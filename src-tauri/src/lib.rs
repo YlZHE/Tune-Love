@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod autotune;
+pub mod devocal;
 pub mod key_detection;
 pub mod media;
 mod migrate;
@@ -10,6 +11,8 @@ pub fn run() {
     let media = media::MediaState::default();
     let audio = audio::AudioState::new(media.clone());
     let key_detection = key_detection::KeyDetectionState::new(audio.clone());
+    let devocal =
+        devocal::DevocalState::new(std::sync::Arc::new(devocal::gate::AttenuationGate::new()));
     tauri::Builder::default()
         .manage(media)
         .manage(media::transport::TransportState::default())
@@ -17,8 +20,14 @@ pub fn run() {
         .manage(key_detection)
         .manage(settings::SettingsWindowState::default())
         .manage(autotune::AutotuneState::default())
+        .manage(devocal)
         .setup(|app| {
             use tauri::Manager;
+            // First: give back any player volume a crashed app/engine left lowered.
+            let data_dir = app.path().app_local_data_dir().ok();
+            if let Some(dir) = &data_dir {
+                devocal::restore_at_startup(&devocal::restore_file(dir));
+            }
             app.state::<audio::AudioState>().start();
             // Installed builds ship the bridge and Python under the resource dir.
             if let Ok(resource_dir) = app.path().resource_dir() {
@@ -47,6 +56,8 @@ pub fn run() {
                     runtime.block_on(media::watch(shared));
                 })
                 .expect("media worker thread");
+            let media = app.state::<media::MediaState>().inner().clone();
+            app.state::<devocal::DevocalState>().start(data_dir, media);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -60,6 +71,7 @@ pub fn run() {
                 window.state::<key_detection::KeyDetectionState>().stop();
                 window.state::<audio::AudioState>().stop();
                 window.state::<autotune::AutotuneState>().stop();
+                window.state::<devocal::DevocalState>().shutdown();
                 // A hidden settings window must never keep the app alive after closing the widget.
                 window.app_handle().exit(0);
             }
@@ -70,7 +82,9 @@ pub fn run() {
             audio::get_audio_level,
             key_detection::get_key_detection,
             settings::open_settings,
-            autotune::autotune_command
+            autotune::autotune_command,
+            devocal::get_devocal_status,
+            devocal::devocal_command
         ])
         .build(tauri::generate_context!())
         .expect("Could not start Tune Love")
@@ -80,6 +94,7 @@ pub fn run() {
                 app.state::<key_detection::KeyDetectionState>().stop();
                 app.state::<audio::AudioState>().stop();
                 app.state::<autotune::AutotuneState>().stop();
+                app.state::<devocal::DevocalState>().shutdown();
             }
         });
 }

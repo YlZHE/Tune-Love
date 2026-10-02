@@ -1,0 +1,1535 @@
+//! App-side supervisor of `devocal-engine.exe`.
+//!
+//! The [`Supervisor`] keeps what the user asked for (hold the player, devocal on or off), and
+//! drives one engine process towards it over an [`EngineLink`]. It does no I/O of its own:
+//! the engine process, the restore and the clock are injected, so tests run with a fake link.
+//! The app calls [`Supervisor::tick`] every 100 ms with the current player.
+//!
+//! Rules (caller obligations 1, 9, 16–26 and the controller rulings of task 10):
+//! - The engine's phase is taken only from `State` events. An `attach` is sent only while the
+//!   last State is `Idle` (a fresh engine starts `Idle`), so a player change sends `release`
+//!   and waits for `Idle` first.
+//! - `set_mode(true)` is sent only for a user `enable`, and to a freshly started engine
+//!   (restart) while the user still wants devocal; never on state sync.
+//! - `set_model` is sent to a new engine, when the model path changes, and once per user
+//!   action after `Error{ModelLoadFailed}` (followed by `set_mode(true)` if still wanted).
+//! - `Error{Protocol}` means a version mismatch only during the hello exchange (from the
+//!   spawn until the first State or Metrics); the engine is then shut down (killed after
+//!   2 s) and not restarted.
+//! - After every engine exit (any exit code): gate drops, `restore` runs, gate back to 1.0;
+//!   then, if the hold is still wanted, a restart within the [`RestartBudget`] (phase
+//!   `restarting`), otherwise phase `failed` with `engine_crashed`.
+//! - While nothing is held (no engine, or last State `Idle` with no attach in flight) and the
+//!   restore file exists, `restore` runs every 2 s (a player relaunched at the persisted
+//!   held volume is fixed quickly).
+//! - Attenuation gate: drop while attaching/releasing and around an exit; `1/attenuation`
+//!   only from Metrics received while the last State is `Active` (a fresh Metrics after
+//!   entering Active, so a stale value from before the hold is never used), set again only
+//!   when `attenuationEpoch` changes; 1.0 on `Idle` and after a restore.
+//! - No hang detection from missing Metrics (a model load may block events; obligation 23).
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use devocal_core::protocol::{
+    encode, Command, ErrorCode, Event, FallbackReason, Metrics, Mode, Phase, PROTOCOL,
+};
+use serde::Serialize;
+
+use super::gate::AttenuationGate;
+use super::link::EngineLink;
+
+/// `set_model.id` for StemgenRT hop 128.
+pub const MODEL_ID: &str = "stemgenrt-hop128";
+/// The engine only accepts `"cpu"` in the first version.
+pub const MODEL_DEVICE: &str = "cpu";
+/// ONNX Runtime intra-op threads (the plan's default: never saturate the CPU).
+pub const MODEL_THREADS: u16 = 1;
+/// Restore retry interval while nothing is held (obligation 9).
+pub const RESTORE_RETRY_MS: u64 = 2_000;
+/// Wait before re-attaching the same player after the engine went idle on its own.
+pub const ATTACH_RETRY_MS: u64 = 3_000;
+/// Attaches to one player (pid + creation time) before giving up (`failed`, `attach_failed`).
+pub const MAX_ATTACH_ATTEMPTS: u32 = 3;
+/// `session_overridden` stays true this long after the engine's counter increased.
+pub const OVERRIDE_WINDOW_MS: u64 = 10_000;
+/// `input_silent` once the engine has seen no input for this long while media plays.
+pub const INPUT_SILENT_MS: u64 = 3_000;
+/// A version-mismatched engine that has not exited after `shutdown` is killed after this.
+pub const MISMATCH_KILL_MS: u64 = 2_000;
+/// How long [`Supervisor::shutdown`] waits for the engine to exit before killing it.
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
+
+/// The player the engine should hold: pid plus process creation time (FILETIME).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerProcess {
+    pub source_id: String,
+    pub pid: u32,
+    pub created_at: u64,
+}
+
+impl PlayerProcess {
+    fn key(&self) -> (u32, u64) {
+        (self.pid, self.created_at)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevocalStatus {
+    /// off | attaching | passthrough | devocal | fallback | releasing | restarting | failed |
+    /// unavailable
+    pub phase: &'static str,
+    pub held: bool,
+    pub latency_ms: Option<f32>,
+    pub load_ratio: Option<f32>,
+    /// overload | model_error
+    pub fallback_reason: Option<&'static str>,
+    pub session_overridden: bool,
+    pub input_silent: bool,
+    pub error: Option<String>,
+}
+
+impl DevocalStatus {
+    pub fn off() -> Self {
+        Self {
+            phase: "off",
+            held: false,
+            latency_ms: None,
+            load_ratio: None,
+            fallback_reason: None,
+            session_overridden: false,
+            input_silent: false,
+            error: None,
+        }
+    }
+}
+
+/// At most `max` restarts within any `window_ms`.
+pub struct RestartBudget {
+    max: usize,
+    window_ms: u64,
+    restarts: VecDeque<u64>,
+}
+
+impl Default for RestartBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RestartBudget {
+    /// 3 restarts per 60 s.
+    pub fn new() -> Self {
+        Self {
+            max: 3,
+            window_ms: 60_000,
+            restarts: VecDeque::new(),
+        }
+    }
+
+    /// Records a restart at `now_ms` and returns true if the budget allows it.
+    pub fn allow(&mut self, now_ms: u64) -> bool {
+        while let Some(&t) = self.restarts.front() {
+            if now_ms.saturating_sub(t) >= self.window_ms {
+                self.restarts.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.restarts.len() < self.max {
+            self.restarts.push_back(now_ms);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// What the gate was last set to, so it is set (and its epoch bumped) only on a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateKey {
+    Unity,
+    Drop,
+    Scaled { link: u64, epoch: u64 },
+}
+
+struct EngineState {
+    phase: Phase,
+    mode: Option<Mode>,
+    fallback_reason: Option<FallbackReason>,
+}
+
+/// One running engine process and what we know about it.
+struct Linked<L> {
+    link: L,
+    generation: u64,
+    /// Last State event; `None` until the first one (a fresh engine is idle).
+    state: Option<EngineState>,
+    /// From the spawn until the first State or Metrics.
+    hello_exchange: bool,
+    /// The player of the last `attach`, until the engine reports Idle.
+    attached: Option<PlayerProcess>,
+    /// `attach` sent, no State (or `AttachFailed`) seen for it yet.
+    attach_in_flight: bool,
+    /// `release` sent, Idle not seen yet.
+    release_sent: bool,
+    sent_model: Option<PathBuf>,
+    /// Last Metrics received while Active (cleared when leaving Active).
+    metrics: Option<Metrics>,
+    /// Baseline of the engine's `session_overridden` counter.
+    overridden_seen: Option<u64>,
+    /// Version mismatch detected at this time; the engine is being shut down.
+    mismatch_at: Option<u64>,
+}
+
+impl<L> Linked<L> {
+    fn new(link: L, generation: u64) -> Self {
+        Self {
+            link,
+            generation,
+            state: None,
+            hello_exchange: true,
+            attached: None,
+            attach_in_flight: false,
+            release_sent: false,
+            sent_model: None,
+            metrics: None,
+            overridden_seen: None,
+            mismatch_at: None,
+        }
+    }
+
+    fn phase(&self) -> Phase {
+        self.state.as_ref().map_or(Phase::Idle, |s| s.phase)
+    }
+
+    /// Sessions may be held, or are about to be: restore must not run.
+    fn holding(&self) -> bool {
+        self.attach_in_flight
+            || matches!(
+                self.phase(),
+                Phase::Attaching | Phase::Active | Phase::Releasing
+            )
+    }
+}
+
+pub struct Supervisor<L: EngineLink> {
+    spawn: Box<dyn FnMut() -> Result<L, String> + Send>,
+    restore: Box<dyn FnMut() + Send>,
+    restore_pending: Box<dyn Fn() -> bool + Send>,
+    gate: Arc<AttenuationGate>,
+    gate_key: GateKey,
+    budget: RestartBudget,
+    shutdown_wait: Duration,
+    engine: Option<Linked<L>>,
+    generation: u64,
+
+    // What the user asked for.
+    want_hold: bool,
+    want_devocal: bool,
+    model: Option<PathBuf>,
+    /// One `ModelLoadFailed` retry left for the current user action (ruling 5).
+    model_retry: bool,
+    /// Send `set_mode(true)` once the (new) engine has its handshake.
+    user_on_pending: bool,
+
+    // Conditions.
+    restarting: bool,
+    failed: bool,
+    unavailable: bool,
+    error: Option<String>,
+    shut_down: bool,
+
+    // Re-attach bookkeeping for one player.
+    failure_target: Option<(u32, u64)>,
+    attach_failures: u32,
+    retry_after_ms: u64,
+    attach_gave_up: bool,
+
+    last_restore_ms: Option<u64>,
+    overridden_at: Option<u64>,
+    now_ms: u64,
+    media_playing: bool,
+}
+
+impl<L: EngineLink> Supervisor<L> {
+    /// `spawn` starts an engine and connects to it; `restore` runs the restore file (it must
+    /// not panic and is a no-op without a file).
+    pub fn new(
+        spawn: Box<dyn FnMut() -> Result<L, String> + Send>,
+        restore: Box<dyn FnMut() + Send>,
+        gate: Arc<AttenuationGate>,
+    ) -> Self {
+        Self {
+            spawn,
+            restore,
+            restore_pending: Box::new(|| true),
+            gate,
+            gate_key: GateKey::Unity,
+            budget: RestartBudget::new(),
+            shutdown_wait: SHUTDOWN_WAIT,
+            engine: None,
+            generation: 0,
+            want_hold: false,
+            want_devocal: false,
+            model: None,
+            model_retry: false,
+            user_on_pending: false,
+            restarting: false,
+            failed: false,
+            unavailable: false,
+            error: None,
+            shut_down: false,
+            failure_target: None,
+            attach_failures: 0,
+            retry_after_ms: 0,
+            attach_gave_up: false,
+            last_restore_ms: None,
+            overridden_at: None,
+            now_ms: 0,
+            media_playing: false,
+        }
+    }
+
+    /// Whether the restore file exists (checked before the periodic retry). Defaults to
+    /// "always", which only costs a no-op restore every 2 s.
+    pub fn with_restore_pending(mut self, pending: Box<dyn Fn() -> bool + Send>) -> Self {
+        self.restore_pending = pending;
+        self
+    }
+
+    pub fn with_shutdown_wait(mut self, wait: Duration) -> Self {
+        self.shutdown_wait = wait;
+        self
+    }
+
+    /// User action: hold the player and turn devocal on. `None` (no model) only reports
+    /// `unavailable`.
+    pub fn enable(&mut self, model: Option<PathBuf>) {
+        if self.shut_down {
+            return;
+        }
+        self.error = None;
+        self.failed = false;
+        self.unavailable = false;
+        self.failure_target = None;
+        self.attach_failures = 0;
+        self.attach_gave_up = false;
+        let Some(model) = model else {
+            self.unavailable = true;
+            self.error = Some("model_not_found".into());
+            return;
+        };
+        self.want_hold = true;
+        self.want_devocal = true;
+        self.model_retry = true;
+        self.model = Some(model);
+        let live = self
+            .engine
+            .as_ref()
+            .filter(|e| e.mismatch_at.is_none())
+            .map(|e| e.sent_model != self.model);
+        match live {
+            Some(model_changed) => {
+                self.user_on_pending = false;
+                if model_changed && !self.send_set_model() {
+                    return;
+                }
+                self.send(&Command::SetMode { devocal: true });
+            }
+            // The next tick spawns the engine and sends the whole handshake.
+            None => self.user_on_pending = true,
+        }
+    }
+
+    /// User action: devocal off; the player stays held (passthrough).
+    pub fn disable(&mut self) {
+        if self.shut_down {
+            return;
+        }
+        self.want_devocal = false;
+        self.user_on_pending = false;
+        self.model_retry = false;
+        if self.engine.is_some() {
+            self.send(&Command::SetMode { devocal: false });
+        }
+    }
+
+    /// User action: give the player back.
+    pub fn release(&mut self) {
+        if self.shut_down {
+            return;
+        }
+        self.want_hold = false;
+        self.want_devocal = false;
+        self.user_on_pending = false;
+        self.model_retry = false;
+        self.failed = false;
+        self.restarting = false;
+        self.attach_gave_up = false;
+        self.error = None;
+        self.send_release();
+    }
+
+    pub fn tick(&mut self, now_ms: u64, target: Option<PlayerProcess>, media_playing: bool) {
+        if self.shut_down {
+            return;
+        }
+        self.now_ms = now_ms;
+        self.media_playing = media_playing;
+        self.pump(now_ms);
+        self.check_exit(now_ms);
+        self.ensure_engine(target.as_ref());
+        self.drive_attach(now_ms, target.as_ref());
+        self.flush_user_on();
+        self.retry_restore(now_ms);
+    }
+
+    pub fn status(&self) -> DevocalStatus {
+        let e = self.engine.as_ref();
+        let active_metrics = e
+            .filter(|e| e.phase() == Phase::Active && !e.release_sent)
+            .and_then(|e| e.metrics.as_ref());
+        let phase = if self.unavailable {
+            "unavailable"
+        } else if self.failed || self.attach_gave_up {
+            "failed"
+        } else if self.restarting {
+            "restarting"
+        } else {
+            match e {
+                None if self.want_hold && self.want_devocal => "attaching",
+                None => "off",
+                Some(e) if e.release_sent => "releasing",
+                Some(e) => match e.phase() {
+                    Phase::Idle if e.attach_in_flight || (self.want_hold && self.want_devocal) => {
+                        "attaching"
+                    }
+                    Phase::Idle => "off",
+                    Phase::Attaching => "attaching",
+                    Phase::Active => match e.state.as_ref().and_then(|s| s.mode) {
+                        Some(Mode::Devocal) => "devocal",
+                        Some(Mode::Fallback) => "fallback",
+                        Some(Mode::Passthrough) | None => "passthrough",
+                    },
+                    Phase::Releasing => "releasing",
+                },
+            }
+        };
+        let held = self.want_hold
+            && e.is_some_and(|e| {
+                !e.release_sent && matches!(e.phase(), Phase::Attaching | Phase::Active)
+            });
+        let fallback_reason = e
+            .filter(|e| e.phase() == Phase::Active)
+            .and_then(|e| e.state.as_ref())
+            .and_then(|s| s.fallback_reason)
+            .map(|r| match r {
+                FallbackReason::Overload => "overload",
+                FallbackReason::ModelError => "model_error",
+            });
+        DevocalStatus {
+            phase,
+            held,
+            latency_ms: active_metrics.map(|m| m.latency_ms),
+            load_ratio: active_metrics.map(|m| m.load_ratio),
+            fallback_reason,
+            session_overridden: self
+                .overridden_at
+                .is_some_and(|t| self.now_ms.saturating_sub(t) < OVERRIDE_WINDOW_MS),
+            input_silent: self.media_playing
+                && active_metrics.is_some_and(|m| m.input_silent_ms >= INPUT_SILENT_MS),
+            error: self.error.clone(),
+        }
+    }
+
+    /// App exit: `shutdown`, wait up to 1 s, kill if still running, then restore. Every later
+    /// call is a no-op.
+    pub fn shutdown(&mut self) {
+        if self.shut_down {
+            return;
+        }
+        self.shut_down = true;
+        self.want_hold = false;
+        self.want_devocal = false;
+        match self.engine.take() {
+            Some(mut e) => {
+                if encode(&Command::Shutdown).is_ok() {
+                    let _ = e.link.send(&Command::Shutdown);
+                }
+                let deadline = Instant::now() + self.shutdown_wait;
+                while !e.link.exited() {
+                    if Instant::now() >= deadline {
+                        e.link.kill();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                self.apply_gate(GateKey::Drop, None);
+                (self.restore)();
+                self.apply_gate(GateKey::Unity, Some(1.0));
+            }
+            None => {
+                if (self.restore_pending)() {
+                    (self.restore)();
+                }
+            }
+        }
+    }
+
+    // ---- tick steps ----
+
+    fn pump(&mut self, now_ms: u64) {
+        loop {
+            let Some(e) = self.engine.as_mut() else {
+                return;
+            };
+            let Some(ev) = e.link.try_recv() else {
+                return;
+            };
+            match ev {
+                Event::State {
+                    phase,
+                    mode,
+                    fallback_reason,
+                    ..
+                } => self.on_state(phase, mode, fallback_reason, now_ms),
+                Event::Metrics(m) => self.on_metrics(m, now_ms),
+                Event::Error { code, message } => self.on_error(code, message, now_ms),
+            }
+        }
+    }
+
+    fn on_state(
+        &mut self,
+        phase: Phase,
+        mode: Option<Mode>,
+        fallback_reason: Option<FallbackReason>,
+        now_ms: u64,
+    ) {
+        let Some(e) = self.engine.as_mut() else {
+            return;
+        };
+        e.hello_exchange = false;
+        let was_active = e.phase() == Phase::Active;
+        e.state = Some(EngineState {
+            phase,
+            mode,
+            fallback_reason,
+        });
+        if phase != Phase::Active || !was_active {
+            e.metrics = None;
+        }
+        match phase {
+            Phase::Idle => {
+                e.attach_in_flight = false;
+                let requested = std::mem::replace(&mut e.release_sent, false);
+                let lost = e.attached.take();
+                self.apply_gate(GateKey::Unity, Some(1.0));
+                if let (false, Some(p)) = (requested, lost) {
+                    // The engine let go on its own (player gone, capture failed, ...).
+                    self.note_attach_failure(&p, now_ms);
+                }
+            }
+            Phase::Attaching => {
+                e.attach_in_flight = false;
+                self.apply_gate(GateKey::Drop, None);
+            }
+            Phase::Active => {
+                e.attach_in_flight = false;
+                self.restarting = false;
+                if !was_active {
+                    // Wait for a Metrics received while Active.
+                    self.apply_gate(GateKey::Drop, None);
+                }
+            }
+            Phase::Releasing => self.apply_gate(GateKey::Drop, None),
+        }
+    }
+
+    fn on_metrics(&mut self, m: Metrics, now_ms: u64) {
+        let Some(e) = self.engine.as_mut() else {
+            return;
+        };
+        e.hello_exchange = false;
+        let increased = e
+            .overridden_seen
+            .is_some_and(|seen| m.session_overridden > seen);
+        e.overridden_seen = Some(m.session_overridden);
+        if increased {
+            self.overridden_at = Some(now_ms);
+        }
+        let Some(e) = self.engine.as_mut() else {
+            return;
+        };
+        if e.phase() != Phase::Active {
+            return; // obligation 22
+        }
+        let key = GateKey::Scaled {
+            link: e.generation,
+            epoch: m.attenuation_epoch,
+        };
+        let gain = (m.attenuation.is_finite() && m.attenuation > 0.0).then(|| 1.0 / m.attenuation);
+        e.metrics = Some(m);
+        match gain {
+            Some(g) => self.apply_gate(key, Some(g)),
+            None => self.apply_gate(GateKey::Drop, None),
+        }
+    }
+
+    fn on_error(&mut self, code: ErrorCode, message: String, now_ms: u64) {
+        match code {
+            ErrorCode::Protocol => {
+                let in_hello = self
+                    .engine
+                    .as_ref()
+                    .is_some_and(|e| e.hello_exchange && e.mismatch_at.is_none());
+                if !in_hello {
+                    // Also sent for commands after an exit request (obligation 26).
+                    eprintln!("devocal: engine protocol error: {message}");
+                    return;
+                }
+                self.failed = true;
+                self.restarting = false;
+                self.error = Some(format!("engine_version_mismatch: {message}"));
+                self.send(&Command::Shutdown);
+                if let Some(e) = self.engine.as_mut() {
+                    e.mismatch_at = Some(now_ms);
+                }
+            }
+            ErrorCode::ModelLoadFailed => {
+                if self.model_retry && self.model.is_some() {
+                    self.model_retry = false;
+                    if self.send_set_model() && self.want_devocal {
+                        self.send(&Command::SetMode { devocal: true });
+                    }
+                } else {
+                    self.error = Some(format!("model_load_failed: {message}"));
+                }
+            }
+            ErrorCode::AttachFailed => {
+                self.error = Some(format!("attach_failed: {message}"));
+                let Some(e) = self.engine.as_mut() else {
+                    return;
+                };
+                // Phase stays as the last State said; but an attach that was rejected or
+                // could not start leaves the engine Idle without any State.
+                if e.attach_in_flight && e.phase() == Phase::Idle {
+                    e.attach_in_flight = false;
+                    if let Some(p) = e.attached.take() {
+                        self.note_attach_failure(&p, now_ms);
+                    }
+                }
+            }
+            ErrorCode::CaptureFailed => self.error = Some(format!("capture_failed: {message}")),
+            ErrorCode::RenderFailed => self.error = Some(format!("render_failed: {message}")),
+            ErrorCode::NoModel => self.error = Some(format!("no_model: {message}")),
+            ErrorCode::BadDevice => self.error = Some(format!("bad_device: {message}")),
+        }
+    }
+
+    fn check_exit(&mut self, now_ms: u64) {
+        let exited = match self.engine.as_mut() {
+            None => return,
+            Some(e) => {
+                if !e.link.exited()
+                    && e.mismatch_at
+                        .is_some_and(|t| now_ms.saturating_sub(t) >= MISMATCH_KILL_MS)
+                {
+                    e.link.kill();
+                }
+                e.link.exited()
+            }
+        };
+        if !exited {
+            return;
+        }
+        // Whatever the engine said last (it may have released before exiting).
+        self.pump(now_ms);
+        self.engine = None;
+        self.apply_gate(GateKey::Drop, None);
+        (self.restore)();
+        self.last_restore_ms = Some(now_ms);
+        self.apply_gate(GateKey::Unity, Some(1.0));
+        if self.failed || !self.want_hold {
+            self.restarting = false;
+        } else if self.budget.allow(now_ms) {
+            self.restarting = true;
+        } else {
+            self.restarting = false;
+            self.failed = true;
+            self.error = Some("engine_crashed".into());
+        }
+    }
+
+    fn ensure_engine(&mut self, target: Option<&PlayerProcess>) {
+        if self.engine.is_some()
+            || !self.want_hold
+            || self.failed
+            || self.unavailable
+            || target.is_none()
+        {
+            return;
+        }
+        match (self.spawn)() {
+            Err(e) => {
+                self.unavailable = true;
+                self.restarting = false;
+                self.error = Some(format!("engine_unavailable: {e}"));
+            }
+            Ok(link) => {
+                self.generation += 1;
+                self.engine = Some(Linked::new(link, self.generation));
+                if !self.send(&Command::Hello { version: PROTOCOL }) {
+                    return;
+                }
+                if self.model.is_some() {
+                    self.send_set_model();
+                }
+                // A new engine starts with devocal off: give it the user's standing choice.
+                self.user_on_pending = self.want_devocal;
+            }
+        }
+    }
+
+    fn drive_attach(&mut self, now_ms: u64, target: Option<&PlayerProcess>) {
+        if !self.want_hold || self.failed {
+            return;
+        }
+        let Some(t) = target else {
+            return;
+        };
+        let Some(e) = self.engine.as_ref() else {
+            return;
+        };
+        if e.mismatch_at.is_some() || e.release_sent {
+            return;
+        }
+        let phase = e.phase();
+        if phase == Phase::Idle && !e.attach_in_flight {
+            if self.failure_target == Some(t.key()) {
+                if self.attach_failures >= MAX_ATTACH_ATTEMPTS {
+                    if !self.attach_gave_up {
+                        self.attach_gave_up = true;
+                        self.error = Some("attach_failed".into());
+                    }
+                    return;
+                }
+                if now_ms < self.retry_after_ms {
+                    return;
+                }
+            }
+            if self.attach_gave_up {
+                self.attach_gave_up = false;
+                self.error = None;
+            }
+            let cmd = Command::Attach {
+                pid: t.pid,
+                created_at: t.created_at,
+            };
+            if self.send(&cmd) {
+                if let Some(e) = self.engine.as_mut() {
+                    e.attached = Some(t.clone());
+                    e.attach_in_flight = true;
+                }
+                self.apply_gate(GateKey::Drop, None);
+            }
+        } else if e.attach_in_flight || matches!(phase, Phase::Attaching | Phase::Active) {
+            let changed = e.attached.as_ref().is_some_and(|a| a.key() != t.key());
+            if changed {
+                // Another player: release first, attach once Idle (obligation 18).
+                self.send_release();
+            }
+        }
+    }
+
+    fn flush_user_on(&mut self) {
+        if !self.user_on_pending || self.engine.as_ref().is_none_or(|e| e.mismatch_at.is_some()) {
+            return;
+        }
+        self.user_on_pending = false;
+        if self.want_devocal {
+            self.send(&Command::SetMode { devocal: true });
+        }
+    }
+
+    fn retry_restore(&mut self, now_ms: u64) {
+        if self
+            .last_restore_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) < RESTORE_RETRY_MS)
+        {
+            return;
+        }
+        if self.engine.as_ref().is_some_and(|e| e.holding()) {
+            return;
+        }
+        self.last_restore_ms = Some(now_ms);
+        if (self.restore_pending)() {
+            (self.restore)();
+        }
+    }
+
+    // ---- helpers ----
+
+    fn note_attach_failure(&mut self, p: &PlayerProcess, now_ms: u64) {
+        if self.failure_target == Some(p.key()) {
+            self.attach_failures += 1;
+        } else {
+            self.failure_target = Some(p.key());
+            self.attach_failures = 1;
+        }
+        self.retry_after_ms = now_ms + ATTACH_RETRY_MS;
+    }
+
+    fn send_release(&mut self) {
+        let needed = self.engine.as_ref().is_some_and(|e| {
+            e.mismatch_at.is_none()
+                && !e.release_sent
+                && (e.attach_in_flight || matches!(e.phase(), Phase::Attaching | Phase::Active))
+        });
+        if needed && self.send(&Command::Release) {
+            if let Some(e) = self.engine.as_mut() {
+                e.release_sent = true;
+            }
+            self.apply_gate(GateKey::Drop, None);
+        }
+    }
+
+    /// Sends `set_model` for `self.model`. An unencodable path makes devocal unavailable.
+    fn send_set_model(&mut self) -> bool {
+        let Some(path) = self.model.clone() else {
+            return false;
+        };
+        let cmd = Command::SetModel {
+            id: MODEL_ID.into(),
+            path: path.clone(),
+            device: MODEL_DEVICE.into(),
+            threads: MODEL_THREADS,
+        };
+        if let Err(e) = encode(&cmd) {
+            self.unavailable = true;
+            self.want_devocal = false;
+            self.user_on_pending = false;
+            self.error = Some(format!("model_path_unencodable: {e}"));
+            return false;
+        }
+        if !self.send(&cmd) {
+            return false;
+        }
+        if let Some(e) = self.engine.as_mut() {
+            e.sent_model = Some(path);
+        }
+        true
+    }
+
+    /// Sends `cmd`; an unencodable command never reaches the link. A link error means the
+    /// link is broken: the engine is killed and the next tick handles it as an exit.
+    fn send(&mut self, cmd: &Command) -> bool {
+        if self.engine.is_none() {
+            return false;
+        }
+        if let Err(e) = encode(cmd) {
+            self.error = Some(format!("encode_failed: {e}"));
+            return false;
+        }
+        let Some(e) = self.engine.as_mut() else {
+            return false;
+        };
+        match e.link.send(cmd) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("devocal: engine link broken: {err}");
+                e.link.kill();
+                false
+            }
+        }
+    }
+
+    fn apply_gate(&mut self, key: GateKey, value: Option<f32>) {
+        if self.gate_key != key {
+            self.gate_key = key;
+            self.gate.set(value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devocal::link::fake::{FakeEngine, FakeLink};
+    use devocal_core::protocol::{ErrorCode, FallbackReason, Metrics, Mode, Phase, PROTOCOL};
+    use std::sync::Mutex;
+
+    struct Rig {
+        sup: Supervisor<FakeLink>,
+        engines: Arc<Mutex<Vec<FakeEngine>>>,
+        /// The gate value seen by each restore call.
+        restores: Arc<Mutex<Vec<Option<f32>>>>,
+        gate: Arc<AttenuationGate>,
+        spawn_error: Arc<Mutex<Option<String>>>,
+    }
+
+    fn rig() -> Rig {
+        rig_with(false)
+    }
+
+    fn rig_with(restore_pending: bool) -> Rig {
+        let engines: Arc<Mutex<Vec<FakeEngine>>> = Arc::default();
+        let restores: Arc<Mutex<Vec<Option<f32>>>> = Arc::default();
+        let gate = Arc::new(AttenuationGate::new());
+        let spawn_error: Arc<Mutex<Option<String>>> = Arc::default();
+        let (e, s) = (engines.clone(), spawn_error.clone());
+        let (r, g) = (restores.clone(), gate.clone());
+        let sup = Supervisor::new(
+            Box::new(move || {
+                if let Some(err) = s.lock().unwrap().clone() {
+                    return Err(err);
+                }
+                let engine = FakeEngine::default();
+                e.lock().unwrap().push(engine.clone());
+                Ok(engine.link())
+            }),
+            Box::new(move || r.lock().unwrap().push(g.read().1)),
+            gate.clone(),
+        )
+        .with_restore_pending(Box::new(move || restore_pending))
+        .with_shutdown_wait(Duration::from_millis(50));
+        Rig {
+            sup,
+            engines,
+            restores,
+            gate,
+            spawn_error,
+        }
+    }
+
+    impl Rig {
+        fn engine(&self, i: usize) -> FakeEngine {
+            self.engines.lock().unwrap()[i].clone()
+        }
+        fn last(&self) -> FakeEngine {
+            self.engines.lock().unwrap().last().unwrap().clone()
+        }
+        fn spawns(&self) -> usize {
+            self.engines.lock().unwrap().len()
+        }
+        fn restores(&self) -> usize {
+            self.restores.lock().unwrap().len()
+        }
+        fn phase(&self) -> &'static str {
+            self.sup.status().phase
+        }
+        /// enable + tick with `p` + Attaching + Active(Devocal), at time `t`.
+        fn hold(&mut self, t: u64, p: &PlayerProcess) {
+            self.sup.enable(Some(model()));
+            self.sup.tick(t, Some(p.clone()), true);
+            let e = self.last();
+            e.push(state(Phase::Attaching, None));
+            e.push(state(Phase::Active, Some(Mode::Devocal)));
+            self.sup.tick(t + 100, Some(p.clone()), true);
+        }
+    }
+
+    fn model() -> PathBuf {
+        PathBuf::from(r"C:\models\stemgenrt-hop128.onnx")
+    }
+
+    fn player(pid: u32) -> PlayerProcess {
+        PlayerProcess {
+            source_id: "folia".into(),
+            pid,
+            created_at: 1_000 + u64::from(pid),
+        }
+    }
+
+    fn state(phase: Phase, mode: Option<Mode>) -> Event {
+        Event::State {
+            phase,
+            mode,
+            fallback_reason: None,
+            attached_pid: None,
+        }
+    }
+
+    fn metrics(attenuation: f32, epoch: u64) -> Event {
+        Event::Metrics(Metrics {
+            mode: Some(Mode::Devocal),
+            latency_ms: 42.0,
+            load_ratio: 0.3,
+            underruns: 0,
+            fallback_reason: None,
+            attenuation,
+            attenuation_epoch: epoch,
+            session_overridden: 0,
+            input_silent_ms: 0,
+        })
+    }
+
+    fn error(code: ErrorCode) -> Event {
+        Event::Error {
+            code,
+            message: "x".into(),
+        }
+    }
+
+    fn set_model() -> Command {
+        Command::SetModel {
+            id: MODEL_ID.into(),
+            path: model(),
+            device: "cpu".into(),
+            threads: 1,
+        }
+    }
+
+    fn attach(p: &PlayerProcess) -> Command {
+        Command::Attach {
+            pid: p.pid,
+            created_at: p.created_at,
+        }
+    }
+
+    fn handshake(p: &PlayerProcess) -> Vec<Command> {
+        vec![
+            Command::Hello { version: PROTOCOL },
+            set_model(),
+            attach(p),
+            Command::SetMode { devocal: true },
+        ]
+    }
+
+    #[test]
+    fn enable_sends_handshake_in_order() {
+        let mut r = rig();
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, None, true);
+        assert_eq!(r.spawns(), 0, "no target: no spawn");
+        assert_eq!(r.phase(), "attaching");
+        let p = player(7);
+        r.sup.tick(100, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 1);
+        assert_eq!(r.engine(0).sent(), handshake(&p));
+        // Nothing is re-sent on later ticks.
+        r.sup.tick(200, Some(p.clone()), true);
+        assert_eq!(r.engine(0).sent().len(), 4);
+    }
+
+    #[test]
+    fn enable_while_held_only_sends_set_mode() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.sup.disable();
+        r.engine(0).clear_sent();
+        r.sup.enable(Some(model()));
+        r.sup.tick(300, Some(p), true);
+        assert_eq!(r.engine(0).sent(), vec![Command::SetMode { devocal: true }]);
+        assert_eq!(r.spawns(), 1);
+    }
+
+    #[test]
+    fn crash_restores_then_restarts_up_to_three_times_per_minute() {
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 1);
+        for (i, t) in [1_000u64, 2_000, 3_000].into_iter().enumerate() {
+            r.last().exit();
+            r.sup.tick(t, Some(p.clone()), true);
+            assert_eq!(r.restores(), i + 1);
+            assert_eq!(r.spawns(), i + 2);
+            assert_eq!(r.phase(), "restarting");
+            // The restarted engine gets the whole handshake again.
+            assert_eq!(r.last().sent(), handshake(&p));
+        }
+        r.last().exit();
+        r.sup.tick(4_000, Some(p.clone()), true);
+        assert_eq!(r.restores(), 4);
+        assert_eq!(r.spawns(), 4, "budget exhausted: no 4th restart");
+        assert_eq!(r.phase(), "failed");
+        assert_eq!(r.sup.status().error.as_deref(), Some("engine_crashed"));
+        assert_eq!(r.gate.read().1, Some(1.0));
+        r.sup.tick(5_000, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 4, "failed stays failed without a user action");
+
+        // 61 s: a user enable spawns again and the restart budget has recovered.
+        r.sup.enable(Some(model()));
+        r.sup.tick(61_000, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 5);
+        r.last().exit();
+        r.sup.tick(62_000, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 6);
+        assert_eq!(r.phase(), "restarting");
+    }
+
+    #[test]
+    fn restart_reaches_active_and_leaves_restarting() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().exit();
+        r.sup.tick(1_000, Some(p.clone()), true);
+        assert_eq!(r.phase(), "restarting");
+        r.last().push(state(Phase::Attaching, None));
+        r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+        r.sup.tick(1_100, Some(p), true);
+        assert_eq!(r.phase(), "devocal");
+    }
+
+    #[test]
+    fn any_exit_restores_even_without_a_hold_and_does_not_restart() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.sup.release();
+        r.last().push(state(Phase::Releasing, None));
+        r.last().push(state(Phase::Idle, None));
+        r.sup.tick(300, Some(p.clone()), true);
+        assert_eq!(r.phase(), "off");
+        r.last().exit();
+        r.sup.tick(400, Some(p), true);
+        assert_eq!(r.restores(), 1);
+        assert_eq!(r.spawns(), 1);
+        assert_eq!(r.phase(), "off");
+    }
+
+    #[test]
+    fn gate_drops_during_attach_and_scales_when_active() {
+        let mut r = rig();
+        let p = player(7);
+        assert_eq!(r.gate.read(), (0, Some(1.0)));
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().push(state(Phase::Attaching, None));
+        r.sup.tick(100, Some(p.clone()), true);
+        let (e1, g) = r.gate.read();
+        assert_eq!(g, None, "attaching drops the capture");
+
+        // Metrics are ignored unless the last State was Active (obligation 22).
+        r.last().push(metrics(1e-4 / 0.3, 1));
+        r.sup.tick(200, Some(p.clone()), true);
+        assert_eq!(r.gate.read().1, None);
+
+        r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+        r.last().push(metrics(1e-4 / 0.3, 1));
+        r.sup.tick(300, Some(p.clone()), true);
+        let (e2, g) = r.gate.read();
+        let g = g.expect("scaled when active");
+        assert!((g - 3000.0).abs() <= 0.1, "gain {g}");
+        assert!(e2 > e1);
+
+        // Same epoch: no new set.
+        r.last().push(metrics(1e-4 / 0.3, 1));
+        r.sup.tick(400, Some(p.clone()), true);
+        assert_eq!(r.gate.read().0, e2);
+
+        // New epoch: set again.
+        r.last().push(metrics(1e-4 / 0.5, 2));
+        r.sup.tick(500, Some(p.clone()), true);
+        let (e3, g) = r.gate.read();
+        assert!(e3 > e2);
+        assert!((g.unwrap() - 5000.0).abs() <= 0.1);
+
+        r.last().push(state(Phase::Releasing, None));
+        r.sup.tick(600, Some(p.clone()), true);
+        let (e4, g) = r.gate.read();
+        assert!(e4 > e3);
+        assert_eq!(g, None);
+        r.last().push(state(Phase::Idle, None));
+        r.sup.tick(700, Some(p), true);
+        let (e5, g) = r.gate.read();
+        assert!(e5 > e4);
+        assert_eq!(g, Some(1.0));
+    }
+
+    #[test]
+    fn engine_exit_drops_gate_restores_then_unity() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().push(metrics(1e-4, 1));
+        r.sup.tick(200, Some(p.clone()), true);
+        assert_eq!(r.gate.read().1, Some(10_000.0));
+        // The restart's spawn fails, so nothing re-attaches after the restore.
+        *r.spawn_error.lock().unwrap() = Some("gone".into());
+        r.last().exit();
+        r.sup.tick(300, Some(p), true);
+        assert_eq!(
+            *r.restores.lock().unwrap(),
+            vec![None],
+            "restore runs while dropping"
+        );
+        assert_eq!(r.gate.read().1, Some(1.0), "unity after the restore");
+    }
+
+    #[test]
+    fn player_change_releases_then_attaches_new() {
+        let mut r = rig();
+        let (a, b) = (player(7), player(8));
+        r.hold(0, &a);
+        r.last().clear_sent();
+        r.sup.tick(300, Some(b.clone()), true);
+        assert_eq!(r.last().sent(), vec![Command::Release]);
+        assert_eq!(r.gate.read().1, None);
+        r.last().push(state(Phase::Releasing, None));
+        r.sup.tick(400, Some(b.clone()), true);
+        assert_eq!(r.last().sent(), vec![Command::Release], "wait for Idle");
+        r.last().push(state(Phase::Idle, None));
+        r.sup.tick(500, Some(b.clone()), true);
+        assert_eq!(r.last().sent(), vec![Command::Release, attach(&b)]);
+        assert_eq!(r.spawns(), 1);
+        // Same pid with a new creation time is also a different player.
+        let mut b2 = b.clone();
+        b2.created_at += 1;
+        r.last().push(state(Phase::Attaching, None));
+        r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+        r.sup.tick(600, Some(b.clone()), true);
+        r.last().clear_sent();
+        r.sup.tick(700, Some(b2), true);
+        assert_eq!(r.last().sent(), vec![Command::Release]);
+    }
+
+    #[test]
+    fn unrequested_idle_retries_the_same_player_with_backoff_then_fails() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        for i in 0..2u64 {
+            r.last().clear_sent();
+            let t = 1_000 + i * 10_000;
+            r.last().push(state(Phase::Releasing, None));
+            r.last().push(state(Phase::Idle, None));
+            r.sup.tick(t, Some(p.clone()), true);
+            r.sup.tick(t + 1_000, Some(p.clone()), true);
+            assert!(r.last().sent().is_empty(), "backoff before retrying");
+            r.sup.tick(t + ATTACH_RETRY_MS, Some(p.clone()), true);
+            assert_eq!(r.last().sent(), vec![attach(&p)]);
+            r.last().push(state(Phase::Attaching, None));
+            r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+            r.sup.tick(t + ATTACH_RETRY_MS + 100, Some(p.clone()), true);
+        }
+        r.last().clear_sent();
+        r.last().push(state(Phase::Idle, None));
+        r.sup.tick(40_000, Some(p.clone()), true);
+        r.sup.tick(50_000, Some(p.clone()), true);
+        assert!(r.last().sent().is_empty());
+        assert_eq!(r.phase(), "failed");
+        assert_eq!(r.sup.status().error.as_deref(), Some("attach_failed"));
+        // A different player is tried again.
+        r.sup.tick(50_100, Some(player(9)), true);
+        assert_eq!(r.last().sent(), vec![attach(&player(9))]);
+    }
+
+    #[test]
+    fn attach_failed_while_idle_counts_as_a_failed_attempt() {
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().push(error(ErrorCode::AttachFailed));
+        r.sup.tick(100, Some(p.clone()), true);
+        r.last().clear_sent();
+        r.sup.tick(200, Some(p.clone()), true);
+        assert!(r.last().sent().is_empty());
+        r.sup.tick(100 + ATTACH_RETRY_MS, Some(p.clone()), true);
+        assert_eq!(r.last().sent(), vec![attach(&p)]);
+    }
+
+    #[test]
+    fn disable_keeps_hold() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().clear_sent();
+        r.sup.disable();
+        assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: false }]);
+        r.last().push(state(Phase::Active, Some(Mode::Passthrough)));
+        r.sup.tick(300, Some(p), true);
+        assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: false }]);
+        let s = r.sup.status();
+        assert!(s.held);
+        assert_eq!(s.phase, "passthrough");
+    }
+
+    #[test]
+    fn release_sends_release_and_clears_held() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        assert!(r.sup.status().held);
+        r.last().clear_sent();
+        r.sup.release();
+        assert_eq!(r.last().sent(), vec![Command::Release]);
+        assert!(!r.sup.status().held);
+        r.last().push(state(Phase::Releasing, None));
+        r.last().push(state(Phase::Idle, None));
+        r.sup.tick(300, Some(p), true);
+        assert_eq!(r.last().sent(), vec![Command::Release], "no re-attach");
+        assert_eq!(r.phase(), "off");
+    }
+
+    #[test]
+    fn missing_model_reports_unavailable() {
+        let dir = crate::devocal::tests::temp_dir("missing-model");
+        let model = crate::devocal::model_path_from(None, &dir);
+        assert_eq!(model, None);
+        let mut r = rig();
+        r.sup.enable(model);
+        r.sup.tick(0, Some(player(7)), true);
+        assert_eq!(r.spawns(), 0);
+        assert_eq!(r.phase(), "unavailable");
+    }
+
+    #[test]
+    fn missing_engine_reports_unavailable_without_retrying() {
+        let mut r = rig();
+        *r.spawn_error.lock().unwrap() = Some("devocal-engine.exe not found".into());
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, Some(player(7)), true);
+        r.sup.tick(100, Some(player(7)), true);
+        let s = r.sup.status();
+        assert_eq!(s.phase, "unavailable");
+        assert!(s.error.unwrap().contains("devocal-engine.exe not found"));
+    }
+
+    #[test]
+    fn shutdown_kills_and_restores_if_engine_hangs() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        let e = r.last();
+        r.sup.shutdown();
+        assert_eq!(e.sent().last(), Some(&Command::Shutdown));
+        assert!(e.killed());
+        assert_eq!(r.restores(), 1);
+        assert_eq!(r.gate.read().1, Some(1.0));
+        // Ticks and commands after shutdown do nothing.
+        r.sup.enable(Some(model()));
+        r.sup.tick(10_000, Some(p), true);
+        assert_eq!(r.spawns(), 1);
+    }
+
+    #[test]
+    fn shutdown_of_a_well_behaved_engine_does_not_kill_but_still_restores() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        let e = r.last();
+        e.lock().exit_on_shutdown = true;
+        r.sup.shutdown();
+        assert!(!e.killed());
+        assert_eq!(r.restores(), 1);
+    }
+
+    #[test]
+    fn restore_retries_every_two_seconds_only_while_nothing_is_held() {
+        let mut r = rig_with(true);
+        r.sup.tick(0, None, false);
+        assert_eq!(r.restores(), 1, "nothing held: retry at once");
+        r.sup.tick(1_000, None, false);
+        assert_eq!(r.restores(), 1);
+        r.sup.tick(2_000, None, false);
+        assert_eq!(r.restores(), 2);
+        let p = player(7);
+        r.sup.enable(Some(model()));
+        r.sup.tick(3_000, Some(p.clone()), true);
+        // The attach is in flight (no State yet): no restore.
+        r.sup.tick(6_100, Some(p.clone()), true);
+        assert_eq!(r.restores(), 2);
+        r.last().push(state(Phase::Attaching, None));
+        r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+        for t in [8_200u64, 10_300, 12_400] {
+            r.sup.tick(t, Some(p.clone()), true);
+        }
+        assert_eq!(r.restores(), 2, "held: no restore");
+        r.sup.release();
+        r.last().push(state(Phase::Releasing, None));
+        r.sup.tick(14_500, Some(p.clone()), true);
+        assert_eq!(r.restores(), 2, "releasing still holds");
+        r.last().push(state(Phase::Idle, None));
+        r.sup.tick(16_600, Some(p), true);
+        assert_eq!(r.restores(), 3);
+    }
+
+    #[test]
+    fn no_restore_retry_without_a_restore_file() {
+        let mut r = rig_with(false);
+        for t in [0u64, 2_000, 4_000] {
+            r.sup.tick(t, None, false);
+        }
+        assert_eq!(r.restores(), 0);
+    }
+
+    #[test]
+    fn model_load_failure_resends_set_model_once_per_user_action() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().clear_sent();
+        r.last().push(error(ErrorCode::ModelLoadFailed));
+        r.sup.tick(300, Some(p.clone()), true);
+        assert_eq!(
+            r.last().sent(),
+            vec![set_model(), Command::SetMode { devocal: true }]
+        );
+        r.last().clear_sent();
+        r.last().push(error(ErrorCode::ModelLoadFailed));
+        r.sup.tick(400, Some(p.clone()), true);
+        assert!(r.last().sent().is_empty(), "no loop on a bad model");
+        assert!(r
+            .sup
+            .status()
+            .error
+            .unwrap()
+            .starts_with("model_load_failed"));
+        // A new user action allows one more retry; disable ends that allowance.
+        r.sup.enable(Some(model()));
+        r.sup.disable();
+        r.last().clear_sent();
+        r.last().push(error(ErrorCode::ModelLoadFailed));
+        r.sup.tick(500, Some(p), true);
+        assert!(r.last().sent().is_empty(), "disable ends the user action");
+    }
+
+    #[test]
+    fn model_load_failure_after_disable_then_enable_retries_with_set_mode() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.sup.disable();
+        r.sup.enable(Some(model()));
+        r.last().clear_sent();
+        r.last().push(error(ErrorCode::ModelLoadFailed));
+        r.sup.tick(300, Some(p), true);
+        assert_eq!(
+            r.last().sent(),
+            vec![set_model(), Command::SetMode { devocal: true }]
+        );
+    }
+
+    #[test]
+    fn protocol_error_during_hello_is_a_version_mismatch() {
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().clear_sent();
+        r.last().push(error(ErrorCode::Protocol));
+        r.sup.tick(100, Some(p.clone()), true);
+        assert_eq!(r.phase(), "failed");
+        assert!(r
+            .sup
+            .status()
+            .error
+            .unwrap()
+            .starts_with("engine_version_mismatch"));
+        assert_eq!(r.last().sent(), vec![Command::Shutdown]);
+        r.last().exit();
+        r.sup.tick(200, Some(p.clone()), true);
+        assert_eq!(r.restores(), 1);
+        assert_eq!(r.spawns(), 1, "no restart after a version mismatch");
+        assert_eq!(r.phase(), "failed");
+    }
+
+    #[test]
+    fn version_mismatched_engine_that_does_not_exit_is_killed() {
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().push(error(ErrorCode::Protocol));
+        r.sup.tick(100, Some(p.clone()), true);
+        r.sup.tick(1_000, Some(p.clone()), true);
+        assert!(!r.last().killed());
+        r.sup.tick(2_200, Some(p), true);
+        assert!(r.last().killed());
+        assert_eq!(r.restores(), 1);
+        assert_eq!(r.spawns(), 1);
+    }
+
+    #[test]
+    fn protocol_error_after_the_hello_exchange_is_not_a_mismatch() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().push(error(ErrorCode::Protocol));
+        r.sup.tick(300, Some(p), true);
+        assert_eq!(r.phase(), "devocal");
+    }
+
+    #[test]
+    fn status_reports_metrics_fallback_override_and_silence() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().push(Event::Metrics(Metrics {
+            mode: Some(Mode::Devocal),
+            latency_ms: 45.4,
+            load_ratio: 0.25,
+            underruns: 0,
+            fallback_reason: None,
+            attenuation: 1e-4,
+            attenuation_epoch: 1,
+            session_overridden: 2,
+            input_silent_ms: 3_500,
+        }));
+        r.sup.tick(1_000, Some(p.clone()), true);
+        let s = r.sup.status();
+        assert_eq!(s.latency_ms, Some(45.4));
+        assert_eq!(s.load_ratio, Some(0.25));
+        assert!(s.input_silent);
+        assert!(!s.session_overridden, "first sample is the baseline");
+        r.sup.tick(1_100, Some(p.clone()), false);
+        assert!(!r.sup.status().input_silent, "not playing: not silent");
+
+        let mut m = match metrics(1e-4, 1) {
+            Event::Metrics(m) => m,
+            _ => unreachable!(),
+        };
+        m.session_overridden = 3;
+        r.last().push(Event::Metrics(m));
+        r.sup.tick(2_000, Some(p.clone()), true);
+        assert!(r.sup.status().session_overridden);
+        r.sup.tick(11_900, Some(p.clone()), true);
+        assert!(r.sup.status().session_overridden);
+        r.sup.tick(12_100, Some(p.clone()), true);
+        assert!(!r.sup.status().session_overridden, "older than 10 s");
+
+        r.last().push(Event::State {
+            phase: Phase::Active,
+            mode: Some(Mode::Fallback),
+            fallback_reason: Some(FallbackReason::Overload),
+            attached_pid: Some(7),
+        });
+        r.sup.tick(12_200, Some(p), true);
+        let s = r.sup.status();
+        assert_eq!(s.phase, "fallback");
+        assert_eq!(s.fallback_reason, Some("overload"));
+    }
+
+    #[test]
+    fn link_send_failure_is_handled_as_an_engine_exit() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        // The engine died between ticks; the next command fails.
+        r.last().exit();
+        r.sup.disable();
+        r.sup.tick(300, Some(p), true);
+        assert_eq!(r.restores(), 1);
+        assert_eq!(r.spawns(), 2);
+    }
+
+    #[test]
+    fn restart_budget_allows_three_per_window() {
+        let mut b = RestartBudget::new();
+        assert!(b.allow(0));
+        assert!(b.allow(1));
+        assert!(b.allow(2));
+        assert!(!b.allow(59_999));
+        assert!(b.allow(60_000));
+    }
+}

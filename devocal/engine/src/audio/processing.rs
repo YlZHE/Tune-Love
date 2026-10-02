@@ -13,7 +13,8 @@ use devocal_core::protocol::FallbackReason;
 use rtrb::{Consumer, Producer};
 
 use super::{
-    edge_fade_frames, now_us, AudioStats, FadeIn, InputMarker, Mmcss, ProcCommand, Shared,
+    edge_fade_frames, is_backlogged, now_us, reason_code, stage_code, AudioStats, FadeIn,
+    InputMarker, Mmcss, ProcCommand, Shared, Starvation,
 };
 use crate::dsp::SAMPLE_RATE;
 use crate::load::LoadMonitor;
@@ -36,6 +37,23 @@ pub(crate) struct ProcessingCtx {
     pub control: Consumer<ProcCommand>,
     pub shared: Arc<Shared>,
     pub stats: Arc<AudioStats>,
+}
+
+/// Ruling 18 overload decision for one processed block. Never while the user toggle is off
+/// or the model is not running. LoadMonitor overload always forces the fallback; a counted
+/// underrun only when, at that starvation, the model ran and ring A held at least one hop
+/// (processing was behind). Any other underrun is jitter, absorbed by render headroom.
+pub fn should_force_fallback(
+    underrun: Option<Starvation>,
+    hop: usize,
+    user_on: bool,
+    ran_model: bool,
+    overloaded: bool,
+) -> bool {
+    if !user_on || !ran_model {
+        return false;
+    }
+    overloaded || underrun.is_some_and(|u| is_backlogged(u.ran_model, u.backlog_frames, hop))
 }
 
 fn block_us(hop: usize) -> f64 {
@@ -80,12 +98,16 @@ pub(crate) fn run(mut ctx: ProcessingCtx) {
     };
     st.underrun_base = ctx.stats.underruns.load(Ordering::Acquire);
     publish_config(&ctx, &st);
+    publish_state(&ctx);
 
     'outer: while !ctx.shared.stop.load(Ordering::Acquire) {
         while let Ok(cmd) = ctx.control.pop() {
             apply_command(&mut ctx, &mut st, cmd);
+            publish_state(&ctx);
         }
-        try_swap(&mut ctx, &mut st);
+        if try_swap(&mut ctx, &mut st) {
+            publish_state(&ctx);
+        }
 
         ctx.shared
             .in_ring_frames
@@ -145,17 +167,21 @@ pub(crate) fn run(mut ctx: ProcessingCtx) {
         } else {
             st.load.reset();
         }
+        // The render thread publishes the starvation snapshot before incrementing the count.
         let underruns = ctx.stats.underruns.load(Ordering::Acquire);
-        if report.ran_model && st.user_on {
-            if st.load.overloaded() {
-                ctx.processor.force_fallback(FallbackReason::Overload);
+        let underrun = (underruns > st.underrun_base).then(|| Starvation {
+            ran_model: ctx.shared.underrun_ran_model.load(Ordering::Acquire),
+            backlog_frames: ctx.shared.underrun_backlog_frames.load(Ordering::Acquire) as usize,
+        });
+        let overloaded = report.ran_model && st.load.overloaded();
+        if should_force_fallback(underrun, st.hop, st.user_on, report.ran_model, overloaded) {
+            ctx.processor.force_fallback(FallbackReason::Overload);
+            if overloaded {
                 st.load.reset();
-            } else if underruns > st.underrun_base {
-                // A dropout while input was flowing (counted by the render thread).
-                ctx.processor.force_fallback(FallbackReason::Overload);
             }
         }
         st.underrun_base = underruns;
+        publish_state(&ctx);
         let ratio = if report.ran_model {
             st.load.ratio()
         } else {
@@ -205,15 +231,18 @@ fn apply_command(ctx: &mut ProcessingCtx, st: &mut State, cmd: ProcCommand) {
     }
 }
 
-/// A user "on" was accepted: fresh load window and underrun baseline (obligation 2).
+/// A user "on" was accepted: fresh load window and underrun baseline (obligation 2), and a
+/// one-time render pre-roll (ruling 18).
 fn accept_on(ctx: &ProcessingCtx, st: &mut State) {
     st.load.reset();
     st.underrun_base = ctx.stats.underruns.load(Ordering::Acquire);
+    ctx.shared.preroll_request.store(true, Ordering::Release);
 }
 
-fn try_swap(ctx: &mut ProcessingCtx, st: &mut State) {
+/// Installs a pending model once it is safe; returns true if it did.
+fn try_swap(ctx: &mut ProcessingCtx, st: &mut State) -> bool {
     if st.pending.is_none() {
-        return;
+        return false;
     }
     let audible = matches!(
         ctx.processor.stage(),
@@ -221,10 +250,10 @@ fn try_swap(ctx: &mut ProcessingCtx, st: &mut State) {
     );
     let idle = now_us().saturating_sub(st.last_block_us) > SWAP_IDLE_US;
     if audible && !idle {
-        return;
+        return false;
     }
     let Some(s) = st.pending.take() else {
-        return;
+        return false;
     };
     // Allocates (and drops the old model) between blocks; not on the per-block path.
     if let Some(old) = ctx.processor.set_separator(s) {
@@ -243,6 +272,18 @@ fn try_swap(ctx: &mut ProcessingCtx, st: &mut State) {
         ctx.processor.request_devocal(true);
         accept_on(ctx, st);
     }
+    true
+}
+
+/// Publishes the processor's stage and fallback reason (caller obligation 5).
+fn publish_state(ctx: &ProcessingCtx) {
+    ctx.stats
+        .stage
+        .store(stage_code(ctx.processor.stage()), Ordering::Release);
+    ctx.stats.fallback_reason.store(
+        reason_code(ctx.processor.fallback_reason()),
+        Ordering::Release,
+    );
 }
 
 /// Drops a replaced model on a short-lived thread: tearing down an inference session can
@@ -260,4 +301,94 @@ fn publish_config(ctx: &ProcessingCtx, st: &State) {
         .proc_latency_frames
         .store(st.latency as u32, Ordering::Relaxed);
     ctx.shared.proc_hop.store(st.hop as u32, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOP: usize = 128;
+
+    fn starved(ran_model: bool, backlog_frames: usize) -> Option<Starvation> {
+        Some(Starvation {
+            ran_model,
+            backlog_frames,
+        })
+    }
+
+    #[test]
+    fn jitter_underrun_does_not_force_fallback() {
+        // Model running, but ring A held less than a hop: processing kept up.
+        assert!(!should_force_fallback(
+            starved(true, 0),
+            HOP,
+            true,
+            true,
+            false
+        ));
+        assert!(!should_force_fallback(
+            starved(true, HOP - 1),
+            HOP,
+            true,
+            true,
+            false
+        ));
+        // Starved while the model was not running (passthrough).
+        assert!(!should_force_fallback(
+            starved(false, 4 * HOP),
+            HOP,
+            true,
+            true,
+            false
+        ));
+        assert!(!should_force_fallback(None, HOP, true, true, false));
+    }
+
+    #[test]
+    fn backlogged_underrun_forces_fallback() {
+        assert!(should_force_fallback(
+            starved(true, HOP),
+            HOP,
+            true,
+            true,
+            false
+        ));
+        assert!(should_force_fallback(
+            starved(true, 10 * HOP),
+            HOP,
+            true,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn load_overload_forces_fallback() {
+        assert!(should_force_fallback(None, HOP, true, true, true));
+        assert!(should_force_fallback(
+            starved(true, 0),
+            HOP,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn nothing_forced_while_user_off_or_model_idle() {
+        assert!(!should_force_fallback(
+            starved(true, 10 * HOP),
+            HOP,
+            false,
+            true,
+            true
+        ));
+        assert!(!should_force_fallback(
+            starved(true, 10 * HOP),
+            HOP,
+            true,
+            false,
+            true
+        ));
+    }
 }

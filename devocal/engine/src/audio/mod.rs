@@ -33,7 +33,7 @@ pub mod endpoint;
 mod processing;
 pub mod render;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -49,8 +49,10 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+use devocal_core::protocol::FallbackReason;
+
 use crate::dsp::{frames_for_ms, SAMPLE_RATE};
-use crate::processor::Processor;
+use crate::processor::{Processor, Stage};
 use crate::separator::Separator;
 
 /// An underrun counts only if capture data arrived this recently.
@@ -97,7 +99,93 @@ pub struct AudioStats {
     pub discontinuities: AtomicU64,
     /// Blocks silenced by the safety guard (peak above 1.5 after the capture gain).
     pub unattenuated_blocks: AtomicU64,
+    /// Processor stage after the latest block or applied command ([`stage_code`] mapping:
+    /// 0 Passthrough, 1 WarmingUp, 2 FadingIn, 3 Devocal, 4 FadingOut, 5 Fallback).
+    pub stage: AtomicU8,
+    /// Processor fallback reason ([`reason_code`]: 0 none, 1 Overload, 2 ModelError).
+    pub fallback_reason: AtomicU8,
+    /// Extra render headroom in frames added after jitter underruns (on top of
+    /// one period + one hop; at most [`MAX_EXTRA_HEADROOM_FRAMES`]).
+    pub headroom_frames: AtomicU32,
+    /// A thread ended without being stopped (error or panic). `capture_failed` also covers
+    /// process loopback errors; render device errors are `AudioHandle::output_failed`
+    /// (recoverable by a rebind), `render_failed` only an unexpected end of the thread.
+    pub processing_failed: AtomicBool,
+    pub capture_failed: AtomicBool,
+    pub render_failed: AtomicBool,
 }
+
+/// [`AudioStats::stage`] encoding.
+pub fn stage_code(stage: Stage) -> u8 {
+    match stage {
+        Stage::Passthrough => 0,
+        Stage::WarmingUp => 1,
+        Stage::FadingIn => 2,
+        Stage::Devocal => 3,
+        Stage::FadingOut => 4,
+        Stage::Fallback => 5,
+    }
+}
+
+/// Inverse of [`stage_code`]; unknown codes read as `Passthrough`.
+pub fn stage_from_code(code: u8) -> Stage {
+    match code {
+        1 => Stage::WarmingUp,
+        2 => Stage::FadingIn,
+        3 => Stage::Devocal,
+        4 => Stage::FadingOut,
+        5 => Stage::Fallback,
+        _ => Stage::Passthrough,
+    }
+}
+
+/// The model runs in these stages (the processor's `model_running`).
+pub fn stage_runs_model(stage: Stage) -> bool {
+    matches!(
+        stage,
+        Stage::WarmingUp | Stage::FadingIn | Stage::Devocal | Stage::FadingOut
+    )
+}
+
+/// [`AudioStats::fallback_reason`] encoding.
+pub fn reason_code(reason: Option<FallbackReason>) -> u8 {
+    match reason {
+        None => 0,
+        Some(FallbackReason::Overload) => 1,
+        Some(FallbackReason::ModelError) => 2,
+    }
+}
+
+/// Inverse of [`reason_code`]; unknown codes read as `None`.
+pub fn reason_from_code(code: u8) -> Option<FallbackReason> {
+    match code {
+        1 => Some(FallbackReason::Overload),
+        2 => Some(FallbackReason::ModelError),
+        _ => None,
+    }
+}
+
+/// What the render thread saw when the output starved; carried with a counted underrun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Starvation {
+    /// The processor's stage ran the model.
+    pub ran_model: bool,
+    /// Unprocessed input waiting in ring A, in frames.
+    pub backlog_frames: usize,
+}
+
+/// Ruling 18: the processing thread is behind when the model runs and ring A holds at least
+/// one hop of unprocessed input at the moment the output starves.
+pub fn is_backlogged(ran_model: bool, backlog_frames: usize, hop: usize) -> bool {
+    ran_model && backlog_frames >= hop
+}
+
+/// Extra render headroom never exceeds about one capture packet (10 ms), which keeps
+/// capture packet + ring A + model latency + (period + hop + headroom) inside the 50 ms
+/// devocal budget for engine periods up to 10 ms.
+pub const MAX_EXTRA_HEADROOM_FRAMES: usize = 441;
+/// One-time render pre-roll when a user "on" is accepted (about one capture packet).
+pub const PREROLL_FRAMES: usize = 441;
 
 /// Gains as `f32` bit patterns; published by the engine loop from the Holder every 1 ms.
 #[derive(Debug)]
@@ -228,7 +316,12 @@ pub(crate) struct Shared {
     pub proc_latency_frames: AtomicU32,
     pub proc_hop: AtomicU32,
     pub output_failed: AtomicBool,
-    pub capture_failed: AtomicBool,
+    /// Set by processing when it accepts a user "on"; render takes it and pre-rolls once.
+    pub preroll_request: AtomicBool,
+    /// Snapshot taken when the output starved (published with each counted underrun, before
+    /// `AudioStats::underruns` is incremented): did the model run, and ring A's backlog.
+    pub underrun_ran_model: AtomicBool,
+    pub underrun_backlog_frames: AtomicU32,
     /// Wakes the processing thread (capture pushed data, control message, stop).
     pub wake: OwnedEvent,
 }
@@ -267,6 +360,12 @@ impl AudioHandle {
             ));
         }
         let stats = Arc::new(AudioStats::default());
+        stats
+            .stage
+            .store(stage_code(processor.stage()), Ordering::Release);
+        stats
+            .fallback_reason
+            .store(reason_code(processor.fallback_reason()), Ordering::Release);
         let follow_now = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
@@ -277,7 +376,9 @@ impl AudioHandle {
             proc_latency_frames: AtomicU32::new(processor.latency_frames() as u32),
             proc_hop: AtomicU32::new(processor.hop() as u32),
             output_failed: AtomicBool::new(false),
-            capture_failed: AtomicBool::new(false),
+            preroll_request: AtomicBool::new(false),
+            underrun_ran_model: AtomicBool::new(false),
+            underrun_backlog_frames: AtomicU32::new(0),
             wake: OwnedEvent::new()?,
         });
 
@@ -307,7 +408,11 @@ impl AudioHandle {
             shared: shared.clone(),
             stats: stats.clone(),
         };
-        handle.spawn("devocal-processing", move || processing::run(ctx))?;
+        handle.spawn(
+            "devocal-processing",
+            |s| &s.processing_failed,
+            move || processing::run(ctx),
+        )?;
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let ctx = capture::CaptureCtx {
@@ -319,7 +424,11 @@ impl AudioHandle {
             gains: gains.clone(),
             follow_now,
         };
-        handle.spawn("devocal-capture", move || capture::run(ctx, ready_tx))?;
+        handle.spawn(
+            "devocal-capture",
+            |s| &s.capture_failed,
+            move || capture::run(ctx, ready_tx),
+        )?;
         handle.await_ready("capture", &ready_rx)?;
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -332,7 +441,11 @@ impl AudioHandle {
             stats,
             gains,
         };
-        handle.spawn("devocal-render", move || render::run(ctx, ready_tx))?;
+        handle.spawn(
+            "devocal-render",
+            |s| &s.render_failed,
+            move || render::run(ctx, ready_tx),
+        )?;
         handle.await_ready("render", &ready_rx)?;
         Ok(handle)
     }
@@ -368,7 +481,25 @@ impl AudioHandle {
 
     /// True once process loopback failed (the capture thread has ended).
     pub fn capture_failed(&self) -> bool {
-        self.shared.capture_failed.load(Ordering::Acquire)
+        self.stats.capture_failed.load(Ordering::Acquire)
+    }
+
+    /// True once any audio thread ended without being stopped (process loopback error, or
+    /// a panic in capture, processing or render). The engine treats this as a Failure.
+    pub fn failed(&self) -> bool {
+        self.stats.processing_failed.load(Ordering::Acquire)
+            || self.stats.capture_failed.load(Ordering::Acquire)
+            || self.stats.render_failed.load(Ordering::Acquire)
+    }
+
+    /// Processor stage after the latest block or applied control command.
+    pub fn stage(&self) -> Stage {
+        stage_from_code(self.stats.stage.load(Ordering::Acquire))
+    }
+
+    /// Processor fallback reason (for the status mapping, caller obligation 5).
+    pub fn fallback_reason(&self) -> Option<FallbackReason> {
+        reason_from_code(self.stats.fallback_reason.load(Ordering::Acquire))
     }
 
     /// Returns and clears the safety guard's request to run `Holder::follow()` now.
@@ -391,13 +522,21 @@ impl AudioHandle {
         }
     }
 
+    /// Spawns an audio thread; `failed` selects the stats flag set if the thread ends
+    /// without a stop request (or panics).
     fn spawn(
         &mut self,
         name: &'static str,
+        failed: fn(&AudioStats) -> &AtomicBool,
         f: impl FnOnce() + Send + 'static,
     ) -> Result<(), String> {
         let exited = Arc::new(AtomicBool::new(false));
-        let flag = ExitFlag(exited.clone());
+        let flag = ExitFlag {
+            exited: exited.clone(),
+            shared: self.shared.clone(),
+            stats: self.stats.clone(),
+            failed,
+        };
         let spawned = thread::Builder::new().name(name.into()).spawn(move || {
             let _flag = flag;
             f()
@@ -484,12 +623,21 @@ struct Worker {
     exited: Arc<AtomicBool>,
 }
 
-/// Marks the thread finished when dropped (also on panic unwinding).
-struct ExitFlag(Arc<AtomicBool>);
+/// Marks the thread finished when dropped (also on panic unwinding); an end without a stop
+/// request, or a panic, also sets the thread's failure flag.
+struct ExitFlag {
+    exited: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+    stats: Arc<AudioStats>,
+    failed: fn(&AudioStats) -> &AtomicBool,
+}
 
 impl Drop for ExitFlag {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        if thread::panicking() || !self.shared.stop.load(Ordering::Acquire) {
+            (self.failed)(&self.stats).store(true, Ordering::Release);
+        }
+        self.exited.store(true, Ordering::Release);
     }
 }
 
@@ -678,11 +826,61 @@ mod tests {
             let _ = trim.observe(5_000, i * 30_000);
             let _ = count_underrun(i, i + 10);
             let mut judge = render::UnderrunJudge::new();
-            judge.starved(i, i + 10);
+            judge.starved(
+                i,
+                i + 10,
+                Starvation {
+                    ran_model: true,
+                    backlog_frames: 0,
+                },
+            );
             let _ = judge.poll(i + 20, i + 30);
+            let _ = render::grow_headroom(i as usize, 128, MAX_EXTRA_HEADROOM_FRAMES);
+            let _ = is_backlogged(true, 128, 128);
             let _ = capture::guard_block(&mut block);
         }
         assert_eq!(alloc_count::this_thread() - before, 0);
+    }
+
+    #[test]
+    fn stage_and_reason_codes_round_trip() {
+        let stages = [
+            Stage::Passthrough,
+            Stage::WarmingUp,
+            Stage::FadingIn,
+            Stage::Devocal,
+            Stage::FadingOut,
+            Stage::Fallback,
+        ];
+        for (i, &st) in stages.iter().enumerate() {
+            assert_eq!(stage_code(st), i as u8, "documented mapping");
+            assert_eq!(stage_from_code(stage_code(st)), st);
+        }
+        assert_eq!(stage_from_code(200), Stage::Passthrough);
+        assert_eq!(AudioStats::default().stage.load(Ordering::Relaxed), 0);
+        for r in [
+            None,
+            Some(FallbackReason::Overload),
+            Some(FallbackReason::ModelError),
+        ] {
+            assert_eq!(reason_from_code(reason_code(r)), r);
+        }
+        assert_eq!(reason_code(None), 0);
+        assert_eq!(reason_code(Some(FallbackReason::Overload)), 1);
+        assert_eq!(reason_code(Some(FallbackReason::ModelError)), 2);
+        assert_eq!(reason_from_code(9), None);
+        assert!(stage_runs_model(Stage::WarmingUp) && stage_runs_model(Stage::FadingOut));
+        assert!(!stage_runs_model(Stage::Passthrough) && !stage_runs_model(Stage::Fallback));
+    }
+
+    #[test]
+    fn backlog_means_processing_is_behind() {
+        assert!(is_backlogged(true, 128, 128));
+        assert!(
+            !is_backlogged(true, 127, 128),
+            "less than a hop waiting: jitter"
+        );
+        assert!(!is_backlogged(false, 4_000, 128), "model not running");
     }
 
     #[test]

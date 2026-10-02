@@ -113,7 +113,7 @@ pub(crate) fn run(ctx: CaptureCtx, ready: Sender<Result<(), String>>) {
     let _com = match ComGuard::init_mta() {
         Ok(c) => c,
         Err(e) => {
-            ctx.shared.capture_failed.store(true, Ordering::Release);
+            ctx.stats.capture_failed.store(true, Ordering::Release);
             let _ = ready.send(Err(format!("capture: {e}")));
             return;
         }
@@ -126,15 +126,15 @@ pub(crate) fn run(ctx: CaptureCtx, ready: Sender<Result<(), String>>) {
 }
 
 fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<(), String> {
-    let fail = |shared: &Shared, e: String| {
-        shared.capture_failed.store(true, Ordering::Release);
+    let fail = |stats: &AudioStats, e: String| {
+        stats.capture_failed.store(true, Ordering::Release);
         e
     };
     // Note: activation waits for its completion callback without a timeout (vendored
     // wasapi); `AudioHandle::start` bounds the wait and `stop` detaches a stuck thread.
     let mut client = AudioClient::new_application_loopback_client(ctx.pid, true).map_err(|e| {
         fail(
-            &ctx.shared,
+            &ctx.stats,
             format!("process loopback for pid {}: {e}", ctx.pid),
         )
     })?;
@@ -148,16 +148,16 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
                 buffer_duration_hns: 0,
             },
         )
-        .map_err(|e| fail(&ctx.shared, format!("initialise loopback capture: {e}")))?;
+        .map_err(|e| fail(&ctx.stats, format!("initialise loopback capture: {e}")))?;
     let event = client
         .set_get_eventhandle()
-        .map_err(|e| fail(&ctx.shared, format!("capture event: {e}")))?;
+        .map_err(|e| fail(&ctx.stats, format!("capture event: {e}")))?;
     let cap = client
         .get_audiocaptureclient()
-        .map_err(|e| fail(&ctx.shared, format!("capture client: {e}")))?;
+        .map_err(|e| fail(&ctx.stats, format!("capture client: {e}")))?;
     client
         .start_stream()
-        .map_err(|e| fail(&ctx.shared, format!("start capture: {e}")))?;
+        .map_err(|e| fail(&ctx.stats, format!("start capture: {e}")))?;
     let _ = ready.send(Ok(()));
 
     let mut bytes = vec![0u8; MAX_PACKET_FRAMES * 8];
@@ -239,7 +239,7 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
     drop(event);
     match error {
         Some(e) => {
-            ctx.shared.capture_failed.store(true, Ordering::Release);
+            ctx.stats.capture_failed.store(true, Ordering::Release);
             eprintln!("devocal audio: {e}");
             Ok(())
         }

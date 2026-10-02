@@ -4,11 +4,14 @@
 //!   directly, `InitializeSharedAudioStream` at the minimum `GetSharedModeEnginePeriod`.
 //! - Otherwise: wasapi `EventsShared { autoconvert: true, buffer_duration_hns: 0 }`.
 //!
-//! Queue target = one device period + one hop (device padding plus ring B). Each wake fills
-//! the device up to the target; if that leaves less than one period queued the device would
-//! starve, so the shortfall is written as silence: the real frames before it fade out
-//! (`fade_edges`), the audio after it fades in, and one underrun is counted per gap if input
-//! was flowing. A queue more than 20 ms over target for a whole second is trimmed back (fade
+//! Queue target = one device period + one hop (+ jitter headroom), device padding plus ring B.
+//! Each wake fills the device up to the target; if that leaves less than one period queued the
+//! device would starve, so the shortfall up to the target is written as silence: the real
+//! frames before it fade out (`fade_edges`), the audio after it fades in, and one underrun is
+//! counted per gap if input kept flowing (`UnderrunJudge`). Ruling 18: an underrun while the
+//! processing thread was not behind is jitter and raises the target by one hop (at most one
+//! capture packet in total); when a user "on" is accepted the output pre-rolls once by about
+//! one capture packet of silence. A queue more than 20 ms over target for a whole second is trimmed back (fade
 //! out, skip, fade in). Output gain is ramped across each write; every sample is clamped to
 //! [-1, 1] (non-finite -> 0) before it reaches the device.
 
@@ -28,8 +31,9 @@ use windows::Win32::System::Com::CLSCTX_ALL;
 
 use super::endpoint::{find_render_device, low_latency_eligible, read_mix_format, CoTaskFormat};
 use super::{
-    count_underrun, edge_fade_frames, now_us, AudioStats, ComGuard, FadeIn, Mmcss, OwnedEvent,
-    RenderCommand, Shared, SharedGains, INPUT_FLOWING_US,
+    count_underrun, edge_fade_frames, is_backlogged, now_us, stage_from_code, stage_runs_model,
+    AudioStats, ComGuard, FadeIn, Mmcss, OwnedEvent, RenderCommand, Shared, SharedGains,
+    Starvation, INPUT_FLOWING_US, MAX_EXTRA_HEADROOM_FRAMES, PREROLL_FRAMES,
 };
 use crate::dsp::{fade_edges, frames_for_ms, SAMPLE_RATE};
 
@@ -103,7 +107,7 @@ impl TrimPolicy {
 /// ([`count_underrun`]) and counts only if another capture packet then arrives within
 /// [`INPUT_FLOWING_US`]; otherwise it was a pause. Pure; times in microseconds.
 pub struct UnderrunJudge {
-    starved_at: Option<u64>,
+    starved_at: Option<(u64, Starvation)>,
 }
 
 impl UnderrunJudge {
@@ -115,27 +119,32 @@ impl UnderrunJudge {
         self.starved_at = None;
     }
 
-    /// The output starved at `now_us` (call once per gap).
-    pub fn starved(&mut self, last_input_us: u64, now_us: u64) {
+    /// The output starved at `now_us` (call once per gap); `seen` is what the starvation
+    /// looked like (model running, ring A backlog) and is returned if it counts.
+    pub fn starved(&mut self, last_input_us: u64, now_us: u64, seen: Starvation) {
         if self.starved_at.is_none() && count_underrun(last_input_us, now_us) {
-            self.starved_at = Some(now_us);
+            self.starved_at = Some((now_us, seen));
         }
     }
 
-    /// True once for an armed starvation that input kept flowing through.
-    pub fn poll(&mut self, last_input_us: u64, now_us: u64) -> bool {
-        let Some(t) = self.starved_at else {
-            return false;
-        };
+    /// `Some` once for an armed starvation that input kept flowing through.
+    pub fn poll(&mut self, last_input_us: u64, now_us: u64) -> Option<Starvation> {
+        let (t, seen) = self.starved_at?;
         if last_input_us > t && last_input_us - t <= INPUT_FLOWING_US {
             self.starved_at = None;
-            return true;
+            return Some(seen);
         }
         if now_us.saturating_sub(t) > INPUT_FLOWING_US {
             self.starved_at = None;
         }
-        false
+        None
     }
+}
+
+/// Ruling 18: after a jitter underrun the render target grows by one hop, never beyond `cap`
+/// frames of extra headroom in total.
+pub fn grow_headroom(extra: usize, hop: usize, cap: usize) -> usize {
+    (extra + hop).min(cap)
 }
 
 /// Fades out the frames before each gap marker (a ring B position where the output jumps to
@@ -513,6 +522,11 @@ struct Renderer {
     /// Fed without a shortfall since the last gap; a starvation is judged only when primed.
     primed: bool,
     underruns: UnderrunJudge,
+    /// Jitter headroom on top of period + hop (ruling 18).
+    extra: usize,
+    /// Pre-roll silence still to write, and whether its leading fade-out is still to do.
+    preroll_left: usize,
+    preroll_fade: bool,
     last_gain: f32,
 }
 
@@ -531,6 +545,9 @@ impl Renderer {
             drop_pending: 0,
             primed: false,
             underruns: UnderrunJudge::new(),
+            extra: 0,
+            preroll_left: 0,
+            preroll_fade: false,
             last_gain: 0.0,
         }
     }
@@ -599,6 +616,15 @@ impl Renderer {
         self.drop_pending = 0;
         self.primed = false;
         self.underruns.reset();
+        // A new device starts without learned headroom or a stale pre-roll.
+        self.extra = 0;
+        self.ctx.stats.headroom_frames.store(0, Ordering::Relaxed);
+        self.preroll_left = 0;
+        self.preroll_fade = false;
+        self.ctx
+            .shared
+            .preroll_request
+            .store(false, Ordering::Release);
         self.last_gain = 0.0;
     }
 
@@ -658,14 +684,28 @@ impl Renderer {
         let period = sink.period_frames();
         let buffer = sink.buffer_frames().min(self.staging.len() / 2);
         let hop = self.ctx.shared.proc_hop.load(Ordering::Relaxed) as usize;
-        let target = (period + hop).min(buffer);
-        self.trim.set_target(target);
-
         let now = now_us();
         let last_input = self.ctx.shared.last_input_us.load(Ordering::Acquire);
-        if self.underruns.poll(last_input, now) {
+        if let Some(seen) = self.underruns.poll(last_input, now) {
+            // Snapshot first, then the count (the processing thread reads them in that order).
+            let sh = &self.ctx.shared;
+            sh.underrun_ran_model
+                .store(seen.ran_model, Ordering::Release);
+            sh.underrun_backlog_frames
+                .store(seen.backlog_frames as u32, Ordering::Release);
             self.ctx.stats.underruns.fetch_add(1, Ordering::AcqRel);
+            if !is_backlogged(seen.ran_model, seen.backlog_frames, hop) {
+                // Jitter, not a slow model: more headroom instead of a fallback.
+                self.extra = grow_headroom(self.extra, hop, MAX_EXTRA_HEADROOM_FRAMES);
+                self.ctx
+                    .stats
+                    .headroom_frames
+                    .store(self.extra as u32, Ordering::Relaxed);
+            }
         }
+        let target = (period + hop + self.extra).min(buffer);
+        self.trim.set_target(target);
+
         let mut avail = self.ctx.input.slots() / 2;
         if let Some(d) = self.trim.observe(avail + padding, now) {
             self.drop_pending = d;
@@ -675,6 +715,34 @@ impl Renderer {
         let must = period.saturating_sub(padding).min(room);
         if need == 0 {
             return Ok(padding);
+        }
+
+        if self.preroll_left == 0
+            && self
+                .ctx
+                .shared
+                .preroll_request
+                .swap(false, Ordering::AcqRel)
+        {
+            self.preroll_left = PREROLL_FRAMES;
+            self.preroll_fade = true;
+        }
+        if self.preroll_left > 0 {
+            // Pre-roll: fade out, then silence while input keeps filling ring B.
+            let mut w = 0;
+            if self.preroll_fade {
+                let k = self.fade_frames.min(need).min(avail);
+                self.take(0, k);
+                fade_edges(&mut self.staging[..k * 2], false, true, k);
+                self.preroll_fade = false;
+                w = k;
+            }
+            self.staging[w * 2..need * 2].fill(0.0);
+            self.preroll_left = self.preroll_left.saturating_sub(need - w);
+            if self.preroll_left == 0 {
+                self.fade_in.start(0);
+            }
+            return self.write_out(need, padding);
         }
 
         let mut w = 0;
@@ -696,20 +764,31 @@ impl Renderer {
         w += real;
 
         if w < must {
-            // The device would starve before the next wake: pad with silence.
+            // The device would starve before the next wake: pad with silence up to the
+            // target (ruling 18), not just one period.
             let k = w.min(self.fade_frames);
             fade_edges(&mut self.staging[(w - k) * 2..w * 2], false, true, k);
-            self.staging[w * 2..must * 2].fill(0.0);
+            self.staging[w * 2..need * 2].fill(0.0);
             if self.primed {
-                self.underruns.starved(last_input, now);
+                let seen = Starvation {
+                    ran_model: stage_runs_model(stage_from_code(
+                        self.ctx.stats.stage.load(Ordering::Acquire),
+                    )),
+                    backlog_frames: self.ctx.shared.in_ring_frames.load(Ordering::Acquire) as usize,
+                };
+                self.underruns.starved(last_input, now, seen);
             }
             self.primed = false;
             self.fade_in.start(0);
-            w = must;
+            w = need;
         } else if real > 0 {
             self.primed = true;
         }
+        self.write_out(w, padding)
+    }
 
+    /// Output gain ramp, clamp, and write of `staging[..w]`; returns the new padding.
+    fn write_out(&mut self, w: usize, padding: usize) -> Result<usize, String> {
         let gain = self.ctx.gains.output_gain();
         finish_block(&mut self.staging[..w * 2], self.last_gain, gain);
         self.last_gain = gain;
@@ -784,38 +863,65 @@ mod tests {
         assert_eq!(t.observe(6_000, s3 + 1_000_000), Some(1_500));
     }
 
+    const SEEN: Starvation = Starvation {
+        ran_model: true,
+        backlog_frames: 300,
+    };
+
     #[test]
     fn starvation_after_input_stops_is_not_an_underrun() {
         let mut j = UnderrunJudge::new();
         let t = 10_000_000;
         // Player paused: last packet 15 ms before the queue ran dry, none after.
-        j.starved(t - 15_000, t);
-        assert!(!j.poll(t - 15_000, t + 10_000));
-        assert!(!j.poll(t - 15_000, t + 51_000));
+        j.starved(t - 15_000, t, SEEN);
+        assert_eq!(j.poll(t - 15_000, t + 10_000), None);
+        assert_eq!(j.poll(t - 15_000, t + 51_000), None);
         // Playback resumes later: still not an underrun.
-        assert!(!j.poll(t + 400_000, t + 400_000));
+        assert_eq!(j.poll(t + 400_000, t + 400_000), None);
+    }
+
+    #[test]
+    fn headroom_grows_by_a_hop_up_to_one_packet() {
+        let cap = MAX_EXTRA_HEADROOM_FRAMES;
+        assert_eq!(cap, 441, "about one 10 ms capture packet");
+        let mut extra = 0;
+        let mut steps = Vec::new();
+        for _ in 0..6 {
+            extra = grow_headroom(extra, 128, cap);
+            steps.push(extra);
+        }
+        assert_eq!(steps, vec![128, 256, 384, 441, 441, 441]);
+        // Budget: 10 ms packet + 1 hop in ring A + 128 model + (441 period + 128 hop + 441)
+        // stays under 50 ms at 44.1 kHz.
+        let worst = 441 + 128 + 128 + 441 + 128 + cap;
+        assert!(worst * 1000 / 44_100 < 50, "{worst} frames");
     }
 
     #[test]
     fn starvation_while_input_flows_counts_once() {
         let mut j = UnderrunJudge::new();
         let t = 10_000_000;
-        j.starved(t - 4_000, t);
-        j.starved(t - 4_000, t + 3_000); // same gap, not re-armed
-        assert!(!j.poll(t - 4_000, t + 3_000));
-        assert!(
+        j.starved(t - 4_000, t, SEEN);
+        let other = Starvation {
+            ran_model: false,
+            backlog_frames: 0,
+        };
+        j.starved(t - 4_000, t + 3_000, other); // same gap, not re-armed
+        assert_eq!(j.poll(t - 4_000, t + 3_000), None);
+        assert_eq!(
             j.poll(t + 6_000, t + 8_000),
+            Some(SEEN),
             "next packet arrived: input kept flowing"
         );
-        assert!(!j.poll(t + 16_000, t + 18_000), "counted once");
+        assert_eq!(j.poll(t + 16_000, t + 18_000), None, "counted once");
         // Input already silent for > 50 ms when the queue ran dry: never armed.
         let mut j = UnderrunJudge::new();
-        j.starved(t - 51_000, t);
-        assert!(!j.poll(t + 5_000, t + 5_000));
+        j.starved(t - 51_000, t, SEEN);
+        assert_eq!(j.poll(t + 5_000, t + 5_000), None);
         // A packet more than 50 ms after the starvation is a resume, not flowing input.
         let mut j = UnderrunJudge::new();
-        j.starved(t - 4_000, t);
-        assert!(!j.poll(t + 51_000, t + 51_000));
+        j.starved(t - 4_000, t, SEEN);
+        assert_eq!(j.poll(t + 51_000, t + 51_000), None);
     }
 
     #[test]

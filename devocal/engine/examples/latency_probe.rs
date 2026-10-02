@@ -1,28 +1,25 @@
-//! Real-machine latency and dropout probe for a running devocal engine (Task 14).
+//! Passive real-machine latency and dropout probe (Task 14).
 //!
 //! Records, at the same time, the player's own audio (process loopback of its process tree)
-//! and the system output (loopback of the render endpoint the engine plays on), then:
-//! - finds the engine's added latency by cross-correlation (search 0..300 ms; coarse search on
-//!   8x decimated audio, refined at full rate) and reports the correlation coefficient;
-//! - counts dropouts on the output in 10 ms blocks: a block whose energy is more than 30 dB
-//!   below the median of its neighbours (±10 blocks) while those neighbours are audible;
-//!   dropouts also present in the player's own audio at the same time are reported apart;
+//! and the system output (loopback of a render endpoint, by default the default one), then:
+//! - finds the added latency by cross-correlation (search 0..300 ms; coarse search on 8x
+//!   decimated audio, refined at full rate) and reports the correlation coefficient;
+//! - counts dropouts in 10 ms blocks, separately on each stream and relative to that stream's
+//!   own level: a block more than 30 dB below the running median of its neighbours (±10
+//!   blocks), where those neighbours are within 30 dB of the stream's median block energy.
+//!   This works for the player's process loopback even while it is held at -80 dB.
+//!   Output dropouts also present in the player's own audio are reported apart;
 //! - prints one JSON object (and writes it to `--out` if given).
 //!
-//! It must be pointed at a running engine with `--engine-pipe`; it sends `hello`, reads the
-//! engine's state and metrics, and never changes any session volume itself.
+//! It only captures: it talks to no engine and never changes any session volume.
 //!
 //! Usage:
-//!   latency_probe --engine-pipe \\.\pipe\tune-love-devocal-<app pid> [--pid <player pid>]
-//!                 [--endpoint <render endpoint id>] [--seconds 60] [--out probe.json]
+//!   latency_probe --pid <player root pid> --seconds <s> [--endpoint <render endpoint id>]
+//!                 [--out probe.json]
 
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
-use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use devocal_core::protocol::{decode_event, encode, Command, Event, Metrics, Phase, PROTOCOL};
 use serde_json::json;
 use wasapi::{AudioClient, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
 
@@ -33,82 +30,49 @@ const BLOCK: usize = RATE / 100;
 const NEIGHBOURS: usize = 10;
 /// -30 dB in energy.
 const GAP_RATIO: f64 = 1e-3;
-/// Neighbours quieter than about -70 dBFS are silence, not music.
-const AUDIBLE_ENERGY: f64 = 1e-7;
+/// Neighbours count as audible when their median energy is within 30 dB of the stream's
+/// median block energy.
+const AUDIBLE_RELATIVE: f64 = 1e-3;
 /// Longest window used for the lag search.
 const SEARCH_SECONDS: usize = 10;
 
 struct Args {
-    pipe: String,
-    pid: Option<u32>,
+    pid: u32,
     endpoint: Option<String>,
     seconds: f64,
     out: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args {
-        pipe: String::new(),
-        pid: None,
-        endpoint: None,
-        seconds: 60.0,
-        out: None,
-    };
+    let (mut pid, mut seconds, mut endpoint, mut out) = (None, None, None, None);
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
-            "--engine-pipe" => a.pipe = value()?,
-            "--pid" => a.pid = Some(value()?.parse().map_err(|e| format!("--pid: {e}"))?),
-            "--endpoint" => a.endpoint = Some(value()?),
-            "--seconds" => a.seconds = value()?.parse().map_err(|e| format!("--seconds: {e}"))?,
-            "--out" => a.out = Some(value()?),
+            "--pid" => pid = Some(value()?.parse().map_err(|e| format!("--pid: {e}"))?),
+            "--seconds" => {
+                seconds = Some(
+                    value()?
+                        .parse::<f64>()
+                        .map_err(|e| format!("--seconds: {e}"))?,
+                )
+            }
+            "--endpoint" => endpoint = Some(value()?),
+            "--out" => out = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if a.pipe.is_empty() {
-        return Err("--engine-pipe is required: the probe only measures a running engine".into());
-    }
-    if !(a.seconds > 0.0 && a.seconds <= 600.0) {
+    let pid = pid.ok_or("--pid <player root pid> is required")?;
+    let seconds = seconds.ok_or("--seconds is required")?;
+    if !(seconds > 0.0 && seconds <= 600.0) {
         return Err("--seconds must be in (0, 600]".into());
     }
-    Ok(a)
-}
-
-#[derive(Default)]
-struct EngineView {
-    state: Option<Event>,
-    metrics: Vec<Metrics>,
-    errors: Vec<Event>,
-}
-
-/// Connects to the engine pipe, sends `hello` and collects events in the background.
-fn connect(pipe: &str) -> Result<Arc<Mutex<EngineView>>, String> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pipe)
-        .map_err(|e| format!("open engine pipe {pipe}: {e}"))?;
-    let hello = encode(&Command::Hello { version: PROTOCOL }).map_err(|e| e.to_string())?;
-    file.write_all(hello.as_bytes())
-        .map_err(|e| format!("send hello: {e}"))?;
-    let view = Arc::new(Mutex::new(EngineView::default()));
-    let sink = view.clone();
-    thread::spawn(move || {
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else { break };
-            let Ok(ev) = decode_event(&line) else {
-                continue;
-            };
-            let mut v = sink.lock().unwrap();
-            match ev {
-                Event::Metrics(m) => v.metrics.push(m),
-                e @ Event::State { .. } => v.state = Some(e),
-                e @ Event::Error { .. } => v.errors.push(e),
-            }
-        }
-    });
-    Ok(view)
+    Ok(Args {
+        pid,
+        endpoint,
+        seconds,
+        out,
+    })
 }
 
 enum Source {
@@ -270,12 +234,23 @@ fn find_lag(out: &[f32], src: &[f32], offset: i64) -> (usize, f64) {
     fine
 }
 
-/// 10 ms blocks more than 30 dB below their audible neighbours; returns runs as block indices.
+/// Dropout runs (first block index of each) in 10 ms blocks, relative to the stream's own
+/// level: energies are normalised by the stream's median block energy, a block is a gap when
+/// it is more than 30 dB below the running median of its ±10 neighbours and those neighbours
+/// are within 30 dB of the stream's median. A stream that is mostly digital silence (median
+/// energy 0) reports none.
 fn dropouts(x: &[f32]) -> Vec<usize> {
-    let energy: Vec<f64> = x
+    let mut energy: Vec<f64> = x
         .chunks_exact(BLOCK)
         .map(|b| b.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>() / BLOCK as f64)
         .collect();
+    let level = median(&energy);
+    if level <= 0.0 || !level.is_finite() {
+        return Vec::new();
+    }
+    for e in energy.iter_mut() {
+        *e /= level;
+    }
     let mut runs = Vec::new();
     let mut in_gap = false;
     let mut neighbours = Vec::with_capacity(2 * NEIGHBOURS);
@@ -284,15 +259,23 @@ fn dropouts(x: &[f32]) -> Vec<usize> {
         let lo = b.saturating_sub(NEIGHBOURS);
         let hi = (b + NEIGHBOURS + 1).min(energy.len());
         neighbours.extend((lo..hi).filter(|&k| k != b).map(|k| energy[k]));
-        neighbours.sort_by(|a, c| a.partial_cmp(c).unwrap_or(std::cmp::Ordering::Equal));
-        let median = neighbours.get(neighbours.len() / 2).copied().unwrap_or(0.0);
-        let gap = median > AUDIBLE_ENERGY && energy[b] < median * GAP_RATIO;
+        let local = median(&neighbours);
+        let gap = local > AUDIBLE_RELATIVE && energy[b] < local * GAP_RATIO;
         if gap && !in_gap {
             runs.push(b);
         }
         in_gap = gap;
     }
     runs
+}
+
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut v = values.to_vec();
+    v.sort_by(|a, c| a.partial_cmp(c).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
 }
 
 fn rms(x: &[f32]) -> f64 {
@@ -311,34 +294,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let engine = connect(&args.pipe)?;
-    // Wait for the engine's state to learn the attached player.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut attached = None;
-    while Instant::now() < deadline {
-        if let Some(Event::State {
-            phase,
-            attached_pid,
-            ..
-        }) = engine.lock().unwrap().state.clone()
-        {
-            if phase == Phase::Active {
-                attached = attached_pid;
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let pid = args
-        .pid
-        .or(attached)
-        .ok_or("no --pid given and the engine reports no attached player")?;
-    if let (Some(a), Some(p)) = (attached, args.pid) {
-        if a != p {
-            return Err(format!("engine is attached to pid {a}, not {p}"));
-        }
-    }
-
+    let pid = args.pid;
     let secs = args.seconds;
     let endpoint = args.endpoint.clone();
     let src = thread::spawn(move || record(Source::Process(pid), secs));
@@ -370,7 +326,6 @@ fn run() -> Result<(), String> {
         })
         .collect();
 
-    let view = engine.lock().unwrap();
     let report = json!({
         "pid": pid,
         "seconds": secs,
@@ -385,11 +340,7 @@ fn run() -> Result<(), String> {
         "outputRms": rms(&out_m),
         "sourceDiscontinuities": src.discontinuities,
         "outputDiscontinuities": out.discontinuities,
-        "engineState": view.state.as_ref().map(|s| serde_json::to_value(s).ok()),
-        "engineMetricsLast": view.metrics.last().map(|m| serde_json::to_value(m).ok()),
-        "engineMetricsCount": view.metrics.len(),
-        "engineMaxLoadRatio": view.metrics.iter().map(|m| m.load_ratio).fold(0.0f32, f32::max),
-        "engineErrors": view.errors.iter().filter_map(|e| serde_json::to_value(e).ok()).collect::<Vec<_>>(),
+        "endpoint": args.endpoint,
     });
     let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
     println!("{text}");

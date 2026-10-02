@@ -409,7 +409,7 @@ now-playing/
   pub struct Holder<S: SessionVolumes> { .. }
   impl<S: SessionVolumes> Holder<S> {
       pub fn new(sessions: S, restore_path: PathBuf) -> Self;
-      pub fn begin_attach(&mut self, pid: u32, created_at: u64, now_us: u64) -> Result<(), String>;
+      pub fn begin_attach(&mut self, pid: u32, created_at: u64, now_us: u64) -> Result<AttachReport, String>; // 裁定 15
       pub fn begin_release(&mut self, now_us: u64);
       pub fn tick(&mut self, now_us: u64) -> HolderPhase;   // 推进 4 步音量阶梯：0/10/20/30 ms
       pub fn follow(&mut self, now_us: u64) -> FollowReport; // 每 0.5 s：新会话、被调大的会话、进程退出
@@ -425,9 +425,20 @@ now-playing/
   pub fn next(phase: Phase, input: Input) -> Result<Phase, Phase /* 拒绝时原样返回 */>;
   ```
 - 还原倍数（对应 Review Focus 第 1 条）：
-  - `original` = 接管时进程树中所有原音量 > `HELD_VOLUME` 的会话里，原音量的最大值。
+  - `original` = 已压低会话（原音量 > `HELD_VOLUME`）的原音量中的**最小值**。
+    - 这条依据裁定 16（2026-10-02），取代原先的“最大值”：取最大值时，较小音量的会话会被放大到超过它自己的原音量（例如 1.0 和 0.2 两个会话，0.2 那个会响 +14 dB）。
+    - 每个会话释放时仍回到各自的原音量。
+    - 接管后 `follow` 又压低新会话时，`original` 只降不升。
   - 原音量 ≤ 1e-4 的会话不压低，也不写入恢复文件。
   - 一个会话都没有时 `original = 1.0`。
+  - 裁定 15（2026-10-02）：
+    - `begin_attach` 改为返回 `Result<AttachReport, String>`，`AttachReport { restore_failed, restore_corrupt, adopted }`。
+    - `restore()` 之后，若某会话仍为 1e-4，且恢复文件中保留的条目（无论是等待播放器还是恢复失败）与它的会话标识相同，就接管它：
+      - 原音量取该条目的原音量；
+      - 不再压低；
+      - 文件中用我们的条目替换那条保留条目。
+    - 没有匹配条目的 1e-4 会话视为用户自己的近零音量，不动。
+    - 播放器退出时，`FollowReport` 同样报告 `restore_failed` 与 `restore_corrupt`。
 - 写入顺序：每次压低新会话之前，先 `write_atomic` 更新恢复文件，把新条目追加进去。
 - 释放：
   - 4 步阶梯回到原音量。

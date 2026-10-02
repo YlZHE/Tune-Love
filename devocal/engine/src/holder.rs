@@ -28,6 +28,14 @@
 //! - Failures in `follow` are counted in [`FollowReport::failed`] with the first message in
 //!   [`FollowReport::error`]; until a pass succeeds the capture gain falls back to 1.0 (no
 //!   compensation), because a session that could not be lowered plays at its full level.
+//! - The outcome of every `restore::restore` the holder runs is surfaced: at attach in
+//!   [`AttachReport`] (or the `Err` message), after the player exited in
+//!   [`FollowReport::restore_failed`] / [`FollowReport::restore_corrupt`] (not counted in
+//!   `failed`, which is about this pass's own operations).
+//!
+//! Gain reference (ruling 16): `original` is the smallest original volume among the lowered
+//! sessions, so the compensating gain `original / HELD_VOLUME` never makes any session
+//! louder than before the takeover; quieter-than-max sessions are not boosted.
 
 use crate::dsp::GainHistory;
 use devocal_core::restore::{self, RestoreEntry, RestoreRecord, RESTORE_VERSION};
@@ -54,6 +62,19 @@ pub enum HolderPhase {
     Failed(String),
 }
 
+/// Result of a successful `begin_attach`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttachReport {
+    /// Entries the attach-time `restore::restore` could not restore (`RestoreOutcome::failed`);
+    /// they stay in the restore file.
+    pub restore_failed: usize,
+    /// The restore file did not parse and was quarantined (`RestoreOutcome::corrupt`).
+    pub restore_corrupt: bool,
+    /// Sessions still at the held volume that were taken over from a kept restore entry with
+    /// the same session identifier (their original is that entry's).
+    pub adopted: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FollowReport {
     pub newly_lowered: usize,
@@ -63,6 +84,10 @@ pub struct FollowReport {
     pub failed: usize,
     /// The first error message of this pass.
     pub error: Option<String>,
+    /// After `player_exited`: entries `restore::restore` could not restore (kept in the file).
+    pub restore_failed: usize,
+    /// After `player_exited`: the restore file did not parse and was quarantined.
+    pub restore_corrupt: bool,
 }
 
 impl FollowReport {
@@ -98,6 +123,8 @@ struct Owned {
     entry: RestoreEntry,
     /// The volume we last set; `None` = never lowered (e.g. `set_volume` failed).
     last_set: Option<f32>,
+    /// Lowered by the attach ramp (false for a session adopted at attach, already held).
+    ramp: bool,
     release_from: f32,
     release: Release,
 }
@@ -107,6 +134,7 @@ impl Owned {
         Self {
             entry,
             last_set: None,
+            ramp: true,
             release_from: 0.0,
             release: Release::Pending,
         }
@@ -144,7 +172,9 @@ pub struct Holder<S: SessionVolumes> {
     ramp_start_us: u64,
     ramp_step: u32,
     owned: Vec<Owned>,
-    /// Gain reference: the largest original volume among the lowered sessions (1.0 if none).
+    /// Gain reference: the smallest original volume among the lowered sessions (1.0 if none),
+    /// so no session comes out louder than its own original (ruling 16). Only ever decreases
+    /// while held.
     original: f32,
     /// Some session has been lowered since the attach (`original` comes from sessions).
     lowered_any: bool,
@@ -162,6 +192,8 @@ pub struct Holder<S: SessionVolumes> {
     release_error: Option<String>,
     /// A session's volume could not be read at attach (it was not lowered).
     attach_unread: bool,
+    /// Session identifiers of kept restore entries replaced by our own entries at attach.
+    absorbed: HashSet<String>,
 }
 
 /// True for a volume the holder lowers: finite, above `HELD_VOLUME` and not already held.
@@ -192,14 +224,23 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Rewrites the restore file as the entries already in it whose instance id is not in
-/// `owned_ids` (kept from earlier runs), followed by `ours`; deletes it when nothing remains.
-/// An unreadable or corrupt file is an error (never overwritten).
-fn update_file(path: &Path, ours: &[RestoreEntry], owned_ids: &HashSet<String>) -> io::Result<()> {
+/// Rewrites the restore file as the entries already in it (kept from earlier runs) whose
+/// instance id is not in `owned_ids` and whose session identifier is not in `absorbed`,
+/// followed by `ours`; deletes it when nothing remains. An unreadable or corrupt file is an
+/// error (never overwritten).
+fn update_file(
+    path: &Path,
+    ours: &[RestoreEntry],
+    owned_ids: &HashSet<String>,
+    absorbed: &HashSet<String>,
+) -> io::Result<()> {
     let existing = restore::read(path)?.map(|r| r.entries).unwrap_or_default();
     let mut entries: Vec<RestoreEntry> = existing
         .into_iter()
-        .filter(|e| !owned_ids.contains(&e.instance_id))
+        .filter(|e| {
+            !owned_ids.contains(&e.instance_id)
+                && (e.session_identifier.is_empty() || !absorbed.contains(&e.session_identifier))
+        })
         .collect();
     entries.extend_from_slice(ours);
     if entries.is_empty() {
@@ -241,6 +282,7 @@ impl<S: SessionVolumes> Holder<S> {
             attach_failure: None,
             release_error: None,
             attach_unread: false,
+            absorbed: HashSet::new(),
         }
     }
 
@@ -266,24 +308,76 @@ impl<S: SessionVolumes> Holder<S> {
     /// First runs `restore::restore` on the restore file, so a relaunched player whose
     /// session came back at the persisted held volume gets its real original back before
     /// originals are read. Then records every session whose volume is above `HELD_VOLUME`
-    /// (sessions at or below it are never lowered) and writes the restore file. Nothing is
-    /// lowered here; the ramp runs in `tick`. A session whose volume cannot be read now is
+    /// and writes the restore file. Nothing is lowered here; the ramp runs in `tick`.
+    ///
+    /// A session still at the held volume whose session identifier matches an entry the
+    /// restore kept (it could not be restored, or is awaiting the player) is adopted: owned
+    /// with that entry's original, not lowered again (it already is), and our entry replaces
+    /// the kept one in the file (ruling 15). Other sessions at or below `HELD_VOLUME` are the
+    /// user's own near-zero and are left alone. A session whose volume cannot be read now is
     /// picked up by `follow`.
-    pub fn begin_attach(&mut self, pid: u32, created_at: u64, now_us: u64) -> Result<(), String> {
+    ///
+    /// The restore outcome and the adoptions are returned in [`AttachReport`]; on `Err` the
+    /// restore outcome is appended to the message when it was not clean.
+    pub fn begin_attach(
+        &mut self,
+        pid: u32,
+        created_at: u64,
+        now_us: u64,
+    ) -> Result<AttachReport, String> {
         if self.stage != Stage::Idle {
             return Err(format!("cannot attach while {:?}", self.stage));
         }
-        restore::restore(&self.restore_path, &self.sessions);
+        let outcome = restore::restore(&self.restore_path, &self.sessions);
+        let mut report = AttachReport {
+            restore_failed: outcome.failed,
+            restore_corrupt: outcome.corrupt,
+            adopted: 0,
+        };
+        let with_restore = |msg: String| -> String {
+            if outcome.failed > 0 || outcome.corrupt {
+                format!(
+                    "{msg} (restore before attach: {} entries failed, corrupt file: {})",
+                    outcome.failed, outcome.corrupt
+                )
+            } else {
+                msg
+            }
+        };
+        // An unreadable file is already counted in `restore_failed`; adoption then finds
+        // nothing, and the write below fails if anything is to be lowered.
+        let kept = restore::read(&self.restore_path)
+            .ok()
+            .flatten()
+            .map(|r| r.entries)
+            .unwrap_or_default();
         let tree = self
             .sessions
             .sessions_for_tree(pid)
-            .map_err(|e| format!("enumerating the player's sessions failed: {e}"))?;
+            .map_err(|e| with_restore(format!("enumerating the player's sessions failed: {e}")))?;
         let mut owned = Vec::new();
+        let mut absorbed = HashSet::new();
         let mut unread = false;
         for s in &tree {
             match self.sessions.volume(&s.instance_id) {
                 Ok(v) if should_lower(v) => {
                     owned.push(Owned::new(self.entry_for(s, v, pid, created_at)));
+                }
+                Ok(v) if is_held(v) && !s.session_identifier.is_empty() => {
+                    let Some(k) = kept
+                        .iter()
+                        .find(|k| k.session_identifier == s.session_identifier)
+                    else {
+                        continue; // the user's own near-zero: left alone
+                    };
+                    let mut entry = self.entry_for(s, k.original_volume, pid, created_at);
+                    entry.original_mute = k.original_mute;
+                    let mut o = Owned::new(entry);
+                    o.last_set = Some(HELD_VOLUME);
+                    o.ramp = false;
+                    owned.push(o);
+                    absorbed.insert(s.session_identifier.clone());
+                    report.adopted += 1;
                 }
                 Ok(_) => {}
                 // Picked up by `follow`; until then it may play at full level.
@@ -293,13 +387,14 @@ impl<S: SessionVolumes> Holder<S> {
         if !owned.is_empty() {
             let ours: Vec<RestoreEntry> = owned.iter().map(|o| o.entry.clone()).collect();
             let ids = ours.iter().map(|e| e.instance_id.clone()).collect();
-            update_file(&self.restore_path, &ours, &ids)
-                .map_err(|e| format!("writing the restore file failed: {e}"))?;
+            update_file(&self.restore_path, &ours, &ids, &absorbed)
+                .map_err(|e| with_restore(format!("writing the restore file failed: {e}")))?;
         }
+        self.absorbed = absorbed;
         self.original = owned
             .iter()
             .map(|o| o.entry.original_volume)
-            .reduce(f32::max)
+            .reduce(f32::min)
             .unwrap_or(1.0);
         self.owned = owned;
         self.pid = pid;
@@ -314,7 +409,7 @@ impl<S: SessionVolumes> Holder<S> {
         self.attach_failure = None;
         self.release_error = None;
         self.attach_unread = unread;
-        Ok(())
+        Ok(report)
     }
 
     /// Starts the ramp back to the original volumes. No-op when idle or already releasing.
@@ -446,12 +541,7 @@ impl<S: SessionVolumes> Holder<S> {
                     degraded = true;
                 }
                 Ok(targets) => {
-                    if !self.lowered_any {
-                        // Nothing was held yet: the reference is the loudest session lowered now.
-                        if let Some(m) = targets.iter().filter_map(|t| t.1).reduce(f32::max) {
-                            self.original = m;
-                        }
-                    }
+                    let mut lowered_min: Option<f32> = None;
                     for (i, lower) in targets {
                         if lower.is_none() {
                             self.owned[i].last_set = Some(HELD_VOLUME); // adopted, already held
@@ -465,6 +555,8 @@ impl<S: SessionVolumes> Holder<S> {
                             Ok(()) => {
                                 self.owned[i].last_set = Some(HELD_VOLUME);
                                 r.newly_lowered += 1;
+                                let o = self.owned[i].entry.original_volume;
+                                lowered_min = Some(lowered_min.map_or(o, |m| m.min(o)));
                             }
                             Err(e) => {
                                 r.fail(format!("lowering session {id} failed: {e}"));
@@ -472,7 +564,15 @@ impl<S: SessionVolumes> Holder<S> {
                             }
                         }
                     }
-                    if r.newly_lowered > 0 && !self.lowered_any {
+                    if let Some(m) = lowered_min {
+                        // Ruling 16: the reference is the quietest lowered original and only
+                        // goes down. Gain entries recorded against a larger value now yield
+                        // less gain, so the window stays conservative.
+                        self.original = if self.lowered_any {
+                            self.original.min(m)
+                        } else {
+                            m
+                        };
                         self.lowered_any = true;
                         self.set_attenuation(HELD_VOLUME / self.original);
                     }
@@ -484,12 +584,14 @@ impl<S: SessionVolumes> Holder<S> {
     }
 
     /// Gain for the captured audio: `original / max(effective volume in the last 100 ms)`,
-    /// never louder than the audio was before the takeover.
+    /// with `original` the quietest lowered session's original, so no session is louder than
+    /// it was before the takeover.
     pub fn capture_gain(&self, now_us: u64) -> f32 {
         self.gains.conservative_gain(self.original, now_us)
     }
 
-    /// `HELD_VOLUME / original` while sessions are held; 1.0 otherwise.
+    /// `HELD_VOLUME / original` (quietest lowered original) while sessions are held; 1.0
+    /// otherwise.
     pub fn attenuation(&self) -> f32 {
         self.attenuation
     }
@@ -523,7 +625,7 @@ impl<S: SessionVolumes> Holder<S> {
         if !self.owned.is_empty() {
             self.record_gain(now_us, ramp_value(self.original, HELD_VOLUME, step));
         }
-        for o in &mut self.owned {
+        for o in self.owned.iter_mut().filter(|o| o.ramp) {
             let v = ramp_value(o.entry.original_volume, HELD_VOLUME, step);
             match self.sessions.set_volume(&o.entry.instance_id, v) {
                 Ok(()) => o.last_set = Some(v),
@@ -624,7 +726,7 @@ impl<S: SessionVolumes> Holder<S> {
                 .iter()
                 .map(|o| o.entry.instance_id.clone())
                 .collect();
-            if let Err(e) = update_file(&self.restore_path, &keep, &ids) {
+            if let Err(e) = update_file(&self.restore_path, &keep, &ids, &self.absorbed) {
                 self.release_error
                     .get_or_insert(format!("updating the restore file failed: {e}"));
             }
@@ -640,11 +742,13 @@ impl<S: SessionVolumes> Holder<S> {
     fn player_exited(&mut self, r: &mut FollowReport) {
         r.player_exited = true;
         let out = restore::restore(&self.restore_path, &self.sessions);
-        if out.failed > 0 {
-            r.failed += out.failed;
+        r.restore_failed = out.failed;
+        r.restore_corrupt = out.corrupt;
+        if out.failed > 0 || out.corrupt {
             r.error.get_or_insert(format!(
-                "{} restore entries could not be restored yet (kept in the restore file)",
-                out.failed
+                "restore after the player exited: {} entries not restored yet (kept in the \
+                 restore file), corrupt file: {}",
+                out.failed, out.corrupt
             ));
         }
         self.owned.clear();
@@ -691,7 +795,7 @@ impl<S: SessionVolumes> Holder<S> {
             }
         }
         let ids = ours.iter().map(|e| e.instance_id.clone()).collect();
-        update_file(&self.restore_path, &ours, &ids)?;
+        update_file(&self.restore_path, &ours, &ids, &self.absorbed)?;
         let known = self.owned.len();
         for (o, e) in self.owned.iter_mut().zip(&ours) {
             o.entry = e.clone();
@@ -1440,6 +1544,218 @@ mod tests {
         assert_eq!(release(&mut h, T0 + 1500 * MS), HolderPhase::Idle);
         assert_eq!(vol(&h, "late"), 0.8);
         assert!(!dir.file().exists());
+    }
+
+    fn kept_entry(pid: u32, id: &str, ident: &str, original: f32) -> RestoreEntry {
+        RestoreEntry {
+            pid,
+            created_at: 7,
+            instance_id: id.into(),
+            original_volume: original,
+            original_mute: false,
+            saved_at_ms: 1,
+            session_identifier: ident.into(),
+        }
+    }
+
+    fn write_file(dir: &TempDir, entries: Vec<RestoreEntry>) {
+        restore::write_atomic(
+            &dir.file(),
+            &RestoreRecord {
+                version: 1,
+                entries,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn attach_adopts_a_still_held_session_from_a_kept_entry() {
+        let dir = TempDir::new("adopt-kept");
+        // Earlier crash: player pid 10 (gone) was held; its original was 0.7.
+        write_file(&dir, vec![kept_entry(10, "old", "ident:player", 0.7)]);
+        let f = fake(&[]);
+        let mut s = info("new", PID);
+        s.session_identifier = "ident:player".into();
+        f.add_session(s, HELD_VOLUME, false); // relaunched at the persisted held volume
+        f.add_session(info("mine", PID), HELD_VOLUME, false); // user's own, no entry
+        f.fail_set_volume("new"); // the restore cannot bring it back
+        let mut h = Holder::new(f, dir.file());
+
+        let report = h.begin_attach(PID, CREATED, T0).unwrap();
+        assert_eq!(
+            report,
+            AttachReport {
+                restore_failed: 1,
+                restore_corrupt: false,
+                adopted: 1,
+            }
+        );
+        let n = h.sessions().set_volume_calls(); // the restore's failed attempt
+        for k in 0..4 {
+            assert_eq!(
+                h.tick(T0 + k * 10 * MS),
+                if k == 3 {
+                    HolderPhase::Held
+                } else {
+                    HolderPhase::Attaching
+                }
+            );
+        }
+        assert_eq!(
+            h.sessions().set_volume_calls(),
+            n,
+            "already held: not lowered again"
+        );
+        assert!((h.attenuation() - 1e-4 / 0.7).abs() < 1e-9);
+        assert!((h.capture_gain(T0 + 131 * MS) - 7000.0).abs() < 0.1);
+        // Our entry replaces the kept one; the user's own near-zero session is untouched.
+        let e = entries(&dir);
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            (e[0].instance_id.as_str(), e[0].original_volume),
+            ("new", 0.7)
+        );
+        assert_eq!(vol(&h, "mine"), HELD_VOLUME);
+
+        h.sessions().clear_failures();
+        assert_eq!(release(&mut h, T0 + 500 * MS), HolderPhase::Idle);
+        assert_eq!(vol(&h, "new"), 0.7);
+        assert_eq!(vol(&h, "mine"), HELD_VOLUME);
+        assert!(!dir.file().exists());
+    }
+
+    #[test]
+    fn attach_reports_restore_failures() {
+        // A kept entry whose process cannot be queried: failed, kept, merged.
+        let dir = TempDir::new("attach-restore-failed");
+        write_file(&dir, vec![kept_entry(77, "x", "ident:x", 0.9)]);
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        h.sessions().fail_process_created(77);
+        let report = h.begin_attach(PID, CREATED, T0).unwrap();
+        assert_eq!(
+            report,
+            AttachReport {
+                restore_failed: 1,
+                restore_corrupt: false,
+                adopted: 0,
+            }
+        );
+        assert_eq!(entry_ids(&dir), vec!["x", "a"]);
+
+        // A corrupt file is quarantined and reported.
+        let dir = TempDir::new("attach-restore-corrupt");
+        std::fs::write(dir.file(), "{oops").unwrap();
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        let report = h.begin_attach(PID, CREATED, T0).unwrap();
+        assert!(report.restore_corrupt);
+        assert!(dir.0.join("devocal-restore.json.corrupt").exists());
+        assert_eq!(entry_ids(&dir), vec!["a"]);
+
+        // An unreadable file: the attach fails and the message carries the restore outcome.
+        let dir = TempDir::new("attach-restore-unreadable");
+        std::fs::create_dir(dir.file()).unwrap();
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        let err = h.begin_attach(PID, CREATED, T0).unwrap_err();
+        assert!(
+            err.contains("restore before attach: 1 entries failed"),
+            "{err}"
+        );
+        assert_eq!(h.sessions().set_volume_calls(), 0);
+
+        // A clean attach reports nothing.
+        let dir = TempDir::new("attach-restore-clean");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        assert_eq!(
+            h.begin_attach(PID, CREATED, T0).unwrap(),
+            AttachReport::default()
+        );
+    }
+
+    #[test]
+    fn player_exit_reports_restore_failures() {
+        let dir = TempDir::new("exit-restore-failed");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        h.sessions().set_process_created(PID, None);
+        h.sessions().fail_set_volume("a");
+        let r = h.follow(T0 + 500 * MS);
+        assert!(r.player_exited);
+        assert_eq!((r.restore_failed, r.restore_corrupt), (1, false));
+        assert!(r.error.is_some());
+        assert_eq!(entry_ids(&dir), vec!["a"]);
+
+        let dir = TempDir::new("exit-restore-corrupt");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        std::fs::write(dir.file(), "{oops").unwrap();
+        h.sessions().set_process_created(PID, None);
+        let r = h.follow(T0 + 500 * MS);
+        assert!(r.player_exited && r.restore_corrupt);
+        assert!(r.error.is_some());
+    }
+
+    #[test]
+    fn two_sessions_use_the_quieter_original() {
+        let dir = TempDir::new("quieter");
+        let mut h = holder(&dir, &[("loud", 1.0), ("quiet", 0.2)]);
+        h.begin_attach(PID, CREATED, T0).unwrap();
+        // Every ms of the ramp and the window after it: no session is boosted above its own
+        // original, i.e. gain <= o_s / v for every volume v either session had in the window.
+        type History = Vec<(u64, f32)>;
+        let mut hist: Vec<(&str, f32, History)> = vec![
+            ("loud", 1.0, vec![(0, 1.0)]),
+            ("quiet", 0.2, vec![(0, 0.2)]),
+        ];
+        for ms in 0..=130 {
+            let t = T0 + ms * MS;
+            h.tick(t);
+            let g = h.capture_gain(t);
+            let window_start = t.saturating_sub(100 * MS);
+            for (id, o, history) in &mut hist {
+                let v = vol(&h, id);
+                if history.last().unwrap().1 != v {
+                    history.push((t, v));
+                }
+                for (i, &(since, v)) in history.iter().enumerate() {
+                    let until = history.get(i + 1).map_or(u64::MAX, |n| n.0);
+                    if until < window_start || since > t {
+                        continue;
+                    }
+                    assert!(g <= *o / v * (1.0 + 1e-5), "{id} +{ms} ms: {g} > {o}/{v}");
+                }
+            }
+        }
+        assert_eq!(
+            (vol(&h, "loud"), vol(&h, "quiet")),
+            (HELD_VOLUME, HELD_VOLUME)
+        );
+        assert!((h.attenuation() - 1e-4 / 0.2).abs() < 1e-9);
+        assert!((h.capture_gain(T0 + 131 * MS) - 2000.0).abs() < 0.05);
+        // Each session still goes back to its own original.
+        assert_eq!(release(&mut h, T0 + 500 * MS), HolderPhase::Idle);
+        assert_eq!((vol(&h, "loud"), vol(&h, "quiet")), (1.0, 0.2));
+    }
+
+    #[test]
+    fn a_quieter_late_session_lowers_the_original_only_downwards() {
+        let dir = TempDir::new("quieter-late");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let e0 = h.attenuation_epoch();
+        h.sessions().add_session(info("loud", PID), 0.9, false);
+        let t = T0 + 500 * MS;
+        assert_eq!(h.follow(t).newly_lowered, 1);
+        assert!((h.attenuation() - 1e-4 / 0.5).abs() < 1e-9, "never goes up");
+        assert_eq!(h.attenuation_epoch(), e0);
+
+        h.sessions().add_session(info("quiet", PID), 0.25, false);
+        let t = t + 500 * MS;
+        assert_eq!(h.follow(t).newly_lowered, 1);
+        assert!((h.attenuation() - 1e-4 / 0.25).abs() < 1e-9);
+        assert_eq!(h.attenuation_epoch(), e0 + 1);
+        assert!(h.capture_gain(t + 100 * MS) <= 1.0 + 1e-6);
+        assert!((h.capture_gain(t + 101 * MS) - 2500.0).abs() < 0.1);
     }
 
     #[test]

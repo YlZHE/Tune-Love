@@ -8,7 +8,7 @@
 //! does not initialise COM itself; without it the calls fail with `CO_E_NOTINITIALIZED`.
 //! [`process_tree`] and [`tree_from_pairs`] do not use COM.
 
-use crate::sessions::{SessionInfo, SessionVolumes};
+use crate::sessions::{endpoint_of_instance, SessionInfo, SessionVolumes};
 use std::collections::{HashMap, HashSet};
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE};
@@ -147,11 +147,21 @@ struct RawSession {
     control: IAudioSessionControl2,
 }
 
+/// Result of one enumeration pass over the active render endpoints.
+struct Enumerated {
+    sessions: Vec<RawSession>,
+    /// Ids of the active render endpoints that were read.
+    active_endpoints: HashSet<String>,
+    /// First failure that affected only one endpoint (its sessions are missing from `sessions`).
+    error: Option<String>,
+}
+
 /// Every session on every active render endpoint. A failure that affects only one endpoint is
-/// returned alongside the sessions that were read (the first such error), so a lookup can still
-/// succeed when it found its target, but never reports "absent" when it might not be.
-fn enumerate() -> Result<(Vec<RawSession>, Option<String>), String> {
+/// returned alongside the sessions that were read, so a lookup can still succeed when it found
+/// its target, but never reports "absent" when it might not be.
+fn enumerate() -> Result<Enumerated, String> {
     let mut out = Vec::new();
+    let mut active_endpoints = HashSet::new();
     let mut first_err: Option<String> = None;
     let en: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
@@ -164,6 +174,7 @@ fn enumerate() -> Result<(Vec<RawSession>, Option<String>), String> {
             let dev = unsafe { devices.Item(i) }.map_err(|e| format!("endpoint {i}: {e}"))?;
             let id = unsafe { dev.GetId() }.map_err(|e| format!("endpoint {i} id: {e}"))?;
             let endpoint_id = take_pwstr(id)?;
+            active_endpoints.insert(endpoint_id.clone());
             let mgr: IAudioSessionManager2 = unsafe { dev.Activate(CLSCTX_ALL, None) }
                 .map_err(|e| format!("session manager on {endpoint_id}: {e}"))?;
             let sessions = unsafe { mgr.GetSessionEnumerator() }
@@ -185,7 +196,11 @@ fn enumerate() -> Result<(Vec<RawSession>, Option<String>), String> {
             first_err.get_or_insert(e);
         }
     }
-    Ok((out, first_err))
+    Ok(Enumerated {
+        sessions: out,
+        active_endpoints,
+        error: first_err,
+    })
 }
 
 fn instance_id(s: &RawSession) -> Result<String, String> {
@@ -194,23 +209,52 @@ fn instance_id(s: &RawSession) -> Result<String, String> {
     take_pwstr(p)
 }
 
+fn session_identifier(s: &RawSession) -> Result<String, String> {
+    let p = unsafe { s.control.GetSessionIdentifier() }
+        .map_err(|e| format!("session identifier: {e}"))?;
+    take_pwstr(p)
+}
+
 fn info(s: &RawSession, instance_id: String) -> Result<SessionInfo, String> {
     let pid = unsafe { s.control.GetProcessId() }
         .map_err(|e| format!("session pid ({instance_id}): {e}"))?;
     let state = unsafe { s.control.GetState() }
         .map_err(|e| format!("session state ({instance_id}): {e}"))?;
+    let session_identifier = session_identifier(s).map_err(|e| format!("{e} ({instance_id})"))?;
     Ok(SessionInfo {
         instance_id,
+        session_identifier,
         pid,
         endpoint_id: s.endpoint_id.clone(),
         active: state == AudioSessionStateActive,
     })
 }
 
+/// Outcome of a lookup that read everything without error and found nothing. The instance id
+/// names its endpoint (prefix before the first `|`); only if that endpoint is active is the
+/// session really absent. On an unplugged or disabled endpoint its sessions are not enumerated
+/// but may well still exist (and come back), so that, like an unparsable id, is an error.
+fn not_found<T>(
+    instance_id: &str,
+    active_endpoints: &HashSet<String>,
+) -> Result<Option<T>, String> {
+    match endpoint_of_instance(instance_id) {
+        Some(ep) if active_endpoints.contains(ep) => Ok(None),
+        Some(ep) => Err(format!(
+            "endpoint {ep} is not active; session may still exist: {instance_id}"
+        )),
+        None => Err(format!("no endpoint in session instance id: {instance_id}")),
+    }
+}
+
 /// The session with this instance identifier. `Ok(None)` only when every endpoint and session
-/// was read without error and none matched.
+/// was read without error, none matched, and the id's endpoint is active (see [`not_found`]).
 fn find(wanted: &str) -> Result<Option<(SessionInfo, RawSession)>, String> {
-    let (sessions, mut err) = enumerate()?;
+    let Enumerated {
+        sessions,
+        active_endpoints,
+        error: mut err,
+    } = enumerate()?;
     for s in sessions {
         match instance_id(&s) {
             Ok(id) if id == wanted => {
@@ -225,7 +269,7 @@ fn find(wanted: &str) -> Result<Option<(SessionInfo, RawSession)>, String> {
     }
     match err {
         Some(e) => Err(e),
-        None => Ok(None),
+        None => not_found(wanted, &active_endpoints),
     }
 }
 
@@ -246,12 +290,12 @@ impl SessionVolumes for WinSessions {
             return Err("pid 0 is not a player process".into());
         }
         let tree: HashSet<u32> = process_tree(root_pid).into_iter().collect();
-        let (sessions, err) = enumerate()?;
-        if let Some(e) = err {
+        let all = enumerate()?;
+        if let Some(e) = all.error {
             return Err(e);
         }
         let mut out = Vec::new();
-        for s in &sessions {
+        for s in &all.sessions {
             // A session whose pid cannot be read cannot be attributed to the tree.
             let Ok(pid) = (unsafe { s.control.GetProcessId() }) else {
                 continue;
@@ -260,6 +304,25 @@ impl SessionVolumes for WinSessions {
                 continue;
             }
             out.push(info(s, instance_id(s)?)?);
+        }
+        Ok(out)
+    }
+
+    /// Sessions with this pid-free identifier on every active render endpoint. Like
+    /// `sessions_for_tree`, fails rather than returning a partial list.
+    fn sessions_with_identifier(
+        &self,
+        session_identifier: &str,
+    ) -> Result<Vec<SessionInfo>, String> {
+        let all = enumerate()?;
+        if let Some(e) = all.error {
+            return Err(e);
+        }
+        let mut out = Vec::new();
+        for s in &all.sessions {
+            if self::session_identifier(s)? == session_identifier {
+                out.push(info(s, instance_id(s)?)?);
+            }
         }
         Ok(out)
     }
@@ -292,6 +355,9 @@ impl SessionVolumes for WinSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Far above any pid Windows hands out; `OpenProcess` reports `ERROR_INVALID_PARAMETER`.
+    const UNUSED_PID: u32 = 0xFFFF_FFF0;
 
     fn sorted(mut v: Vec<u32>) -> Vec<u32> {
         v.sort_unstable();
@@ -340,6 +406,30 @@ mod tests {
         ];
         assert_eq!(sorted(tree_from_pairs(100, &procs)), vec![100, 101, 102]);
         assert_eq!(tree_from_pairs(0, &procs), vec![0]);
+    }
+
+    #[test]
+    fn missing_session_is_absent_only_on_an_active_endpoint() {
+        let active: HashSet<String> = HashSet::from(["{ep-a}".to_string()]);
+        assert_eq!(
+            not_found::<()>("{ep-a}|x.exe%b{0}|1%b10", &active),
+            Ok(None)
+        );
+        // Endpoint unplugged/disabled: the session may still exist there.
+        assert!(not_found::<()>("{ep-b}|x.exe%b{0}|1%b10", &active).is_err());
+        // No endpoint prefix: cannot tell, so never "absent".
+        assert!(not_found::<()>("garbage", &active).is_err());
+    }
+
+    #[test]
+    fn process_created_reports_this_process() {
+        let me = WinSessions.process_created(std::process::id());
+        assert!(matches!(me, Ok(Some(t)) if t > 0), "{me:?}");
+    }
+
+    #[test]
+    fn process_created_reports_an_unused_pid_as_absent() {
+        assert_eq!(WinSessions.process_created(UNUSED_PID), Ok(None));
     }
 
     #[test]

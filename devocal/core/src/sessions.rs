@@ -12,14 +12,32 @@ pub fn is_held(v: f32) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
+    /// Session instance identifier: unique per session, contains the owning pid.
     pub instance_id: String,
+    /// Session identifier (`IAudioSessionControl2::GetSessionIdentifier`): pid-free, the same for
+    /// every launch of the same executable on the same endpoint. Windows persists per-app
+    /// session volume under this kind of key, so it survives a player restart.
+    pub session_identifier: String,
     pub pid: u32,
     pub endpoint_id: String,
     pub active: bool,
 }
 
+/// Endpoint id of a session instance identifier: the non-empty prefix before the first `|`.
+pub fn endpoint_of_instance(instance_id: &str) -> Option<&str> {
+    instance_id
+        .split_once('|')
+        .map(|(ep, _)| ep)
+        .filter(|ep| !ep.is_empty())
+}
+
 pub trait SessionVolumes {
     fn sessions_for_tree(&self, root_pid: u32) -> Result<Vec<SessionInfo>, String>;
+    /// All current sessions whose (pid-free) session identifier equals `session_identifier`.
+    fn sessions_with_identifier(
+        &self,
+        session_identifier: &str,
+    ) -> Result<Vec<SessionInfo>, String>;
     fn session(&self, instance_id: &str) -> Result<Option<SessionInfo>, String>;
     fn volume(&self, instance_id: &str) -> Result<f32, String>;
     fn set_volume(&self, instance_id: &str, volume: f32) -> Result<(), String>;
@@ -37,7 +55,7 @@ pub use fake::{FakeSessions, SetVolumeHook};
 
 #[cfg(any(test, feature = "fake"))]
 mod fake {
-    use super::{SessionInfo, SessionVolumes};
+    use super::{endpoint_of_instance, SessionInfo, SessionVolumes};
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
 
@@ -59,6 +77,19 @@ mod fake {
         fail_volume: HashSet<String>,
         fail_set_volume: HashSet<String>,
         fail_process_created: HashSet<u32>,
+        fail_sessions_with_identifier: HashSet<String>,
+        /// Endpoints marked unplugged/disabled: their sessions are not enumerated.
+        inactive_endpoints: HashSet<String>,
+    }
+
+    impl State {
+        /// The session, if it exists and its endpoint is active (i.e. it would be enumerated).
+        fn visible(&self, instance_id: &str) -> Option<&FakeSession> {
+            self.sessions.iter().find(|s| {
+                s.info.instance_id == instance_id
+                    && !self.inactive_endpoints.contains(&s.info.endpoint_id)
+            })
+        }
     }
 
     /// Hook called as `(instance_id, volume)` at the start of every `set_volume`.
@@ -76,7 +107,11 @@ mod fake {
             Self::default()
         }
 
-        pub fn add_session(&self, info: SessionInfo, volume: f32, muted: bool) {
+        /// Adds a session. An empty `session_identifier` is replaced by a unique default.
+        pub fn add_session(&self, mut info: SessionInfo, volume: f32, muted: bool) {
+            if info.session_identifier.is_empty() {
+                info.session_identifier = format!("fake-identifier:{}", info.instance_id);
+            }
             self.state.borrow_mut().sessions.push(FakeSession {
                 info,
                 volume,
@@ -180,13 +215,34 @@ mod fake {
             self.state.borrow_mut().fail_process_created.insert(pid);
         }
 
-        /// Clears all injected failures.
+        /// Makes `sessions_with_identifier(id)` return an error until `clear_failures`.
+        pub fn fail_sessions_with_identifier(&self, session_identifier: &str) {
+            self.state
+                .borrow_mut()
+                .fail_sessions_with_identifier
+                .insert(session_identifier.into());
+        }
+
+        /// Marks an endpoint unplugged/disabled (`false`) or active again (`true`). Like
+        /// `WinSessions`, sessions on an inactive endpoint are not enumerated, and looking up an
+        /// instance id on such an endpoint is an error rather than "absent".
+        pub fn set_endpoint_active(&self, endpoint_id: &str, active: bool) {
+            let mut st = self.state.borrow_mut();
+            if active {
+                st.inactive_endpoints.remove(endpoint_id);
+            } else {
+                st.inactive_endpoints.insert(endpoint_id.into());
+            }
+        }
+
+        /// Clears all injected failures (not endpoint states).
         pub fn clear_failures(&self) {
             let mut st = self.state.borrow_mut();
             st.fail_session.clear();
             st.fail_volume.clear();
             st.fail_set_volume.clear();
             st.fail_process_created.clear();
+            st.fail_sessions_with_identifier.clear();
         }
     }
 
@@ -209,33 +265,61 @@ mod fake {
             Ok(st
                 .sessions
                 .iter()
+                .filter(|s| !st.inactive_endpoints.contains(&s.info.endpoint_id))
                 .filter(|s| in_tree(s.info.pid))
                 .map(|s| s.info.clone())
                 .collect())
         }
 
+        fn sessions_with_identifier(
+            &self,
+            session_identifier: &str,
+        ) -> Result<Vec<SessionInfo>, String> {
+            let st = self.state.borrow();
+            if st
+                .fail_sessions_with_identifier
+                .contains(session_identifier)
+            {
+                return Err(format!(
+                    "injected sessions_with_identifier failure: {session_identifier}"
+                ));
+            }
+            Ok(st
+                .sessions
+                .iter()
+                .filter(|s| !st.inactive_endpoints.contains(&s.info.endpoint_id))
+                .filter(|s| s.info.session_identifier == session_identifier)
+                .map(|s| s.info.clone())
+                .collect())
+        }
+
         fn session(&self, instance_id: &str) -> Result<Option<SessionInfo>, String> {
-            if self.state.borrow().fail_session.contains(instance_id) {
+            let st = self.state.borrow();
+            if st.fail_session.contains(instance_id) {
                 return Err(format!("injected session failure: {instance_id}"));
             }
-            Ok(self
-                .state
-                .borrow()
+            if let Some(s) = st.visible(instance_id) {
+                return Ok(Some(s.info.clone()));
+            }
+            let stored_endpoint = st
                 .sessions
                 .iter()
                 .find(|s| s.info.instance_id == instance_id)
-                .map(|s| s.info.clone()))
+                .map(|s| s.info.endpoint_id.as_str());
+            match stored_endpoint.or_else(|| endpoint_of_instance(instance_id)) {
+                Some(ep) if st.inactive_endpoints.contains(ep) => {
+                    Err(format!("endpoint {ep} is not active: {instance_id}"))
+                }
+                _ => Ok(None),
+            }
         }
 
         fn volume(&self, instance_id: &str) -> Result<f32, String> {
-            if self.state.borrow().fail_volume.contains(instance_id) {
+            let st = self.state.borrow();
+            if st.fail_volume.contains(instance_id) {
                 return Err(format!("injected volume failure: {instance_id}"));
             }
-            self.state
-                .borrow()
-                .sessions
-                .iter()
-                .find(|s| s.info.instance_id == instance_id)
+            st.visible(instance_id)
                 .map(|s| s.volume)
                 .ok_or_else(|| format!("no such session: {instance_id}"))
         }
@@ -249,25 +333,22 @@ mod fake {
             if st.fail_set_volume.contains(instance_id) {
                 return Err(format!("injected set_volume failure: {instance_id}"));
             }
-            match st
+            if st.visible(instance_id).is_none() {
+                return Err(format!("no such session: {instance_id}"));
+            }
+            let s = st
                 .sessions
                 .iter_mut()
                 .find(|s| s.info.instance_id == instance_id)
-            {
-                Some(s) => {
-                    s.volume = volume;
-                    Ok(())
-                }
-                None => Err(format!("no such session: {instance_id}")),
-            }
+                .expect("visible session exists");
+            s.volume = volume;
+            Ok(())
         }
 
         fn muted(&self, instance_id: &str) -> Result<bool, String> {
             self.state
                 .borrow()
-                .sessions
-                .iter()
-                .find(|s| s.info.instance_id == instance_id)
+                .visible(instance_id)
                 .map(|s| s.muted)
                 .ok_or_else(|| format!("no such session: {instance_id}"))
         }
@@ -299,10 +380,71 @@ mod tests {
     fn info(id: &str, pid: u32) -> SessionInfo {
         SessionInfo {
             instance_id: id.into(),
+            session_identifier: String::new(),
             pid,
             endpoint_id: "ep".into(),
             active: true,
         }
+    }
+
+    #[test]
+    fn endpoint_of_instance_takes_the_prefix_before_the_first_bar() {
+        let id = "{0.0.0.00000000}.{667b}|\\Device\\HarddiskVolume3\\x.exe%b{0000}|1%b19376";
+        assert_eq!(endpoint_of_instance(id), Some("{0.0.0.00000000}.{667b}"));
+        assert_eq!(endpoint_of_instance("ep|a|b"), Some("ep"));
+        assert_eq!(endpoint_of_instance("no-bar"), None);
+        assert_eq!(endpoint_of_instance("|leading"), None);
+        assert_eq!(endpoint_of_instance(""), None);
+    }
+
+    #[test]
+    fn fake_session_identifier_lookup_and_injected_failure() {
+        let f = FakeSessions::new();
+        let mut a = info("ep|a|1%b10", 10);
+        a.session_identifier = "ep|player.exe%b{0}".into();
+        f.add_session(a.clone(), 0.5, false);
+        f.add_session(info("ep|b|1%b11", 11), 0.5, false); // gets a default identifier
+        let b = f.session("ep|b|1%b11").unwrap().unwrap();
+        assert!(!b.session_identifier.is_empty());
+        assert_ne!(b.session_identifier, a.session_identifier);
+
+        assert_eq!(
+            f.sessions_with_identifier("ep|player.exe%b{0}"),
+            Ok(vec![a])
+        );
+        assert_eq!(f.sessions_with_identifier("nothing"), Ok(vec![]));
+        f.fail_sessions_with_identifier("ep|player.exe%b{0}");
+        assert!(f.sessions_with_identifier("ep|player.exe%b{0}").is_err());
+        f.clear_failures();
+        assert_eq!(
+            f.sessions_with_identifier("ep|player.exe%b{0}")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn fake_inactive_endpoint_hides_sessions_and_errors_lookups() {
+        let f = FakeSessions::new();
+        let mut a = info("ep2|a|1%b10", 10);
+        a.endpoint_id = "ep2".into();
+        a.session_identifier = "ep2|player.exe%b{0}".into();
+        f.add_session(a.clone(), 1.0e-4, false);
+        f.set_endpoint_active("ep2", false);
+        // Not visible, but not reported as absent either.
+        assert!(f.session("ep2|a|1%b10").is_err());
+        assert!(f.session("ep2|unknown").is_err());
+        assert!(f.volume("ep2|a|1%b10").is_err());
+        assert_eq!(f.sessions_for_tree(10), Ok(vec![]));
+        assert_eq!(
+            f.sessions_with_identifier("ep2|player.exe%b{0}"),
+            Ok(vec![])
+        );
+        // Ids on active (or unknown) endpoints still report absence normally.
+        assert_eq!(f.session("ep|missing"), Ok(None));
+        f.set_endpoint_active("ep2", true);
+        assert_eq!(f.session("ep2|a|1%b10"), Ok(Some(a)));
     }
 
     #[test]

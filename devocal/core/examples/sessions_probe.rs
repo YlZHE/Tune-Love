@@ -35,6 +35,7 @@ fn main() {
     println!("{} session(s)", sessions.len());
     for info in &sessions {
         println!("- instance: {}", info.instance_id);
+        println!("  session_identifier: {}", info.session_identifier);
         println!("  pid: {}  active: {}", info.pid, info.active);
         println!("  endpoint: {}", info.endpoint_id);
         println!("  volume: {:?}", s.volume(&info.instance_id));
@@ -42,6 +43,11 @@ fn main() {
         println!(
             "  session lookup: {:?}",
             s.session(&info.instance_id).map(|o| o.is_some())
+        );
+        println!(
+            "  sessions with this identifier: {:?}",
+            s.sessions_with_identifier(&info.session_identifier)
+                .map(|v| v.into_iter().map(|i| i.pid).collect::<Vec<_>>())
         );
     }
 }

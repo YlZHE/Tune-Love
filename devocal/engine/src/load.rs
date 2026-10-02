@@ -1,7 +1,8 @@
 //! Processing-load monitor.
 
 /// Sliding average of per-block processing time versus the block duration.
-/// Fixed-size ring; with fewer samples than the window it averages what it has.
+/// Fixed-size ring; `ratio` averages the samples recorded so far (up to the window) but
+/// `overloaded` needs the window to be full.
 pub struct LoadMonitor {
     block_us: f64,
     threshold: f64,
@@ -52,8 +53,10 @@ impl LoadMonitor {
         self.sum / self.len as f64 / self.block_us
     }
 
+    /// True only once a full window has been recorded (since construction or `reset`)
+    /// and its mean exceeds the threshold, so one slow warm-up block cannot trip it.
     pub fn overloaded(&self) -> bool {
-        self.ratio() > self.threshold
+        self.len == self.ring.len() && self.ratio() > self.threshold
     }
 
     pub fn reset(&mut self) {
@@ -91,10 +94,35 @@ mod tests {
         let mut m = LoadMonitor::new(1000.0, 4, 0.5);
         m.record(800.0);
         assert!((m.ratio() - 0.8).abs() < 1e-12); // averaged over 1 sample
+        assert!(!m.overloaded()); // window not yet full
         for _ in 0..4 {
             m.record(100.0);
         }
         assert!((m.ratio() - 0.1).abs() < 1e-12); // old sample slid out
+        assert!(!m.overloaded());
+    }
+
+    #[test]
+    fn single_slow_first_block_does_not_trip() {
+        let mut m = LoadMonitor::new(2902.0, 344, 0.70);
+        m.record(50_000.0);
+        assert!(m.ratio() > 0.70);
+        assert!(!m.overloaded());
+    }
+
+    #[test]
+    fn trips_only_after_a_full_window() {
+        let mut m = LoadMonitor::new(1000.0, 4, 0.5);
+        for _ in 0..3 {
+            m.record(900.0);
+            assert!(!m.overloaded());
+        }
+        m.record(900.0);
+        assert!(m.overloaded());
+        m.reset();
+        for _ in 0..3 {
+            m.record(900.0);
+        }
         assert!(!m.overloaded());
     }
 }

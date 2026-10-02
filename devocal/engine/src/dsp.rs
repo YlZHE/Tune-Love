@@ -131,9 +131,14 @@ impl GainHistory {
     }
 
     /// `original / max(volume in effect at any point in [now - window, now])`, where the
-    /// maximum also covers sets stamped after `now` (conservative). No history means the
-    /// volume was never touched, so the gain is 1.0.
+    /// maximum also covers sets stamped after `now` (conservative). If no set is older than
+    /// the window, the volume before the first set (`original`) was in effect too, so it is
+    /// part of the max; with no history at all the gain is therefore 1.0. A non-finite or
+    /// non-positive `original` yields 0.0 (silent rather than loud).
     pub fn conservative_gain(&self, original: f32, now_us: u64) -> f32 {
+        if !original.is_finite() || original <= 0.0 {
+            return 0.0;
+        }
         let mut max: Option<f32> = None;
         let mut last_old: Option<f32> = None;
         for &(at, v) in &self.entries {
@@ -143,13 +148,12 @@ impl GainHistory {
                 max = Some(max.map_or(v, |m| m.max(v)));
             }
         }
-        if let Some(v) = last_old {
-            max = Some(max.map_or(v, |m| m.max(v)));
-        }
-        match max {
-            Some(m) => original / m.max(MIN_VOLUME),
-            None => 1.0,
-        }
+        // The volume in effect at window start: the latest old set, or the original
+        // volume when nothing was set before the window.
+        let at_window_start = last_old.unwrap_or(original);
+        let m = max.map_or(at_window_start, |m| m.max(at_window_start));
+        // The floor also bounds the result to original / MIN_VOLUME.
+        original / m.max(MIN_VOLUME)
     }
 }
 
@@ -296,6 +300,46 @@ mod tests {
         g.set(0, 1e-4);
         g.set(10_000, 0.5);
         assert!((g.conservative_gain(0.5, 12_000) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn first_lowering_without_seed_is_never_louder() {
+        let mut g = GainHistory::new(100_000);
+        g.set(10_000, 1e-4);
+        let v = g.conservative_gain(0.5, 12_000);
+        assert!(v <= 1.0 + 1e-6, "{v}");
+    }
+
+    #[test]
+    fn set_older_than_window_still_counts() {
+        let mut g = GainHistory::new(100_000);
+        g.set(0, 0.5);
+        g.set(10_000, 0.05);
+        g.set(20_000, 0.005);
+        g.set(30_000, 1e-4);
+        // At 115 ms the 10 ms set (0.05) is the latest one older than the window.
+        let v = g.conservative_gain(0.5, 115_000);
+        assert!((v - 10.0).abs() < 1e-3, "{v}");
+    }
+
+    #[test]
+    fn zero_or_negative_volume_stays_finite() {
+        let mut g = GainHistory::new(100_000);
+        g.set(0, 0.0);
+        g.set(1_000, -1.0);
+        let v = g.conservative_gain(0.5, 200_000);
+        assert!(v.is_finite() && v <= 0.5 / 1e-4 + 1.0, "{v}");
+        let v = g.conservative_gain(0.5, 2_000);
+        assert!(v.is_finite() && v <= 1.0 + 1e-6, "{v}");
+    }
+
+    #[test]
+    fn non_finite_original_is_silent() {
+        let mut g = GainHistory::new(100_000);
+        g.set(0, 0.5);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.5] {
+            assert_eq!(g.conservative_gain(bad, 1_000), 0.0);
+        }
     }
 
     #[test]

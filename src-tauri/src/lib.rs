@@ -20,6 +20,10 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
             app.state::<audio::AudioState>().start();
+            // Installed builds ship the bridge and Python under the resource dir.
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                app.state::<autotune::AutotuneState>().set_resource_dir(resource_dir);
+            }
             // Per-song Key/Scale memory (local only). Without a data dir the
             // feature is simply off; analysis is unaffected.
             if let Ok(dir) = app.path().app_local_data_dir() {

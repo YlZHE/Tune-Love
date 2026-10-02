@@ -2,7 +2,8 @@
 use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    path::PathBuf,
+    ffi::OsString,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -333,6 +334,7 @@ struct Inner {
     manager: Mutex<Manager>,
     child: Mutex<Option<Arc<Mutex<Child>>>>,
     stopped: AtomicBool,
+    resource_dir: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Clone, Default)]
@@ -340,7 +342,52 @@ pub struct AutotuneState {
     inner: Arc<Inner>,
 }
 
+/// Bridge directory: env override (used as-is), then the installed bundle's
+/// `reference/` (only when it really contains `app_bridge.py`), then the dev tree.
+pub fn resolve_bridge_dir(
+    env: Option<PathBuf>,
+    resource_dir: Option<&Path>,
+    dev_dir: &Path,
+) -> PathBuf {
+    if let Some(env) = env {
+        return env;
+    }
+    if let Some(resource_dir) = resource_dir {
+        let bundled = resource_dir.join("reference");
+        if bundled.join("app_bridge.py").is_file() {
+            return bundled;
+        }
+    }
+    dev_dir.to_path_buf()
+}
+
+/// Python interpreter: env override, then the bundled `python/python.exe`
+/// (only when present), then whatever `python` is on PATH.
+pub fn resolve_python(env: Option<OsString>, resource_dir: Option<&Path>) -> OsString {
+    if let Some(env) = env {
+        return env;
+    }
+    if let Some(resource_dir) = resource_dir {
+        let bundled = resource_dir.join("python").join("python.exe");
+        if bundled.is_file() {
+            return bundled.into_os_string();
+        }
+    }
+    "python".into()
+}
+
 impl AutotuneState {
+    /// Called once at startup with the installed resource directory.
+    pub fn set_resource_dir(&self, dir: PathBuf) {
+        if let Ok(mut slot) = self.inner.resource_dir.lock() {
+            *slot = Some(dir);
+        }
+    }
+
+    fn resource_dir(&self) -> Option<PathBuf> {
+        self.inner.resource_dir.lock().ok().and_then(|slot| slot.clone())
+    }
+
     fn kill(&self) {
         if let Ok(child) = self.inner.child.lock() {
             if let Some(child) = child.as_ref() {
@@ -383,18 +430,20 @@ impl AutotuneState {
                     Some("scan" | "options") => {}
                     _ => return Err("No worker connection; scan and explicitly connect".into()),
                 }
-                let reference = std::env::var_os("TUNE_LOVE_REFERENCE")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../reference")
-                    });
+                let resource_dir = self.resource_dir();
+                let reference = resolve_bridge_dir(
+                    std::env::var_os("TUNE_LOVE_REFERENCE").map(PathBuf::from),
+                    resource_dir.as_deref(),
+                    &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../reference"),
+                );
                 let script = reference
                     .join("app_bridge.py")
                     .canonicalize()
                     .map_err(|e| format!("Cannot locate reference/app_bridge.py: {e}"))?;
-                let mut command = Command::new(
-                    std::env::var_os("TUNE_LOVE_PYTHON").unwrap_or_else(|| "python".into()),
-                );
+                let mut command = Command::new(resolve_python(
+                    std::env::var_os("TUNE_LOVE_PYTHON"),
+                    resource_dir.as_deref(),
+                ));
                 command.arg("-u").arg(script);
                 let worker = Worker::spawn(command)?;
                 *self
@@ -596,10 +645,113 @@ mod tests {
         assert!(validate_response(&capable, "status").is_ok());
     }
 
-    fn python(script: &str) -> Command {
-        let mut command = Command::new(
-            std::env::var_os("TUNE_LOVE_PYTHON").unwrap_or_else(|| "python".into()),
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tune-love-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn resolve_env_wins_even_when_missing() {
+        let root = temp_root("env-wins");
+        touch(&root.join("reference").join("app_bridge.py"));
+        touch(&root.join("python").join("python.exe"));
+        let missing = root.join("does-not-exist");
+        assert_eq!(
+            resolve_bridge_dir(Some(missing.clone()), Some(&root), Path::new("dev")),
+            missing
         );
+        assert_eq!(
+            resolve_python(Some("custom-python".into()), Some(&root)),
+            OsString::from("custom-python")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_bundled_bridge_used_when_complete() {
+        let root = temp_root("bundled-bridge");
+        touch(&root.join("reference").join("app_bridge.py"));
+        assert_eq!(
+            resolve_bridge_dir(None, Some(&root), Path::new("dev")),
+            root.join("reference")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_incomplete_bundle_falls_back_to_dev() {
+        let root = temp_root("incomplete-bundle");
+        std::fs::create_dir_all(root.join("reference")).unwrap();
+        assert_eq!(
+            resolve_bridge_dir(None, Some(&root), Path::new("dev")),
+            PathBuf::from("dev")
+        );
+        // A directory named app_bridge.py is not a usable script either.
+        std::fs::create_dir_all(root.join("reference").join("app_bridge.py")).unwrap();
+        assert_eq!(
+            resolve_bridge_dir(None, Some(&root), Path::new("dev")),
+            PathBuf::from("dev")
+        );
+        assert_eq!(
+            resolve_bridge_dir(None, None, Path::new("dev")),
+            PathBuf::from("dev")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_bundled_python_used_when_present() {
+        let root = temp_root("bundled-python");
+        assert_eq!(resolve_python(None, Some(&root)), OsString::from("python"));
+        assert_eq!(resolve_python(None, None), OsString::from("python"));
+        touch(&root.join("python").join("python.exe"));
+        assert_eq!(
+            resolve_python(None, Some(&root)),
+            root.join("python").join("python.exe").into_os_string()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_paths_with_spaces_and_cjk_are_unchanged() {
+        let top = temp_root("cjk");
+        let root = top.join("Tune Love 测试").join("张三");
+        touch(&root.join("reference").join("app_bridge.py"));
+        touch(&root.join("python").join("python.exe"));
+        let bridge = resolve_bridge_dir(None, Some(&root), Path::new("dev"));
+        assert_eq!(bridge, root.join("reference"));
+        let text = bridge.to_string_lossy().into_owned();
+        assert!(text.contains("Tune Love 测试") && text.contains("张三"));
+        assert_eq!(
+            resolve_python(None, Some(&root)),
+            root.join("python").join("python.exe").into_os_string()
+        );
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn set_resource_dir_is_stored() {
+        let state = AutotuneState::default();
+        assert!(state.resource_dir().is_none());
+        state.set_resource_dir(PathBuf::from("res"));
+        assert_eq!(state.resource_dir(), Some(PathBuf::from("res")));
+    }
+
+    fn python(script: &str) -> Command {
+        let mut command = Command::new(resolve_python(
+            std::env::var_os("TUNE_LOVE_PYTHON"),
+            None,
+        ));
         command.args(["-u", "-c", script]);
         command
     }

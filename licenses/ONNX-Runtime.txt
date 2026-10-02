@@ -4,9 +4,15 @@ Licence: MIT
 
 Statically linked into devocal-engine.exe from the prebuilt ONNX Runtime 1.28.0
 library that the `ort` 2.0.0-rc.13 crate downloads at build time (pyke.io build of
-the upstream sources). No copy of the upstream LICENSE file is shipped with that
-download, so the text below is the standard MIT licence with the upstream copyright
-line (text per upstream LICENSE).
+the upstream sources, ms@1.28.0). That download holds only the library files, no
+licence or notices, so both are taken from the upstream repository:
+
+- the text below is the standard MIT licence with the upstream copyright line
+  (text per upstream LICENSE);
+- the notices for the third-party components built into ONNX Runtime (protobuf,
+  abseil, onnx, re2, flatbuffers and others) are in ONNX-Runtime-ThirdPartyNotices.txt
+  next to this file: upstream ThirdPartyNotices.txt at tag v1.28.0
+  (commit da9b5e364c465de65c49d91e696cd6485270757f), unmodified.
 
 ----------------------------------------------------------------------------
 

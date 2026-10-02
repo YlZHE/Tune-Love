@@ -11,7 +11,9 @@
 use crate::sessions::{endpoint_of_instance, SessionInfo, SessionVolumes};
 use std::collections::{HashMap, HashSet};
 use windows::core::{Interface, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE,
+};
 use windows::Win32::Media::Audio::{
     eRender, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2,
     IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
@@ -21,7 +23,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// The real per-process session volume control. See the module docs for the COM requirement.
@@ -44,8 +46,10 @@ pub fn process_tree(root: u32) -> Vec<u32> {
     let timed: Vec<(u32, u32, u64)> = pairs
         .iter()
         .filter(|(pid, _)| candidates.contains(pid))
-        .filter_map(|&(pid, parent)| match query_created(pid) {
-            Ok(Some(created)) => Some((pid, parent, created)),
+        // Creation time only: an exited process still links its live children to the tree
+        // (it has no audio of its own), exactly as before exits were detected.
+        .filter_map(|&(pid, parent)| match query_times(pid) {
+            Ok(Some(times)) => Some((pid, parent, times.created)),
             // Gone since the snapshot, or not queryable: cannot be verified, leave it out.
             _ => None,
         })
@@ -112,12 +116,28 @@ fn filetime(t: FILETIME) -> u64 {
     (t.dwHighDateTime as u64) << 32 | t.dwLowDateTime as u64
 }
 
-/// See [`SessionVolumes::process_created`]. Only `OpenProcess` failing with
-/// `ERROR_INVALID_PARAMETER` means "no such pid"; any other failure (e.g. access denied) is an
-/// `Err`. The exit time is deliberately not consulted: it is undefined for a running process.
-/// A just-exited process still held open elsewhere therefore reports `Some`; its sessions are
-/// judged by the session lookups, not here.
-fn query_created(pid: u32) -> Result<Option<u64>, String> {
+/// Creation time and liveness of one process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessTimes {
+    /// Creation time as a FILETIME.
+    created: u64,
+    /// `GetExitCodeProcess` reported an exit code other than `STILL_ACTIVE`; `Err` if that
+    /// query failed (the creation time alone is still enough for [`process_tree`]).
+    exited: Result<bool, String>,
+}
+
+/// Only `OpenProcess` failing with `ERROR_INVALID_PARAMETER` means "no such pid" (`Ok(None)`);
+/// any other failure (e.g. access denied) is an `Err`.
+///
+/// A process that has exited but whose object is still referenced by an open handle anywhere
+/// in the system (the app keeps one on the player, for example) still opens and still reports
+/// its creation time, so liveness is read separately with `GetExitCodeProcess`: a running
+/// process always reports `STILL_ACTIVE`, so any other code means it has exited. That is
+/// preferred over the exit FILETIME of `GetProcessTimes`, which is documented as undefined
+/// for a running process: a non-zero garbage value there would report a live player as gone
+/// and release it. The only ambiguity left is a process that exited with the code 259
+/// (`STILL_ACTIVE` itself), which reads as running, i.e. exactly as before this check.
+fn query_times(pid: u32) -> Result<Option<ProcessTimes>, String> {
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => Handle(h),
         Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Ok(None),
@@ -131,7 +151,23 @@ fn query_created(pid: u32) -> Result<Option<u64>, String> {
     );
     unsafe { GetProcessTimes(handle.0, &mut start, &mut exit, &mut kernel, &mut user) }
         .map_err(|e| format!("GetProcessTimes({pid}): {e}"))?;
-    Ok(Some(filetime(start)))
+    let mut code = 0u32;
+    let exited = unsafe { GetExitCodeProcess(handle.0, &mut code) }
+        .map(|()| code != STILL_ACTIVE.0 as u32)
+        .map_err(|e| format!("GetExitCodeProcess({pid}): {e}"));
+    Ok(Some(ProcessTimes {
+        created: filetime(start),
+        exited,
+    }))
+}
+
+/// See [`SessionVolumes::process_created`]: `Ok(None)` when there is no such pid or the
+/// process has exited (see [`query_times`]).
+fn query_created(pid: u32) -> Result<Option<u64>, String> {
+    match query_times(pid)? {
+        None => Ok(None),
+        Some(t) => Ok((!t.exited?).then_some(t.created)),
+    }
 }
 
 /// Copies a COM-allocated wide string and frees it.
@@ -430,6 +466,44 @@ mod tests {
     #[test]
     fn process_created_reports_an_unused_pid_as_absent() {
         assert_eq!(WinSessions.process_created(UNUSED_PID), Ok(None));
+    }
+
+    /// Kills the child on drop so a failing assertion does not leave it running.
+    struct Reaped(std::process::Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn process_created_reports_an_exited_process_still_held_open_as_absent() {
+        // `wait` reaps the child but `Child` keeps its process handle open, so the process
+        // object stays referenced: it still opens and still has a creation time.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit 0"])
+            .spawn()
+            .expect("spawn cmd");
+        let pid = child.id();
+        assert!(child.wait().expect("wait").success());
+        assert_eq!(WinSessions.process_created(pid), Ok(None));
+        // The tree query still links through it (creation time only).
+        assert!(matches!(query_times(pid), Ok(Some(t)) if t.exited == Ok(true) && t.created > 0));
+        drop(child);
+    }
+
+    #[test]
+    fn process_created_reports_a_running_child() {
+        let child = Reaped(
+            std::process::Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn ping"),
+        );
+        let got = WinSessions.process_created(child.0.id());
+        assert!(matches!(got, Ok(Some(t)) if t > 0), "{got:?}");
     }
 
     #[test]

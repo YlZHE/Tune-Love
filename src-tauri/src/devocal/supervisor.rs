@@ -1239,6 +1239,37 @@ mod tests {
     }
 
     #[test]
+    fn player_exit_while_held_waits_for_a_player_and_keeps_the_attach_budget() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        assert_eq!(r.phase(), "devocal");
+        // The player exits: the app's target goes away (its process identity is no longer
+        // alive) and the engine, having seen the exit, lets go on its own.
+        r.last().clear_sent();
+        r.last().push(state(Phase::Idle, None));
+        r.sup.tick(1_000, None, false);
+        let s = r.sup.status();
+        assert_eq!(s.phase, "attaching");
+        assert!(s.waiting_for_player, "{s:?}");
+        assert!(!s.held);
+        assert_eq!(s.error, None);
+        // However long it takes, nothing is attached and nothing is given up.
+        for t in (1_100..40_000).step_by(100) {
+            r.sup.tick(t, None, false);
+        }
+        assert!(r.last().sent().is_empty(), "{:?}", r.last().sent());
+        let s = r.sup.status();
+        assert_eq!((s.phase, s.waiting_for_player), ("attaching", true));
+        // The relaunched player (a new process) is attached at once.
+        let relaunched = player(8);
+        r.sup.tick(40_000, Some(relaunched.clone()), true);
+        assert_eq!(r.last().sent(), vec![attach(&relaunched)]);
+        assert!(!r.sup.status().waiting_for_player);
+        assert_eq!(r.spawns(), 1);
+    }
+
+    #[test]
     fn crash_restores_then_restarts_up_to_three_times_per_minute() {
         let mut r = rig();
         let p = player(7);

@@ -44,9 +44,10 @@ pub trait SessionVolumes {
     fn muted(&self, instance_id: &str) -> Result<bool, String>;
     /// Process creation time as a FILETIME.
     ///
-    /// `Ok(Some(t))`: the process exists and was created at `t`. `Ok(None)`: the process
-    /// definitively does not exist. `Err`: the query failed for another reason (e.g. access
-    /// denied); callers must not treat that as "gone".
+    /// `Ok(Some(t))`: the process is running and was created at `t`. `Ok(None)`: there is no
+    /// such process, or it has exited (even if its process object is still held open
+    /// somewhere and still reports a creation time). `Err`: the query failed for another
+    /// reason (e.g. access denied); callers must not treat that as "gone".
     fn process_created(&self, pid: u32) -> Result<Option<u64>, String>;
 }
 

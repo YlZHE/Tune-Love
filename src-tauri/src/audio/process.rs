@@ -350,4 +350,29 @@ pub mod native {
         opened.record = selected;
         Ok(opened)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A player that exits while the identity (and so a handle on it) is still held: the
+        /// devocal supervisor's player target must drop it at once, never hand the dead pid on
+        /// (it would be attached again and spend the attach attempts on a process that is gone).
+        #[test]
+        fn identity_of_an_exited_process_is_not_alive() {
+            let mut child = std::process::Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn ping");
+            let identity = ProcessIdentity::open(child.id());
+            let alive = identity.as_ref().is_ok_and(ProcessIdentity::is_alive);
+            let _ = child.kill();
+            let _ = child.wait();
+            let identity = identity.expect("open a running child");
+            assert!(alive, "a running child is alive");
+            assert!(!identity.is_alive());
+            assert!(ProcessIdentity::open(identity.record.pid).is_err());
+        }
+    }
 }

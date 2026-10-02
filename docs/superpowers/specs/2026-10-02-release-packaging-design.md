@@ -24,9 +24,10 @@
 - 安装包用 NSIS `.exe`，装到当前用户，不需要管理员权限。
 - 推 `v*` 标签后生成草稿 Release，由用户确认后发布。
 - identifier 改为 `io.github.ylzhe.tunelove`，并迁移旧数据（见 §3）。
-- 以下两项**放到最后**，不在本稿实现（见 §8）：
+- 以下几项**放到后面**，不在本稿实现（见 §8）：
   - 程序内置下载；
-  - 首次启动的设置向导。
+  - 首次启动的设置向导；
+  - 把桥接改写成 Rust。
 
 ## 3. 改名
 
@@ -51,17 +52,21 @@
 
 ## 4. 安装版的组成与运行时查找
 
-**打包配置**（`tauri.conf.json`）：
+**打包配置：**
+- `tauri.conf.json` 写入：
 
-```json
-"bundle": {
-  "active": true,
-  "targets": ["nsis"],
-  "windows": { "nsis": { "installMode": "currentUser" } },
-  "resources": { … 见下 … },
-  "licenseFile": "../LICENSE"
-}
-```
+  ```json
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "windows": { "nsis": { "installMode": "currentUser" } },
+    "licenseFile": "../LICENSE"
+  }
+  ```
+
+- 随包资源清单单独放在 `src-tauri/tauri.release.conf.json`，只在打安装包时用 `npx tauri build --config src-tauri/tauri.release.conf.json` 合并进来。
+  - 原因：资源写进主配置后，tauri-build 每次编译都要求这些文件存在。那样日常开发和 CI 的 `cargo test` 都得先准备好 Python 与 agent DLL。
+  - 另一个原因：开发构建会把旧副本复制到 `target/` 下，遮住真正的开发目录。
 
 **随包资源**（安装后位于 `resources/` 下，保持与源码相同的相对结构）：
 
@@ -167,5 +172,10 @@
 
 1. **程序内置下载**：StemgenRT 等模型权重改由程序内下载。下载前显示来源、许可、大小，用户确认后才下载，完成后校验 SHA-256，流程见 [权重许可报告](../../../../docs/2026-10-02_model-weights-licensing.md)。这项与去人声子项目 4 合并。
 2. **首次启动设置向导**：做成精美的 setup 页面，包括欢迎、模型下载确认与进度、计算设备与弱电脑档位等，完成后才进入正常界面。到时单独设计。
+
+3. **把桥接改写成 Rust**（用户 2026-10-02 决定后续再做）：
+   - 用 Rust 重新实现 `client.py` 与 `app_bridge.py`（协议见 `reference/PROTOCOL.md`）。之后安装包不再附带 Python。
+   - 等接入流程中尚未补齐的部分（清理时机、多版本选择等）稳定后再做，并且须在真实宿主上重新验收。
+   - 用户一侧不受影响：嵌入式 Python 不需要用户做任何配置。
 
 整体顺序：本稿（改名 → 查找顺序与资源打包 → 下载脚本 → workflows → 本机打包验证）→ 去人声子项目 1 →（中间各子项目）→ 内置下载与设置向导。

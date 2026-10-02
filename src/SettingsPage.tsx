@@ -8,6 +8,7 @@ import { ColorSettings } from "./components/ColorSettings";
 import { BackgroundSettings } from "./components/BackgroundSettings";
 import { AutoTuneSettings } from "./components/AutoTuneSettings";
 import { AutoApplySettings } from "./components/AutoApplySettings";
+import { DevocalSettings } from "./components/DevocalSettings";
 import { useNowPlaying } from "./useNowPlaying";
 import { useAppColors } from "./useAppColors";
 
@@ -40,7 +41,7 @@ export function SettingsPage() {
         </AppTooltip>
       </header>
       <section className="settings-page-content" aria-label="设置内容">
-        <AutoTuneSettings /><AutoApplySettings /><ColorSettings track={track} colors={colors} /><BackgroundSettings />
+        <AutoTuneSettings /><AutoApplySettings /><DevocalSettings /><ColorSettings track={track} colors={colors} /><BackgroundSettings />
       </section>
       {error && <p className="settings-error" role="status">{error}</p>}
     </main>

@@ -8,6 +8,8 @@ import type { TransportControls } from "../nowPlaying";
 import type { TransportAction } from "../useMediaTransport";
 import { autoTune, useAutoTune } from "../useAutoTune";
 import { controlLabel, type ControlRole } from "../autotuneControl";
+import { devocalLabel } from "../devocal";
+import { useDevocal } from "../useDevocal";
 import "./AutoTuneSettings.css";
 import "./PlayerControls.css";
 
@@ -34,7 +36,8 @@ export function PlayerControls({ children, hovered, playing, hasTrack, transport
     if (autoTuneState.phase !== "ready") { onNotice("参数预览：请先在设置中连接 Auto-Tune"); return; }
     void autoTune.setValue(role, value).catch(error => onNotice(error instanceof Error ? error.message : "参数未能发送"));
   };
-  const [vocalRemovalEnabled, setVocalRemovalEnabled] = useState(false);
+  const { status: devocalStatus, enabled: vocalRemovalEnabled, toggle: toggleDevocal } = useDevocal();
+  const devocalText = devocalLabel(devocalStatus);
   const visible = hovered || focused || panel !== null || touch;
   const previousDisabled = !hasTrack || !transport?.canPrevious || transportPending;
   const nextDisabled = !hasTrack || !transport?.canNext || transportPending;
@@ -69,7 +72,6 @@ export function PlayerControls({ children, hovered, playing, hasTrack, transport
   }, [hovered, panel]);
 
   const setOpen = (name: Exclude<Panel, null>, open: boolean) => setPanel(open ? name : null);
-  const hint = (name: string) => `${name} · 前端预览`;
   return <footer className="player-footer" data-controls-visible={visible} data-panel-open={panel !== null}>
     <div className="footer-information" aria-hidden={visible} inert={visible}>{children(visible)}</div>
     <div ref={controls} className="footer-controls" role="group" aria-label="音乐和电音控制" aria-describedby={previewId}
@@ -108,12 +110,11 @@ export function PlayerControls({ children, hovered, playing, hasTrack, transport
             <span id={detailsId} className="control-connection-note">{controlLabel(autoTuneState)}</span>
           </Popover.Content>
         </Popover.Root>
-        <AppTooltip content={hint(vocalRemovalEnabled ? "关闭去人声，恢复原唱" : "开启去人声")} side="top" disabled={panel !== null}>
+        <AppTooltip content={vocalRemovalEnabled ? "关闭去人声，恢复原唱" : "开启去人声"} side="top" disabled={panel !== null}>
           <IconButton size="1" variant="ghost" radius="full" className={`footer-control-button vocal-removal-control ${vocalRemovalEnabled ? "is-enabled" : ""}`}
-            aria-label={vocalRemovalEnabled ? "关闭去人声" : "开启去人声"} aria-pressed={vocalRemovalEnabled} onClick={() => {
-              setVocalRemovalEnabled(value => !value); onNotice("前端预览：去人声处理尚未接入，实际音频不变");
-            }}><UserSound size={17} weight={vocalRemovalEnabled ? "fill" : "regular"} /></IconButton>
+            aria-label={vocalRemovalEnabled ? "关闭去人声" : "开启去人声"} aria-pressed={vocalRemovalEnabled} onClick={() => { toggleDevocal().catch(() => onNotice("去人声未能切换，请重试")); }}><UserSound size={17} weight={vocalRemovalEnabled ? "fill" : "regular"} /></IconButton>
         </AppTooltip>
+        <span className="devocal-status" aria-live="polite">{devocalText}</span>
       </div>
       <div className="transport-controls" aria-busy={transportPending}>
         <AppTooltip content="上一首" side="top" disabled={previousDisabled || panel !== null}>
@@ -131,6 +132,6 @@ export function PlayerControls({ children, hovered, playing, hasTrack, transport
         </AppTooltip>
       </div>
     </div>
-    <span id={previewId} className="controls-accessible-note">播放按钮控制当前播放器；{controlLabel(autoTuneState)}；去人声仍为前端预览。旋钮显示最近操作值，不代表插件实时回读。</span>
+    <span id={previewId} className="controls-accessible-note">播放按钮控制当前播放器；{controlLabel(autoTuneState)}；去人声会接管当前播放器的声音输出。旋钮显示最近操作值，不代表插件实时回读。</span>
   </footer>;
 }

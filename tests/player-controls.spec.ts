@@ -5,6 +5,9 @@ async function prepare(page: Page, hasTrack = true) {
     const state = window as any;
     state.commands = [];
     state.effectRequests = [];
+    state.devocalRequests = [];
+    state.devocal = { phase: "off", held: false, latencyMs: null, loadRatio: null, fallbackReason: null,
+      sessionOverridden: false, inputSilent: false, error: null };
     state.isTauri = true;
     state.controlMedia = { status: hasTrack ? "ready" : "empty", targetGeneration: 1, capturedAtMs: Date.now(), track: hasTrack ? {
       sourceId: "player.exe", source: "Folia", title: "控制区预览", artist: "示例歌手", album: "示例专辑",
@@ -18,6 +21,13 @@ async function prepare(page: Page, hasTrack = true) {
       invoke: async (command: string, args: any) => {
         state.commands.push(command);
         if (command === "plugin:window|is_always_on_top") return true;
+        if (command === "get_devocal_status") return structuredClone(state.devocal);
+        if (command === "devocal_command") {
+          state.devocalRequests.push(args.request);
+          state.devocal = { ...state.devocal, held: true, ...(args.request.action === "enable"
+            ? { phase: "devocal", latencyMs: 45.4 } : { phase: "passthrough", latencyMs: null }) };
+          return structuredClone(state.devocal);
+        }
         if (command === "control_media") {
           const action = args.request.action;
           if (action === "play" || action === "pause") {
@@ -267,7 +277,7 @@ test("Comet circular dragging lights the tail without flinging the committed par
   await expect(dial).toHaveAttribute("aria-valuenow", "75");
   await expect(panel.getByRole("spinbutton", { name: "Flex-Tune数值" })).toHaveValue("75");
   const commands = await page.evaluate(() => (window as any).commands as string[]);
-  expect(commands.every(command => ["get_audio_level", "get_key_detection", "autotune_command", "plugin:window|is_always_on_top"].includes(command))).toBe(true);
+  expect(commands.every(command => ["get_audio_level", "get_key_detection", "autotune_command", "plugin:window|is_always_on_top", "get_devocal_status", "devocal_command"].includes(command))).toBe(true);
   expect(await page.evaluate(() => (window as any).effectRequests.every((r: any) => r.op === "status"))).toBe(true);
 });
 
@@ -489,7 +499,7 @@ test("details contains only the three requested parameters and safely bounds num
   await expect(panel.getByRole("spinbutton", { name: "Humanize数值" })).toHaveValue("41");
 });
 
-test("vocal removal toggle communicates both states without enabling effects or processing audio", async ({ page }) => {
+test("vocal removal toggle communicates both states without enabling Auto-Tune effects", async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem("helper-colors-v1", JSON.stringify({ mode: "manual", manualColor: "#55aaff" })));
   await prepare(page); await reveal(page);
   const button = page.getByRole("button", { name: /^(开启|关闭)去人声$/ });
@@ -504,7 +514,7 @@ test("vocal removal toggle communicates both states without enabling effects or 
   await button.click();
   await expect(button).toHaveAccessibleName("关闭去人声");
   await expect(button).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByRole("status")).toContainText("去人声处理尚未接入");
+  await expect(page.getByText("去人声中 · 延迟 45 ms", { exact: true })).toBeVisible();
   await reveal(page);
   await expect(button).toHaveCSS("color", "rgb(85, 170, 255)");
   expect(await button.locator("svg").innerHTML()).not.toBe(regularIcon);
@@ -527,11 +537,11 @@ test("vocal removal toggle communicates both states without enabling effects or 
     await expect(page.getByRole("slider", { name, exact: true })).toHaveAttribute("aria-valuenow", "0");
   expect(await page.evaluate(() => (window as any).controlMedia.track.playbackStatus)).toBe("playing");
   const commands = await page.evaluate(() => (window as any).commands as string[]);
-  expect(commands.every(command => ["get_audio_level", "get_key_detection", "autotune_command", "plugin:window|is_always_on_top"].includes(command))).toBe(true);
+  expect(commands.every(command => ["get_audio_level", "get_key_detection", "autotune_command", "plugin:window|is_always_on_top", "get_devocal_status", "devocal_command"].includes(command))).toBe(true);
   expect(await page.evaluate(() => (window as any).effectRequests.every((r: any) => r.op === "status"))).toBe(true);
 });
 
-test("vocal removal preview remains separate from live transport controls", async ({ page }) => {
+test("vocal removal toggle remains separate from live transport controls", async ({ page }) => {
   await prepare(page); await reveal(page);
   const errors: string[] = [];
   page.on("pageerror", error => errors.push(error.message));
@@ -551,7 +561,7 @@ test("vocal removal preview remains separate from live transport controls", asyn
   expect(await page.evaluate(() => (window as any).controlMedia.track.playbackStatus)).toBe("paused");
   const commands = await page.evaluate(() => (window as any).commands as string[]);
   expect(commands.filter(command => command === "control_media")).toHaveLength(3);
-  expect(commands.every(command => ["get_audio_level", "get_key_detection", "autotune_command", "plugin:window|is_always_on_top", "control_media"].includes(command))).toBe(true);
+  expect(commands.every(command => ["get_audio_level", "get_key_detection", "autotune_command", "plugin:window|is_always_on_top", "get_devocal_status", "devocal_command", "control_media"].includes(command))).toBe(true);
   expect(await page.evaluate(() => (window as any).effectRequests.every((r: any) => r.op === "status"))).toBe(true);
   expect(errors).toEqual([]);
 });

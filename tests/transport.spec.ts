@@ -17,6 +17,7 @@ async function prepare(page: Page) {
       invoke: async (command: string, args: unknown) => {
         if (command === "get_now_playing") return structuredClone({ ...state.media, capturedAtMs: Date.now() });
         if (command === "plugin:window|is_always_on_top") return true;
+        if (command === "get_devocal_status") return { phase:"off",held:false,latencyMs:null,loadRatio:null,fallbackReason:null,sessionOverridden:false,inputSilent:false,error: null };
         if (command === "get_audio_level") return null;
         if (command === "control_media") {
           state.requests.push(args);

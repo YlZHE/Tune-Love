@@ -14,6 +14,7 @@ async function installBridge(page: Page, connected = false) {
         if (command === "get_now_playing") return { status: "idle", track: null, capturedAtMs: Date.now() };
         if (command === "get_audio_level" || command === "get_key_detection") return null;
         if (command === "plugin:window|is_always_on_top") return true;
+        if (command === "get_devocal_status") return { phase:"off",held:false,latencyMs:null,loadRatio:null,fallbackReason:null,sessionOverridden:false,inputSilent:false,error: null };
         if (command !== "autotune_command") throw new Error(`Unexpected command ${command}`);
         const request = args.request;
         w.bridgeRequests.push(request);

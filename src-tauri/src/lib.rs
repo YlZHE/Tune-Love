@@ -9,10 +9,11 @@ pub mod source;
 
 pub fn run() {
     let media = media::MediaState::default();
-    let audio = audio::AudioState::new(media.clone());
+    // One gate: devocal publishes the hold attenuation, key-detection capture undoes it.
+    let gate = std::sync::Arc::new(devocal::gate::AttenuationGate::new());
+    let audio = audio::AudioState::new(media.clone(), gate.clone());
     let key_detection = key_detection::KeyDetectionState::new(audio.clone());
-    let devocal =
-        devocal::DevocalState::new(std::sync::Arc::new(devocal::gate::AttenuationGate::new()));
+    let devocal = devocal::DevocalState::new(gate);
     tauri::Builder::default()
         .manage(media)
         .manage(media::transport::TransportState::default())

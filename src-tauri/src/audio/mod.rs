@@ -2,6 +2,7 @@ mod bands;
 pub mod capture;
 pub mod process;
 pub mod signal;
+use crate::devocal::gate::AttenuationGate;
 use crate::media::{AudioTarget, MediaState};
 use std::{
     collections::VecDeque,
@@ -73,8 +74,19 @@ struct Inner {
     level: AudioLevel,
     samples: VecDeque<f32>,
     analyzer: bands::BandAnalyzer,
+    /// Undoes the player attenuation while devocal holds its sessions.
+    gate: Arc<AttenuationGate>,
+    gate_epoch: u64,
 }
 impl Inner {
+    fn with_gate(gate: Arc<AttenuationGate>) -> Self {
+        Self {
+            gate_epoch: gate.read().0,
+            gate,
+            ..Self::default()
+        }
+    }
+
     fn invalidate_pcm(&mut self) {
         self.capture_generation = self.capture_generation.wrapping_add(1);
         self.samples.clear();
@@ -98,6 +110,23 @@ impl Inner {
             || self.target.as_ref().is_none_or(|t| !t.playing)
         {
             return false;
+        }
+        // History recorded under another attenuation is useless: invalidate before anything
+        // else, even when this packet is then dropped.
+        let (epoch, gain) = self.gate.read();
+        if epoch != self.gate_epoch {
+            self.invalidate_pcm();
+            self.gate_epoch = epoch;
+        }
+        let Some(gain) = gain else {
+            return false;
+        };
+        let mut packet = packet;
+        if gain != 1.0 {
+            for v in &mut packet.samples {
+                let scaled = (*v * gain).clamp(-4.0, 4.0);
+                *v = if scaled.is_finite() { scaled } else { 0.0 };
+            }
         }
         if packet.reset {
             self.invalidate_pcm();
@@ -189,9 +218,9 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 impl AudioState {
-    pub fn new(media: MediaState) -> Self {
+    pub fn new(media: MediaState, gate: Arc<AttenuationGate>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner::default())),
+            inner: Arc::new(Mutex::new(Inner::with_gate(gate))),
             media,
             stop: Arc::new(AtomicBool::new(false)),
             started: Arc::new(AtomicBool::new(false)),
@@ -711,7 +740,7 @@ mod tests {
     fn concurrent_refresh_cannot_restore_an_older_observed_source() {
         use std::sync::mpsc;
         use std::time::Duration;
-        let state = AudioState::new(MediaState::default());
+        let state = AudioState::new(MediaState::default(), Arc::new(AttenuationGate::new()));
         let (observed_tx, observed_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let first = state.clone();
@@ -797,6 +826,85 @@ mod tests {
         );
     }
 
+    fn const_packet(value: f32) -> signal::Packet {
+        signal::Packet {
+            samples: vec![value; 4],
+            reset: false,
+        }
+    }
+
+    #[test]
+    fn gate_scales_samples() {
+        let gate = Arc::new(AttenuationGate::new());
+        let mut s = Inner::with_gate(gate.clone());
+        let worker = s.sync(Some(target("a", "one")), 1);
+        gate.set(Some(3000.0));
+        assert!(s.publish(worker, const_packet(1e-4), 2));
+        assert_eq!(s.samples.len(), 4);
+        for v in &s.samples {
+            assert!((v - 0.3).abs() < 1e-6, "{v}");
+        }
+    }
+
+    #[test]
+    fn gate_clamps_and_sanitises_scaled_samples() {
+        let gate = Arc::new(AttenuationGate::new());
+        let mut s = Inner::with_gate(gate.clone());
+        let worker = s.sync(Some(target("a", "one")), 1);
+        gate.set(Some(1e6));
+        let packet = signal::Packet {
+            samples: vec![1.0, -1.0, f32::NAN, f32::INFINITY],
+            reset: false,
+        };
+        assert!(s.publish(worker, packet, 2));
+        assert_eq!(
+            s.samples.iter().copied().collect::<Vec<_>>(),
+            vec![4.0, -4.0, 0.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn gate_epoch_change_invalidates_history() {
+        let gate = Arc::new(AttenuationGate::new());
+        let mut s = Inner::with_gate(gate.clone());
+        let worker = s.sync(Some(target("a", "one")), 1);
+        assert!(s.publish(worker, const_packet(0.5), 2));
+        let before = s.analysis_context().capture_generation;
+        assert_eq!(s.samples.len(), 4);
+        gate.set(Some(1.0));
+        assert!(s.publish(
+            worker,
+            signal::Packet {
+                samples: vec![0.1, 0.1],
+                reset: false,
+            },
+            3
+        ));
+        assert_eq!(s.analysis_context().capture_generation, before + 1);
+        assert_eq!(
+            s.samples.iter().copied().collect::<Vec<_>>(),
+            vec![0.1, 0.1]
+        );
+        // The same epoch no longer invalidates.
+        assert!(s.publish(worker, packet(), 4));
+        assert_eq!(s.analysis_context().capture_generation, before + 1);
+    }
+
+    #[test]
+    fn gate_none_drops_packet() {
+        let gate = Arc::new(AttenuationGate::new());
+        let mut s = Inner::with_gate(gate.clone());
+        let worker = s.sync(Some(target("a", "one")), 1);
+        assert!(s.publish(worker, packet(), 2));
+        let end = s.sample_end_sequence;
+        let level = s.level.clone();
+        gate.set(None);
+        assert!(!s.publish(worker, packet(), 3));
+        assert_eq!(s.sample_end_sequence, end);
+        assert_eq!(s.level.updated_at_ms, level.updated_at_ms);
+        assert_eq!(s.level.peak, level.peak);
+    }
+
     #[test]
     fn discontinuity_invalidates_old_analysis_but_keeps_accepting_current_capture_packets() {
         let mut s = Inner::default();
@@ -838,7 +946,7 @@ mod tests {
     #[test]
     fn stall_reconnect_pause_and_stop_each_invalidate_pending_analysis() {
         let media = MediaState::default();
-        let state = AudioState::new(media);
+        let state = AudioState::new(media, Arc::new(AttenuationGate::new()));
         let worker = state.refresh_from(|| Some(target("a", "one")));
         state.lock().publish(worker, packet(), 10);
         let initial = state.lock().analysis_context().capture_generation;

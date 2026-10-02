@@ -483,7 +483,10 @@ mod tests {
         use crate::media::MediaState;
         use std::sync::mpsc;
 
-        let state = KeyDetectionState::new(AudioState::new(MediaState::default()));
+        let state = KeyDetectionState::new(AudioState::new(
+            MediaState::default(),
+            std::sync::Arc::new(crate::devocal::gate::AttenuationGate::new()),
+        ));
         let wake_guard = state
             .wake
             .0

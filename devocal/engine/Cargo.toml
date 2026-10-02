@@ -19,15 +19,21 @@ wasapi = { path = "../../src-tauri/vendor/wasapi" }
 
 [target.'cfg(windows)'.dependencies]
 # Same features as devocal-core, plus Performance (QueryPerformanceCounter) and Security
-# (CreateEventW's SECURITY_ATTRIBUTES parameter is gated behind it).
+# (CreateEventW's SECURITY_ATTRIBUTES parameter is gated behind it). The app pipe needs
+# Pipes, Storage_FileSystem (ReadFile/WriteFile/pipe flags), IO (OVERLAPPED) and
+# Security_Authorization (SID/SDDL conversion).
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
     "Win32_System_Performance",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_System_Variant",
 ] }

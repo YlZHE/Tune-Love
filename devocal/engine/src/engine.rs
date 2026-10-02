@@ -1,0 +1,1922 @@
+//! Engine core and main loop of `devocal-engine.exe`.
+//!
+//! [`EngineCore`] owns the session [`Holder`], the audio side (behind [`AudioPort`], so tests
+//! use a fake) and the phase machine ([`state::next`](crate::state::next)). It does no I/O of
+//! its own: [`EngineCore::handle`] takes one command, [`EngineCore::tick`] advances time, and
+//! both return the events to send. [`run`] is the real process: the app pipe, the watchdog and
+//! a loop that calls `tick` every millisecond.
+//!
+//! Attach order: `attach` loads the model again if the previous audio run consumed it, starts
+//! the audio threads (process loopback of the player tree, output on the player's endpoint)
+//! and only then, on the next tick, calls `Holder::begin_attach` with that tick's time, so the
+//! 30 ms volume ramp is not compressed by the audio start-up and nothing is lowered when
+//! the audio cannot start.
+//!
+//! Every tick (1 ms in [`run`]):
+//! 1. a pending `begin_attach` (see above);
+//! 2. audio thread failure (`capture_failed` -> `CaptureFailed`, other `failed` ->
+//!    `RenderFailed`) while attaching/active: release first, then report;
+//! 3. `Holder::tick`: `Held` while attaching -> `AttachDone`; `Failed` while attaching ->
+//!    `Failure` + `begin_release`; `Failed` while releasing is one-shot (logged, the entry
+//!    stays in the restore file) and the next `Idle` is `ReleaseDone`;
+//! 4. every 0.5 s, and at once when the safety guard asks (`take_follow_request`):
+//!    `Holder::follow` while active; every 0.5 s also the output endpoint check;
+//! 5. `SharedGains` from the Holder (after the tick and follow, so the audio threads see the
+//!    gain that matches the volumes just set);
+//! 6. `Metrics` once per second;
+//! 7. a `State` event whenever phase, mode, fallback reason or attached pid changed.
+//!
+//! Mode reporting (caller obligation 5), while `Active`:
+//! - user toggle off: `Passthrough` whatever the processor stage (an overload fallback while
+//!   the user has devocal off is plain passthrough, never "overload");
+//! - user toggle on: `Passthrough`/`WarmingUp`/`FadingIn`/`Devocal` report `Devocal`
+//!   (pending until the fade-in is done; the app shows the switch as on); `FadingOut` and
+//!   `Fallback` with a `fallback_reason` report `Fallback(reason)`; `FadingOut` without a reason
+//!   is a model swap in progress and stays `Devocal` (pending);
+//! - for up to 100 ms after a forwarded toggle, until the processor stage moves, the
+//!   requested mode is reported, so a stale stage (e.g. the old `Fallback`) does not flash.
+//!
+//! `set_mode(true)` reaches the audio side only when it changes the user's last requested
+//! value (caller obligation 1); a repeated "on" (state sync) never undoes an overload
+//! fallback. A new audio run (attach) starts with the toggle the user last requested.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Duration;
+
+use devocal_core::protocol::{
+    decode_command, encode, Command, ErrorCode, Event, FallbackReason, Metrics, Mode, Phase,
+    ProtocolError, PROTOCOL,
+};
+use devocal_core::sessions::SessionVolumes;
+use devocal_core::sessions_win::WinSessions;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+
+use crate::audio::endpoint::session_endpoint;
+use crate::audio::{now_us, AudioConfig, AudioHandle, SharedGains};
+use crate::dsp::SAMPLE_RATE;
+use crate::holder::{Holder, HolderPhase};
+use crate::pipe::{pipe_name, Accepted, PipeServer};
+use crate::processor::{Processor, Stage};
+use crate::separator::Separator;
+use crate::state::{next, Input};
+use crate::stemgen::StemgenRt;
+
+/// Main loop period.
+pub const TICK_US: u64 = 1_000;
+/// Holder follow and output endpoint check.
+pub const CHECK_INTERVAL_US: u64 = 500_000;
+pub const METRICS_INTERVAL_US: u64 = 1_000_000;
+/// After a forwarded toggle the requested mode is reported until the stage moves, at most
+/// this long.
+pub const TOGGLE_SETTLE_US: u64 = 100_000;
+/// The audio threads keep running this long after the release (output gain already 0), so
+/// the render side is silent before it stops.
+pub const AUDIO_STOP_DELAY_US: u64 = 20_000;
+/// Watchdog: how long the release may take before the engine exits anyway (the restore file
+/// then stays for the app).
+pub const EXIT_RELEASE_TIMEOUT_US: u64 = 2_000_000;
+/// How long the engine waits for the app to connect.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the writer may take to flush the last events at exit.
+const FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Audio statistics as plain values.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AudioSnapshot {
+    pub underruns: u64,
+    pub input_silent_ms: u64,
+    pub load_ratio: f32,
+    pub latency_ms: f32,
+    /// Blocks silenced by the safety guard.
+    pub unattenuated_blocks: u64,
+    pub headroom_frames: u32,
+}
+
+/// The audio side as the engine core sees it: [`RealAudio`] wraps [`AudioHandle`]; tests use
+/// a fake. `start` replaces nothing (the core stops a previous run first); every other call
+/// is a no-op (or a neutral value) while stopped.
+pub trait AudioPort {
+    fn start(
+        &mut self,
+        cfg: AudioConfig,
+        gains: Arc<SharedGains>,
+        processor: Processor,
+    ) -> Result<(), String>;
+    /// The user toggle (send only on a genuine change, caller obligation 1).
+    fn set_devocal(&self, on: bool);
+    fn set_separator(&self, s: Box<dyn Separator>);
+    fn rebind_output(&self, endpoint: Option<String>);
+    fn output_failed(&self) -> bool;
+    fn capture_failed(&self) -> bool;
+    /// Any audio thread ended without being stopped.
+    fn failed(&self) -> bool;
+    fn stage(&self) -> Stage;
+    fn fallback_reason(&self) -> Option<FallbackReason>;
+    /// The safety guard asks for an immediate `Holder::follow` (cleared by the call).
+    fn take_follow_request(&self) -> bool;
+    fn stats(&self) -> AudioSnapshot;
+    fn stop(&mut self);
+}
+
+/// Loads a model file with the given number of inference threads.
+pub type ModelLoader = Box<dyn FnMut(&Path, u16) -> Result<Box<dyn Separator>, String>>;
+
+/// Reported mode for the user's toggle and the processor's stage (see the module docs).
+pub fn mode_for(
+    user_on: bool,
+    stage: Stage,
+    reason: Option<FallbackReason>,
+) -> (Mode, Option<FallbackReason>) {
+    if !user_on {
+        return (Mode::Passthrough, None);
+    }
+    match (stage, reason) {
+        (Stage::Fallback, r) => (Mode::Fallback, r),
+        (Stage::FadingOut, Some(r)) => (Mode::Fallback, Some(r)),
+        (
+            Stage::FadingOut
+            | Stage::Passthrough
+            | Stage::WarmingUp
+            | Stage::FadingIn
+            | Stage::Devocal,
+            _,
+        ) => (Mode::Devocal, None),
+    }
+}
+
+fn error(code: ErrorCode, message: impl Into<String>) -> Event {
+    Event::Error {
+        code,
+        message: message.into(),
+    }
+}
+
+struct ModelSpec {
+    id: String,
+    path: PathBuf,
+    threads: u16,
+}
+
+type StateKey = (Phase, Option<Mode>, Option<FallbackReason>, Option<u32>);
+
+pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
+    holder: Holder<S>,
+    audio: A,
+    audio_running: bool,
+    /// Set after a release: stop the audio at this time.
+    audio_stop_at: Option<u64>,
+    gains: Arc<SharedGains>,
+    loader: ModelLoader,
+    /// The model last loaded successfully (reloaded for each new audio run).
+    model: Option<ModelSpec>,
+    /// A loaded model waiting for the next audio start.
+    staged: Option<Box<dyn Separator>>,
+    phase: Phase,
+    pid: Option<u32>,
+    /// `begin_attach` runs on the next tick (after the audio started).
+    pending_attach: Option<(u32, u64)>,
+    /// The user's last requested toggle.
+    user_devocal: bool,
+    /// (stage before the last forwarded toggle, until when the requested mode is reported).
+    toggle_settle: Option<(Stage, u64)>,
+    bound_endpoint: Option<String>,
+    next_check_us: Option<u64>,
+    next_metrics_us: Option<u64>,
+    overridden_total: u64,
+    last_state: StateKey,
+    last_follow_error: Option<String>,
+    unattenuated_seen: u64,
+    exit_requested: bool,
+}
+
+impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
+    pub fn new(sessions: S, restore_path: PathBuf, audio: A, loader: ModelLoader) -> Self {
+        Self {
+            holder: Holder::new(sessions, restore_path),
+            audio,
+            audio_running: false,
+            audio_stop_at: None,
+            gains: Arc::new(SharedGains::new(1.0, 0.0)),
+            loader,
+            model: None,
+            staged: None,
+            phase: Phase::Idle,
+            pid: None,
+            pending_attach: None,
+            user_devocal: false,
+            toggle_settle: None,
+            bound_endpoint: None,
+            next_check_us: None,
+            next_metrics_us: None,
+            overridden_total: 0,
+            last_state: (Phase::Idle, None, None, None),
+            last_follow_error: None,
+            unattenuated_seen: 0,
+            exit_requested: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn sessions(&self) -> &S {
+        self.holder.sessions()
+    }
+
+    #[cfg(test)]
+    pub fn audio(&self) -> &A {
+        &self.audio
+    }
+
+    #[cfg(test)]
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// `shutdown`, a protocol mismatch or the watchdog asked the engine to exit.
+    pub fn exit_requested(&self) -> bool {
+        self.exit_requested
+    }
+
+    /// The exit was requested, the release is done and the audio is stopped.
+    pub fn exit_ready(&self) -> bool {
+        self.exit_requested && self.phase == Phase::Idle && !self.audio_running
+    }
+
+    /// Watchdog: release and exit (as `shutdown`).
+    pub fn request_exit(&mut self, now_us: u64) -> Vec<Event> {
+        let mut ev = Vec::new();
+        self.begin_exit(now_us, &mut ev);
+        self.sync_state(now_us, &mut ev);
+        ev
+    }
+
+    /// One line from the pipe. Another protocol version releases and exits (as a `hello`
+    /// with another version); a malformed line is reported and ignored.
+    pub fn handle_line(&mut self, line: &str, now_us: u64) -> Vec<Event> {
+        match decode_command(line) {
+            Ok(cmd) => self.handle(cmd, now_us),
+            Err(e @ ProtocolError::Version(_)) => {
+                let mut ev = vec![error(
+                    ErrorCode::Protocol,
+                    format!("{e}; releasing and exiting"),
+                )];
+                self.begin_exit(now_us, &mut ev);
+                self.sync_state(now_us, &mut ev);
+                ev
+            }
+            Err(e) => vec![error(ErrorCode::Protocol, e.to_string())],
+        }
+    }
+
+    pub fn handle(&mut self, cmd: Command, now_us: u64) -> Vec<Event> {
+        let mut ev = Vec::new();
+        match cmd {
+            Command::Hello { version } => {
+                if version != PROTOCOL {
+                    ev.push(error(
+                        ErrorCode::Protocol,
+                        format!(
+                            "unsupported protocol version {version} (engine speaks {PROTOCOL}); \
+                             releasing and exiting"
+                        ),
+                    ));
+                    self.begin_exit(now_us, &mut ev);
+                }
+            }
+            Command::Attach { pid, created_at } => self.attach(pid, created_at, now_us, &mut ev),
+            Command::SetMode { devocal } => self.set_mode(devocal, now_us, &mut ev),
+            Command::SetModel {
+                id,
+                path,
+                device,
+                threads,
+            } => self.set_model(id, path, &device, threads, &mut ev),
+            Command::Release => self.release(now_us, &mut ev),
+            Command::Shutdown => self.begin_exit(now_us, &mut ev),
+        }
+        self.sync_state(now_us, &mut ev);
+        ev
+    }
+
+    /// Advances the engine to `now_us` (see the module docs for the order).
+    pub fn tick(&mut self, now_us: u64) -> Vec<Event> {
+        let mut ev = Vec::new();
+        self.start_pending_attach(now_us, &mut ev);
+        self.check_audio(now_us, &mut ev);
+        self.step_holder(now_us, &mut ev);
+        self.periodic(now_us, &mut ev);
+        self.gains
+            .set(self.holder.capture_gain(now_us), self.holder.output_gain());
+        if self.audio_stop_at.is_some_and(|t| now_us >= t) {
+            self.stop_audio();
+        }
+        if let Some((before, until)) = self.toggle_settle {
+            if !self.audio_live() || self.audio.stage() != before || now_us >= until {
+                self.toggle_settle = None;
+            }
+        }
+        self.metrics(now_us, &mut ev);
+        self.sync_state(now_us, &mut ev);
+        ev
+    }
+
+    /// Stops the audio threads now (no-op when stopped).
+    pub fn stop_audio(&mut self) {
+        if self.audio_running {
+            self.audio.stop();
+            self.audio_running = false;
+        }
+        self.audio_stop_at = None;
+        self.toggle_settle = None;
+    }
+
+    /// Audio is running for an attach in progress or a hold (not releasing or about to
+    /// stop): toggles and models go to the audio side only then.
+    fn audio_live(&self) -> bool {
+        self.audio_running
+            && self.audio_stop_at.is_none()
+            && matches!(self.phase, Phase::Attaching | Phase::Active)
+    }
+
+    fn begin_exit(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        self.exit_requested = true;
+        self.release(now_us, ev);
+    }
+
+    fn attach(&mut self, pid: u32, created_at: u64, now_us: u64, ev: &mut Vec<Event>) {
+        if self.exit_requested {
+            ev.push(error(
+                ErrorCode::AttachFailed,
+                "the engine is shutting down",
+            ));
+            return;
+        }
+        if self.phase != Phase::Idle {
+            ev.push(error(
+                ErrorCode::AttachFailed,
+                format!(
+                    "cannot attach to {pid} while {:?} (release first)",
+                    self.phase
+                ),
+            ));
+            return;
+        }
+        // The previous run may still be in its stop delay.
+        self.stop_audio();
+        self.stage_model(ev);
+        self.pid = Some(pid);
+        self.transition(Input::Attach, now_us, ev);
+
+        let endpoint = self
+            .holder
+            .sessions()
+            .sessions_for_tree(pid)
+            .ok()
+            .and_then(|t| session_endpoint(&t));
+        let processor = Processor::new(self.staged.take());
+        let cfg = AudioConfig {
+            pid,
+            sample_rate: SAMPLE_RATE,
+            hop: processor.hop(),
+            output_endpoint: endpoint.clone(),
+        };
+        match self.audio.start(cfg, self.gains.clone(), processor) {
+            Ok(()) => {
+                self.audio_running = true;
+                self.bound_endpoint = endpoint;
+                self.pending_attach = Some((pid, created_at));
+                // A fresh processor: apply the user's current toggle once.
+                if self.user_devocal {
+                    self.forward_toggle(true, now_us);
+                }
+            }
+            Err(e) => {
+                ev.push(error(
+                    ErrorCode::AttachFailed,
+                    format!("starting the audio for {pid} failed: {e}"),
+                ));
+                self.abort_to_idle(now_us, ev);
+            }
+        }
+    }
+
+    /// Makes sure a loaded model is staged for the next audio start (a previous run
+    /// consumed the last one).
+    fn stage_model(&mut self, ev: &mut Vec<Event>) {
+        if self.staged.is_some() {
+            return;
+        }
+        let Some(spec) = &self.model else {
+            return;
+        };
+        match (self.loader)(&spec.path, spec.threads) {
+            Ok(s) => self.staged = Some(s),
+            Err(e) => {
+                ev.push(error(
+                    ErrorCode::ModelLoadFailed,
+                    format!("reloading model {} failed: {e}", spec.id),
+                ));
+                self.model = None;
+                self.user_devocal = false;
+            }
+        }
+    }
+
+    fn set_mode(&mut self, devocal: bool, now_us: u64, ev: &mut Vec<Event>) {
+        if devocal && self.model.is_none() {
+            ev.push(error(
+                ErrorCode::NoModel,
+                "no model loaded (send set_model first)",
+            ));
+            return;
+        }
+        if devocal == self.user_devocal {
+            return; // not a change: never re-sent (caller obligation 1)
+        }
+        self.user_devocal = devocal;
+        if self.audio_live() {
+            self.forward_toggle(devocal, now_us);
+        }
+    }
+
+    fn forward_toggle(&mut self, on: bool, now_us: u64) {
+        let before = self.audio.stage();
+        self.audio.set_devocal(on);
+        self.toggle_settle = Some((before, now_us + TOGGLE_SETTLE_US));
+    }
+
+    fn set_model(
+        &mut self,
+        id: String,
+        path: PathBuf,
+        device: &str,
+        threads: u16,
+        ev: &mut Vec<Event>,
+    ) {
+        if device != "cpu" {
+            ev.push(error(
+                ErrorCode::BadDevice,
+                format!("device {device:?} is not supported (only \"cpu\")"),
+            ));
+            return;
+        }
+        match (self.loader)(&path, threads) {
+            Ok(sep) => {
+                if self.audio_live() {
+                    // The audio side fades out, swaps and turns back on if the toggle is on
+                    // (caller obligation 3).
+                    self.audio.set_separator(sep);
+                    self.staged = None;
+                } else {
+                    self.staged = Some(sep);
+                }
+                self.model = Some(ModelSpec { id, path, threads });
+            }
+            // A previously loaded model stays in use.
+            Err(e) => ev.push(error(
+                ErrorCode::ModelLoadFailed,
+                format!("loading model {id} from {} failed: {e}", path.display()),
+            )),
+        }
+    }
+
+    fn release(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        if matches!(self.phase, Phase::Attaching | Phase::Active) {
+            self.pending_attach = None;
+            self.holder.begin_release(now_us);
+            self.transition(Input::Release, now_us, ev);
+        }
+    }
+
+    /// A failure while attaching or active: release (the holder ramps back), phase
+    /// `Releasing`.
+    fn fail(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        self.pending_attach = None;
+        self.holder.begin_release(now_us);
+        self.transition(Input::Failure, now_us, ev);
+    }
+
+    /// The attach failed before anything was lowered: straight back to `Idle`
+    /// (`Failure` then `ReleaseDone`, reported as one state change) with the audio stopped.
+    fn abort_to_idle(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        self.pending_attach = None;
+        self.stop_audio();
+        let phase = next(self.phase, Input::Failure).and_then(|p| next(p, Input::ReleaseDone));
+        self.phase = phase.unwrap_or(Phase::Idle);
+        self.pid = None;
+        self.bound_endpoint = None;
+        self.sync_state(now_us, ev);
+    }
+
+    fn transition(&mut self, input: Input, now_us: u64, ev: &mut Vec<Event>) {
+        if let Ok(phase) = next(self.phase, input) {
+            self.phase = phase;
+            if phase == Phase::Idle {
+                self.pid = None;
+            }
+            self.sync_state(now_us, ev);
+        }
+    }
+
+    fn start_pending_attach(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        if self.phase != Phase::Attaching {
+            return;
+        }
+        let Some((pid, created_at)) = self.pending_attach.take() else {
+            return;
+        };
+        match self.holder.begin_attach(pid, created_at, now_us) {
+            Ok(report) => {
+                if report.restore_failed > 0 || report.restore_corrupt {
+                    ev.push(error(
+                        ErrorCode::AttachFailed,
+                        format!(
+                            "attach continues, but the restore before it was incomplete: {} \
+                             entries not restored (kept in the restore file){}",
+                            report.restore_failed,
+                            if report.restore_corrupt {
+                                "; the restore file was corrupt and has been set aside"
+                            } else {
+                                ""
+                            }
+                        ),
+                    ));
+                }
+            }
+            Err(e) => {
+                ev.push(error(ErrorCode::AttachFailed, e));
+                self.abort_to_idle(now_us, ev);
+            }
+        }
+    }
+
+    fn check_audio(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        if !self.audio_live() || !matches!(self.phase, Phase::Attaching | Phase::Active) {
+            return;
+        }
+        let (code, message) = if self.audio.capture_failed() {
+            (
+                ErrorCode::CaptureFailed,
+                "capturing the player's audio failed; released",
+            )
+        } else if self.audio.failed() {
+            (
+                ErrorCode::RenderFailed,
+                "an audio processing or output thread stopped; released",
+            )
+        } else {
+            return;
+        };
+        self.fail(now_us, ev);
+        ev.push(error(code, message));
+    }
+
+    fn step_holder(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        match (self.phase, self.holder.tick(now_us)) {
+            (Phase::Attaching, HolderPhase::Held) => self.transition(Input::AttachDone, now_us, ev),
+            (Phase::Attaching, HolderPhase::Failed(m)) => {
+                self.fail(now_us, ev);
+                ev.push(error(ErrorCode::AttachFailed, format!("{m}; released")));
+            }
+            (Phase::Releasing, HolderPhase::Failed(m)) => {
+                // One-shot; the release continues and the entry stays in the restore file
+                // (the app restores it later). The next `Idle` ends the release.
+                eprintln!("devocal engine: release: {m} (kept in the restore file)");
+            }
+            (Phase::Releasing, HolderPhase::Idle) => {
+                self.transition(Input::ReleaseDone, now_us, ev);
+                self.schedule_audio_stop(now_us);
+            }
+            _ => {}
+        }
+    }
+
+    fn schedule_audio_stop(&mut self, now_us: u64) {
+        if self.audio_running && self.audio_stop_at.is_none() {
+            self.audio_stop_at = Some(now_us + AUDIO_STOP_DELAY_US);
+        }
+        self.bound_endpoint = None;
+    }
+
+    fn periodic(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        let due = self.next_check_us.is_none_or(|t| now_us >= t);
+        if due {
+            self.next_check_us = Some(now_us + CHECK_INTERVAL_US);
+        }
+        let requested = self.audio_live() && self.audio.take_follow_request();
+        if (due || requested) && self.phase == Phase::Active {
+            self.follow(now_us, ev);
+        }
+        if due && self.audio_live() && matches!(self.phase, Phase::Attaching | Phase::Active) {
+            self.follow_endpoint();
+        }
+    }
+
+    fn follow(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        let r = self.holder.follow(now_us);
+        self.overridden_total += r.overridden as u64;
+        if r.player_exited {
+            self.transition(Input::PlayerExited, now_us, ev);
+            self.schedule_audio_stop(now_us);
+            if r.restore_failed > 0 || r.restore_corrupt {
+                ev.push(error(
+                    ErrorCode::AttachFailed,
+                    format!(
+                        "the player exited; {}",
+                        r.error.as_deref().unwrap_or("restore incomplete")
+                    ),
+                ));
+            }
+            self.last_follow_error = None;
+            return;
+        }
+        match r.error {
+            Some(e) => {
+                if self.last_follow_error.as_deref() != Some(e.as_str()) {
+                    eprintln!(
+                        "devocal engine: follow: {e} ({} errors in this pass)",
+                        r.failed
+                    );
+                }
+                self.last_follow_error = Some(e);
+            }
+            None => self.last_follow_error = None,
+        }
+    }
+
+    /// Rebinds the output when the player's endpoint changed or the output failed. A tree
+    /// without sessions (or an enumeration error) gives no information: the binding is kept
+    /// unless the output failed, which then goes to the session's endpoint or, with no
+    /// session, the default endpoint (`None`).
+    fn follow_endpoint(&mut self) {
+        let Some(pid) = self.pid else {
+            return;
+        };
+        let failed = self.audio.output_failed();
+        let target = match self.holder.sessions().sessions_for_tree(pid) {
+            Ok(tree) => match session_endpoint(&tree) {
+                Some(ep) => Some(ep),
+                None if failed => None,
+                None => self.bound_endpoint.clone(),
+            },
+            Err(_) => self.bound_endpoint.clone(),
+        };
+        if failed || target != self.bound_endpoint {
+            self.audio.rebind_output(target.clone());
+            self.bound_endpoint = target;
+        }
+    }
+
+    fn current_mode(&self, now_us: u64) -> (Option<Mode>, Option<FallbackReason>) {
+        if self.phase != Phase::Active {
+            return (None, None);
+        }
+        if !self.audio_live() {
+            return (Some(Mode::Passthrough), None);
+        }
+        let stage = self.audio.stage();
+        if let Some((before, until)) = self.toggle_settle {
+            if stage == before && now_us < until {
+                let requested = if self.user_devocal {
+                    Mode::Devocal
+                } else {
+                    Mode::Passthrough
+                };
+                return (Some(requested), None);
+            }
+        }
+        let (mode, reason) = mode_for(self.user_devocal, stage, self.audio.fallback_reason());
+        (Some(mode), reason)
+    }
+
+    fn sync_state(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        let (mode, reason) = self.current_mode(now_us);
+        let pid = if self.phase == Phase::Idle {
+            None
+        } else {
+            self.pid
+        };
+        let key = (self.phase, mode, reason, pid);
+        if key != self.last_state {
+            self.last_state = key;
+            ev.push(Event::State {
+                phase: self.phase,
+                mode,
+                fallback_reason: reason,
+                attached_pid: pid,
+            });
+        }
+    }
+
+    fn metrics(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        match self.next_metrics_us {
+            None => {
+                self.next_metrics_us = Some(now_us + METRICS_INTERVAL_US);
+                return;
+            }
+            Some(t) if now_us < t => return,
+            Some(_) => self.next_metrics_us = Some(now_us + METRICS_INTERVAL_US),
+        }
+        let s = if self.audio_running {
+            self.audio.stats()
+        } else {
+            AudioSnapshot::default()
+        };
+        if s.unattenuated_blocks > self.unattenuated_seen {
+            eprintln!(
+                "devocal engine: safety guard silenced {} block(s) so far",
+                s.unattenuated_blocks
+            );
+        }
+        self.unattenuated_seen = s.unattenuated_blocks;
+        let (mode, reason) = self.current_mode(now_us);
+        ev.push(Event::Metrics(Metrics {
+            mode,
+            latency_ms: s.latency_ms,
+            load_ratio: s.load_ratio,
+            underruns: s.underruns,
+            fallback_reason: reason,
+            attenuation: self.holder.attenuation(),
+            attenuation_epoch: self.holder.attenuation_epoch(),
+            session_overridden: self.overridden_total,
+            input_silent_ms: s.input_silent_ms,
+        }));
+    }
+}
+
+/// [`AudioPort`] over the real audio threads.
+#[derive(Default)]
+pub struct RealAudio {
+    handle: Option<AudioHandle>,
+}
+
+impl AudioPort for RealAudio {
+    fn start(
+        &mut self,
+        cfg: AudioConfig,
+        gains: Arc<SharedGains>,
+        processor: Processor,
+    ) -> Result<(), String> {
+        self.stop();
+        self.handle = Some(AudioHandle::start(cfg, gains, processor)?);
+        Ok(())
+    }
+
+    fn set_devocal(&self, on: bool) {
+        if let Some(h) = &self.handle {
+            h.set_devocal(on);
+        }
+    }
+
+    fn set_separator(&self, s: Box<dyn Separator>) {
+        if let Some(h) = &self.handle {
+            h.set_separator(s);
+        }
+    }
+
+    fn rebind_output(&self, endpoint: Option<String>) {
+        if let Some(h) = &self.handle {
+            h.rebind_output(endpoint);
+        }
+    }
+
+    fn output_failed(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| h.output_failed())
+    }
+
+    fn capture_failed(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| h.capture_failed())
+    }
+
+    fn failed(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| h.failed())
+    }
+
+    fn stage(&self) -> Stage {
+        self.handle
+            .as_ref()
+            .map_or(Stage::Passthrough, |h| h.stage())
+    }
+
+    fn fallback_reason(&self) -> Option<FallbackReason> {
+        self.handle.as_ref().and_then(|h| h.fallback_reason())
+    }
+
+    fn take_follow_request(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|h| h.take_follow_request())
+    }
+
+    fn stats(&self) -> AudioSnapshot {
+        let Some(h) = &self.handle else {
+            return AudioSnapshot::default();
+        };
+        let s = &h.stats;
+        AudioSnapshot {
+            underruns: s.underruns.load(Ordering::Relaxed),
+            input_silent_ms: s.input_silent_ms.load(Ordering::Relaxed),
+            load_ratio: s.load_ratio_milli.load(Ordering::Relaxed) as f32 / 1000.0,
+            latency_ms: s.latency_ms_milli.load(Ordering::Relaxed) as f32 / 1000.0,
+            unattenuated_blocks: s.unattenuated_blocks.load(Ordering::Relaxed),
+            headroom_frames: s.headroom_frames.load(Ordering::Relaxed),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.stop();
+        }
+    }
+}
+
+/// Command line: `--app-pid <u32> --restore-file <path>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Args {
+    pub app_pid: u32,
+    pub restore_file: PathBuf,
+}
+
+pub const USAGE: &str = "usage: devocal-engine --app-pid <u32> --restore-file <path>";
+
+pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let (mut app_pid, mut restore_file) = (None, None);
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
+        match flag.as_str() {
+            "--app-pid" => {
+                let v = value()?;
+                app_pid = Some(
+                    v.parse::<u32>()
+                        .map_err(|e| format!("--app-pid {v:?}: {e}"))?,
+                );
+            }
+            "--restore-file" => restore_file = Some(PathBuf::from(value()?)),
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    Ok(Args {
+        app_pid: app_pid.ok_or("--app-pid is required")?,
+        restore_file: restore_file.ok_or("--restore-file is required")?,
+    })
+}
+
+/// The app process, watched with `WaitForSingleObject(handle, 0)`.
+struct AppProcess(HANDLE);
+
+impl AppProcess {
+    fn open(pid: u32) -> Result<Self, String> {
+        unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
+            .map(AppProcess)
+            .map_err(|e| format!("opening the app process {pid}: {e}"))
+    }
+
+    fn exited(&self) -> bool {
+        let r = unsafe { WaitForSingleObject(self.0, 0) };
+        r == WAIT_OBJECT_0
+    }
+}
+
+impl Drop for AppProcess {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// The engine process: pipe, watchdog and the 1 ms main loop. Returns the exit code: 0 after
+/// a normal exit (shutdown, app gone, pipe closed, protocol mismatch), 1 when it could not
+/// start. The calling thread must be in the COM MTA (`WinSessions`).
+pub fn run(args: Args) -> i32 {
+    let app = match AppProcess::open(args.app_pid) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("devocal engine: {e}");
+            return 1;
+        }
+    };
+    let name = pipe_name(args.app_pid);
+    let server = match PipeServer::create(&name) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("devocal engine: {e}");
+            return 1;
+        }
+    };
+    match server.accept(args.app_pid, CONNECT_TIMEOUT, &mut || !app.exited()) {
+        Ok(Accepted::Connected) => {}
+        Ok(other) => {
+            // Nothing is held yet: just leave.
+            eprintln!("devocal engine: no app connection ({other:?}); exiting");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("devocal engine: accepting the app connection: {e}");
+            return 1;
+        }
+    }
+
+    // Reader: lines in, `None` at end of stream or error.
+    let (line_tx, line_rx) = mpsc::channel::<Option<String>>();
+    let reader = server.clone();
+    let spawned = thread::Builder::new()
+        .name("devocal-pipe-read".into())
+        .spawn(move || loop {
+            match reader.read_line() {
+                Ok(Some(line)) => {
+                    if line_tx.send(Some(line)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = line_tx.send(None);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("devocal engine: pipe read: {e}");
+                    let _ = line_tx.send(None);
+                    break;
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("devocal engine: spawn pipe reader: {e}");
+        return 1;
+    }
+
+    // Writer: the main loop never blocks on the pipe.
+    let (out_tx, out_rx) = mpsc::channel::<String>();
+    let (flushed_tx, flushed_rx) = mpsc::channel::<()>();
+    let write_failed = Arc::new(AtomicBool::new(false));
+    let writer = server.clone();
+    let failed_flag = write_failed.clone();
+    let spawned = thread::Builder::new()
+        .name("devocal-pipe-write".into())
+        .spawn(move || {
+            for line in out_rx {
+                if let Err(e) = writer.write_line(&line) {
+                    eprintln!("devocal engine: pipe write: {e}");
+                    failed_flag.store(true, Ordering::Release);
+                    break;
+                }
+            }
+            let _ = flushed_tx.send(());
+        });
+    if let Err(e) = spawned {
+        eprintln!("devocal engine: spawn pipe writer: {e}");
+        return 1;
+    }
+
+    let loader: ModelLoader = Box::new(|path: &Path, threads: u16| {
+        StemgenRt::load(path, threads).map(|m| Box::new(m) as Box<dyn Separator>)
+    });
+    let mut core = EngineCore::new(WinSessions, args.restore_file, RealAudio::default(), loader);
+
+    let mut link_up = true;
+    let mut exit_deadline: Option<u64> = None;
+    loop {
+        let now = now_us();
+        let mut events = Vec::new();
+        while link_up {
+            match line_rx.try_recv() {
+                Ok(Some(line)) => events.extend(core.handle_line(&line, now)),
+                Ok(None) | Err(mpsc::TryRecvError::Disconnected) => link_up = false,
+                Err(mpsc::TryRecvError::Empty) => break,
+            }
+        }
+        if write_failed.load(Ordering::Acquire) {
+            link_up = false;
+        }
+        if !core.exit_requested() {
+            let why = if !link_up {
+                Some("the app pipe closed")
+            } else if app.exited() {
+                Some("the app process exited")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                eprintln!("devocal engine: {why}; releasing and exiting");
+                events.extend(core.request_exit(now));
+            }
+        }
+        events.extend(core.tick(now));
+        for e in &events {
+            match encode(e) {
+                Ok(line) => {
+                    if link_up {
+                        let _ = out_tx.send(line);
+                    }
+                }
+                Err(err) => eprintln!("devocal engine: cannot encode {e:?}: {err}"),
+            }
+        }
+        if core.exit_requested() {
+            let deadline = *exit_deadline.get_or_insert(now + EXIT_RELEASE_TIMEOUT_US);
+            if core.exit_ready() {
+                break;
+            }
+            if now >= deadline {
+                eprintln!(
+                    "devocal engine: the release did not finish within 2 s; exiting and \
+                     leaving the restore file for the app"
+                );
+                break;
+            }
+        }
+        thread::sleep(Duration::from_micros(TICK_US));
+    }
+    core.stop_audio();
+    drop(out_tx);
+    let _ = flushed_rx.recv_timeout(FLUSH_TIMEOUT);
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::separator::DelayOnly;
+    use devocal_core::protocol::{ErrorCode, PROTOCOL};
+    use devocal_core::sessions::{FakeSessions, SessionInfo, HELD_VOLUME};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PID: u32 = 100;
+    const CREATED: u64 = 555;
+    const MS: u64 = 1_000;
+    const T0: u64 = 1_000_000;
+    const SESSION: &str = "ep1|player|1%b100";
+    const SESSION2: &str = "ep2|player|1%b100";
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "devocal-engine-test-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+        fn file(&self) -> PathBuf {
+            self.0.join("devocal-restore.json")
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeState {
+        running: bool,
+        /// `set_devocal` leaves the stage alone (the processing thread has not applied it yet).
+        lazy_stage: bool,
+        start_error: Option<String>,
+        /// Output endpoint of every start.
+        starts: Vec<Option<String>>,
+        stops: usize,
+        devocal_calls: Vec<bool>,
+        separators: usize,
+        rebinds: Vec<Option<String>>,
+        output_failed: bool,
+        capture_failed: bool,
+        failed: bool,
+        stage: Option<Stage>,
+        reason: Option<FallbackReason>,
+        follow_request: bool,
+        stats: AudioSnapshot,
+    }
+
+    /// Audio double: records every call; the test sets stage, failures and stats.
+    #[derive(Default)]
+    struct FakeAudio(RefCell<FakeState>);
+
+    impl FakeAudio {
+        fn st(&self) -> std::cell::Ref<'_, FakeState> {
+            self.0.borrow()
+        }
+        fn set_stage(&self, stage: Stage, reason: Option<FallbackReason>) {
+            let mut s = self.0.borrow_mut();
+            s.stage = Some(stage);
+            s.reason = reason;
+        }
+        fn set_capture_failed(&self) {
+            let mut s = self.0.borrow_mut();
+            s.capture_failed = true;
+            s.failed = true;
+        }
+        fn set_render_failed(&self) {
+            self.0.borrow_mut().failed = true;
+        }
+        fn set_output_failed(&self, v: bool) {
+            self.0.borrow_mut().output_failed = v;
+        }
+        fn request_follow(&self) {
+            self.0.borrow_mut().follow_request = true;
+        }
+        fn fail_next_start(&self, msg: &str) {
+            self.0.borrow_mut().start_error = Some(msg.into());
+        }
+        fn set_lazy_stage(&self) {
+            self.0.borrow_mut().lazy_stage = true;
+        }
+        fn set_stats(&self, stats: AudioSnapshot) {
+            self.0.borrow_mut().stats = stats;
+        }
+    }
+
+    impl AudioPort for FakeAudio {
+        fn start(
+            &mut self,
+            cfg: AudioConfig,
+            _gains: Arc<SharedGains>,
+            processor: Processor,
+        ) -> Result<(), String> {
+            let mut s = self.0.borrow_mut();
+            assert!(!s.running, "start while running");
+            assert_eq!(cfg.pid, PID);
+            assert_eq!(cfg.hop, processor.hop());
+            if let Some(e) = s.start_error.take() {
+                return Err(e);
+            }
+            s.running = true;
+            s.starts.push(cfg.output_endpoint);
+            s.stage = Some(Stage::Passthrough);
+            s.reason = None;
+            Ok(())
+        }
+        fn set_devocal(&self, on: bool) {
+            let mut s = self.0.borrow_mut();
+            assert!(s.running, "set_devocal while stopped");
+            s.devocal_calls.push(on);
+            if !s.lazy_stage {
+                s.stage = Some(if on {
+                    Stage::Devocal
+                } else {
+                    Stage::Passthrough
+                });
+                s.reason = None;
+            }
+        }
+        fn set_separator(&self, _s: Box<dyn Separator>) {
+            self.0.borrow_mut().separators += 1;
+        }
+        fn rebind_output(&self, endpoint: Option<String>) {
+            self.0.borrow_mut().rebinds.push(endpoint);
+        }
+        fn output_failed(&self) -> bool {
+            self.st().output_failed
+        }
+        fn capture_failed(&self) -> bool {
+            self.st().capture_failed
+        }
+        fn failed(&self) -> bool {
+            self.st().failed
+        }
+        fn stage(&self) -> Stage {
+            self.st().stage.unwrap_or(Stage::Passthrough)
+        }
+        fn fallback_reason(&self) -> Option<FallbackReason> {
+            self.st().reason
+        }
+        fn take_follow_request(&self) -> bool {
+            std::mem::take(&mut self.0.borrow_mut().follow_request)
+        }
+        fn stats(&self) -> AudioSnapshot {
+            self.st().stats
+        }
+        fn stop(&mut self) {
+            let mut s = self.0.borrow_mut();
+            if s.running {
+                s.running = false;
+                s.stops += 1;
+            }
+            s.capture_failed = false;
+            s.failed = false;
+            s.output_failed = false;
+        }
+    }
+
+    fn session(id: &str, endpoint: &str) -> SessionInfo {
+        SessionInfo {
+            instance_id: id.into(),
+            session_identifier: format!("{endpoint}|player.exe%b{{0}}"),
+            pid: PID,
+            endpoint_id: endpoint.into(),
+            active: true,
+        }
+    }
+
+    fn fake_sessions() -> FakeSessions {
+        let f = FakeSessions::new();
+        f.set_process_created(PID, Some(CREATED));
+        f.add_session(session(SESSION, "ep1"), 0.8, false);
+        f
+    }
+
+    /// Loads a `DelayOnly` for any path except `*bad.onnx`; counts calls.
+    fn loader(calls: Rc<Cell<usize>>) -> ModelLoader {
+        Box::new(move |path: &Path, _threads: u16| {
+            calls.set(calls.get() + 1);
+            if path.to_string_lossy().ends_with("bad.onnx") {
+                Err("cannot load model".into())
+            } else {
+                Ok(Box::new(DelayOnly::new(128)) as Box<dyn Separator>)
+            }
+        })
+    }
+
+    type Core = EngineCore<FakeSessions, FakeAudio>;
+
+    struct Rig {
+        core: Core,
+        loads: Rc<Cell<usize>>,
+        now: u64,
+        restore: PathBuf,
+        _dir: TempDir,
+    }
+
+    impl Rig {
+        fn new(tag: &str) -> Self {
+            let dir = TempDir::new(tag);
+            let path = dir.file();
+            Self::with_path(dir, path)
+        }
+
+        fn with_path(dir: TempDir, restore: PathBuf) -> Self {
+            let loads = Rc::new(Cell::new(0));
+            let core = EngineCore::new(
+                fake_sessions(),
+                restore.clone(),
+                FakeAudio::default(),
+                loader(loads.clone()),
+            );
+            Rig {
+                core,
+                loads,
+                now: T0,
+                restore,
+                _dir: dir,
+            }
+        }
+
+        fn send(&mut self, cmd: Command) -> Vec<Event> {
+            self.core.handle(cmd, self.now)
+        }
+
+        /// Ticks every millisecond for `ms` milliseconds.
+        fn run(&mut self, ms: u64) -> Vec<Event> {
+            let mut ev = Vec::new();
+            for _ in 0..ms {
+                ev.extend(self.core.tick(self.now));
+                self.now += MS;
+            }
+            ev
+        }
+
+        fn audio(&self) -> &FakeAudio {
+            self.core.audio()
+        }
+
+        fn volume(&self, id: &str) -> f32 {
+            self.core.sessions().volume(id).unwrap()
+        }
+
+        /// hello, set_model, attach and 100 ms of ticks: Active(Passthrough).
+        fn attached(tag: &str) -> (Self, Vec<Event>) {
+            let mut r = Rig::new(tag);
+            let mut ev = r.send(Command::Hello { version: PROTOCOL });
+            ev.extend(r.send(set_model("model.onnx", "cpu")));
+            ev.extend(r.send(attach()));
+            ev.extend(r.run(100));
+            assert_eq!(r.core.phase(), Phase::Active, "{ev:?}");
+            (r, ev)
+        }
+    }
+
+    fn set_model(path: &str, device: &str) -> Command {
+        Command::SetModel {
+            id: "fake".into(),
+            path: PathBuf::from(path),
+            device: device.into(),
+            threads: 1,
+        }
+    }
+
+    fn attach() -> Command {
+        Command::Attach {
+            pid: PID,
+            created_at: CREATED,
+        }
+    }
+
+    type StateTuple = (Phase, Option<Mode>, Option<FallbackReason>);
+
+    fn states(ev: &[Event]) -> Vec<StateTuple> {
+        ev.iter()
+            .filter_map(|e| match e {
+                Event::State {
+                    phase,
+                    mode,
+                    fallback_reason,
+                    ..
+                } => Some((*phase, *mode, *fallback_reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn errors(ev: &[Event]) -> Vec<ErrorCode> {
+        ev.iter()
+            .filter_map(|e| match e {
+                Event::Error { code, .. } => Some(*code),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn error_messages(ev: &[Event]) -> Vec<String> {
+        ev.iter()
+            .filter_map(|e| match e {
+                Event::Error { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn metrics(ev: &[Event]) -> Vec<devocal_core::protocol::Metrics> {
+        ev.iter()
+            .filter_map(|e| match e {
+                Event::Metrics(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const ACTIVE_PASS: StateTuple = (Phase::Active, Some(Mode::Passthrough), None);
+    const ACTIVE_DEVOCAL: StateTuple = (Phase::Active, Some(Mode::Devocal), None);
+    const ATTACHING: StateTuple = (Phase::Attaching, None, None);
+    const RELEASING: StateTuple = (Phase::Releasing, None, None);
+    const IDLE: StateTuple = (Phase::Idle, None, None);
+
+    #[test]
+    fn full_lifecycle_emits_states_in_order() {
+        let mut r = Rig::new("lifecycle");
+        let mut ev = r.send(Command::Hello { version: PROTOCOL });
+        ev.extend(r.send(set_model("model.onnx", "cpu")));
+        ev.extend(r.send(attach()));
+        ev.extend(r.run(100));
+        assert_eq!(r.volume(SESSION), HELD_VOLUME);
+        ev.extend(r.send(Command::SetMode { devocal: true }));
+        ev.extend(r.run(100));
+        ev.extend(r.send(Command::Release));
+        ev.extend(r.run(100));
+
+        assert_eq!(
+            states(&ev),
+            vec![ATTACHING, ACTIVE_PASS, ACTIVE_DEVOCAL, RELEASING, IDLE]
+        );
+        assert!(errors(&ev).is_empty(), "{ev:?}");
+        let attached_pids: Vec<Option<u32>> = ev
+            .iter()
+            .filter_map(|e| match e {
+                Event::State { attached_pid, .. } => Some(*attached_pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attached_pids,
+            vec![Some(PID), Some(PID), Some(PID), Some(PID), None]
+        );
+        assert_eq!(r.volume(SESSION), 0.8);
+        assert!(!r.core.sessions().writes().is_empty());
+        let st = r.audio().st();
+        assert_eq!(st.starts, vec![Some("ep1".to_string())]);
+        assert_eq!(st.devocal_calls, vec![true]);
+        assert_eq!(st.stops, 1);
+        assert!(!st.running);
+        drop(st);
+        assert_eq!(r.loads.get(), 1);
+        assert!(!r.core.exit_requested());
+    }
+
+    #[test]
+    fn bad_device_rejected() {
+        let mut r = Rig::new("bad-device");
+        let ev = r.send(set_model("model.onnx", "dml"));
+        assert_eq!(errors(&ev), vec![ErrorCode::BadDevice]);
+        assert_eq!(r.loads.get(), 0, "the model is not loaded");
+        // Still no model.
+        let ev = r.send(Command::SetMode { devocal: true });
+        assert_eq!(errors(&ev), vec![ErrorCode::NoModel]);
+    }
+
+    #[test]
+    fn model_load_failure_reported() {
+        let mut r = Rig::new("load-fail");
+        let ev = r.send(set_model("bad.onnx", "cpu"));
+        assert_eq!(errors(&ev), vec![ErrorCode::ModelLoadFailed]);
+        assert!(error_messages(&ev)[0].contains("cannot load model"));
+        let ev = r.send(Command::SetMode { devocal: true });
+        assert_eq!(errors(&ev), vec![ErrorCode::NoModel]);
+    }
+
+    #[test]
+    fn devocal_without_model_rejected() {
+        let mut r = Rig::new("no-model");
+        let mut ev = r.send(attach());
+        ev.extend(r.run(100));
+        let rejected = r.send(Command::SetMode { devocal: true });
+        assert_eq!(errors(&rejected), vec![ErrorCode::NoModel]);
+        ev.extend(rejected);
+        ev.extend(r.run(100));
+        assert_eq!(states(&ev), vec![ATTACHING, ACTIVE_PASS]);
+        assert!(r.audio().st().devocal_calls.is_empty());
+    }
+
+    #[test]
+    fn model_loaded_while_active_goes_to_the_audio_side() {
+        let mut r = Rig::new("model-live");
+        r.send(attach());
+        r.run(100);
+        let ev = r.send(set_model("model.onnx", "cpu"));
+        assert!(errors(&ev).is_empty());
+        assert_eq!(r.audio().st().separators, 1);
+        let ev = r.send(Command::SetMode { devocal: true });
+        assert!(errors(&ev).is_empty());
+        assert_eq!(states(&ev), vec![ACTIVE_DEVOCAL]);
+    }
+
+    #[test]
+    fn protocol_mismatch_releases() {
+        let (mut r, _) = Rig::attached("mismatch-hello");
+        let mut ev = r.send(Command::Hello {
+            version: PROTOCOL + 1,
+        });
+        assert_eq!(errors(&ev), vec![ErrorCode::Protocol]);
+        assert!(r.core.exit_requested());
+        ev.extend(r.run(100));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        assert_eq!(r.volume(SESSION), 0.8);
+        assert!(r.core.exit_ready());
+        assert!(!r.audio().st().running);
+
+        // A line with another protocol number is handled the same way.
+        let (mut r, _) = Rig::attached("mismatch-line");
+        let mut ev = r
+            .core
+            .handle_line("{\"protocol\":2,\"cmd\":\"release\"}", r.now);
+        assert_eq!(errors(&ev), vec![ErrorCode::Protocol]);
+        ev.extend(r.run(100));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        assert!(r.core.exit_ready());
+    }
+
+    #[test]
+    fn malformed_line_is_reported_and_ignored() {
+        let (mut r, _) = Rig::attached("malformed");
+        let ev = r
+            .core
+            .handle_line("{\"protocol\":1,\"cmd\":\"explode\"}", r.now);
+        assert_eq!(errors(&ev), vec![ErrorCode::Protocol]);
+        assert!(!r.core.exit_requested());
+        assert_eq!(r.core.phase(), Phase::Active);
+        let ev = r
+            .core
+            .handle_line("{\"protocol\":1,\"cmd\":\"release\"}\n", r.now);
+        assert_eq!(states(&ev), vec![RELEASING]);
+    }
+
+    #[test]
+    fn shutdown_releases_then_exit_is_ready() {
+        let (mut r, _) = Rig::attached("shutdown");
+        let mut ev = r.send(Command::Shutdown);
+        assert!(r.core.exit_requested());
+        assert!(!r.core.exit_ready());
+        ev.extend(r.run(100));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        assert!(r.core.exit_ready());
+        assert_eq!(r.volume(SESSION), 0.8);
+        // Idle already: exit is ready at once.
+        let mut r = Rig::new("shutdown-idle");
+        r.send(Command::Shutdown);
+        assert!(r.core.exit_ready());
+    }
+
+    #[test]
+    fn metrics_once_per_second() {
+        let mut r = Rig::new("metrics");
+        let ev = r.run(2_500);
+        assert_eq!(metrics(&ev).len(), 2);
+
+        let (mut r, _) = Rig::attached("metrics-active");
+        r.audio().set_stats(AudioSnapshot {
+            underruns: 3,
+            input_silent_ms: 40,
+            load_ratio: 0.25,
+            latency_ms: 21.5,
+            unattenuated_blocks: 0,
+            headroom_frames: 0,
+        });
+        let m = metrics(&r.run(1_000));
+        assert_eq!(m.len(), 1);
+        let m = &m[0];
+        assert_eq!(m.mode, Some(Mode::Passthrough));
+        assert_eq!(m.underruns, 3);
+        assert_eq!(m.input_silent_ms, 40);
+        assert_eq!(m.load_ratio, 0.25);
+        assert_eq!(m.latency_ms, 21.5);
+        assert!((m.attenuation - HELD_VOLUME / 0.8).abs() < 1e-9);
+        assert!(m.attenuation_epoch >= 1);
+    }
+
+    #[test]
+    fn overload_reported_as_fallback() {
+        let (mut r, _) = Rig::attached("overload");
+        let mut ev = r.send(Command::SetMode { devocal: true });
+        ev.extend(r.run(100));
+        assert_eq!(states(&ev), vec![ACTIVE_DEVOCAL]);
+
+        r.audio()
+            .set_stage(Stage::Fallback, Some(FallbackReason::Overload));
+        let mut ev = r.run(2_000);
+        // State sync from the app repeats "on": never forwarded again.
+        ev.extend(r.send(Command::SetMode { devocal: true }));
+        ev.extend(r.run(1_000));
+        assert_eq!(
+            states(&ev),
+            vec![(
+                Phase::Active,
+                Some(Mode::Fallback),
+                Some(FallbackReason::Overload)
+            )]
+        );
+        assert_eq!(r.audio().st().devocal_calls, vec![true]);
+        assert_eq!(r.audio().stage(), Stage::Fallback);
+        let m = metrics(&ev);
+        assert!(!m.is_empty());
+        assert!(m.iter().all(|m| m.mode == Some(Mode::Fallback)
+            && m.fallback_reason == Some(FallbackReason::Overload)));
+
+        // A user toggle off/on is forwarded and leaves the fallback.
+        let mut ev = r.send(Command::SetMode { devocal: false });
+        ev.extend(r.send(Command::SetMode { devocal: true }));
+        ev.extend(r.run(10));
+        assert_eq!(r.audio().st().devocal_calls, vec![true, false, true]);
+        assert_eq!(states(&ev), vec![ACTIVE_PASS, ACTIVE_DEVOCAL]);
+    }
+
+    #[test]
+    fn fallback_while_user_off_is_passthrough() {
+        let (mut r, _) = Rig::attached("fallback-off");
+        r.audio()
+            .set_stage(Stage::Fallback, Some(FallbackReason::Overload));
+        let ev = r.run(100);
+        assert!(states(&ev).is_empty(), "{ev:?}");
+    }
+
+    #[test]
+    fn set_mode_forwarded_only_on_change() {
+        let (mut r, _) = Rig::attached("toggle");
+        for on in [true, true, false, false, true] {
+            r.send(Command::SetMode { devocal: on });
+            r.run(5);
+        }
+        assert_eq!(r.audio().st().devocal_calls, vec![true, false, true]);
+    }
+
+    #[test]
+    fn user_toggle_before_attach_applies_to_the_new_audio_once() {
+        let mut r = Rig::new("toggle-early");
+        r.send(set_model("model.onnx", "cpu"));
+        let ev = r.send(Command::SetMode { devocal: true });
+        assert!(errors(&ev).is_empty());
+        let mut ev = r.send(attach());
+        ev.extend(r.run(100));
+        ev.extend(r.send(Command::SetMode { devocal: true }));
+        ev.extend(r.run(10));
+        assert_eq!(r.audio().st().devocal_calls, vec![true]);
+        assert_eq!(states(&ev), vec![ATTACHING, ACTIVE_DEVOCAL]);
+    }
+
+    #[test]
+    fn stage_mapping_reports_pending_and_fallback_reasons() {
+        use FallbackReason::*;
+        use Stage::*;
+        // User on: everything before the fallback is "devocal (pending)".
+        for stage in [Passthrough, WarmingUp, FadingIn, Devocal] {
+            assert_eq!(
+                mode_for(true, stage, None),
+                (Mode::Devocal, None),
+                "{stage:?}"
+            );
+        }
+        // FadingOut: the reason decides (a model swap fades out without one).
+        assert_eq!(mode_for(true, FadingOut, None), (Mode::Devocal, None));
+        assert_eq!(
+            mode_for(true, FadingOut, Some(Overload)),
+            (Mode::Fallback, Some(Overload))
+        );
+        assert_eq!(
+            mode_for(true, Fallback, Some(ModelError)),
+            (Mode::Fallback, Some(ModelError))
+        );
+        // User off: plain passthrough whatever the stage says.
+        for stage in [
+            Passthrough,
+            WarmingUp,
+            FadingIn,
+            Devocal,
+            FadingOut,
+            Fallback,
+        ] {
+            assert_eq!(
+                mode_for(false, stage, Some(Overload)),
+                (Mode::Passthrough, None),
+                "{stage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_change_rebinds() {
+        let (mut r, _) = Rig::attached("endpoint");
+        r.run(1_000);
+        assert!(r.audio().st().rebinds.is_empty());
+
+        // The player moves to another endpoint.
+        r.core.sessions().remove_session(SESSION);
+        r.core
+            .sessions()
+            .add_session(session(SESSION2, "ep2"), 0.8, false);
+        r.run(600);
+        assert_eq!(r.audio().st().rebinds, vec![Some("ep2".to_string())]);
+        r.run(1_500);
+        assert_eq!(r.audio().st().rebinds.len(), 1, "rebinds exactly once");
+
+        // The endpoint failed: rebind at the next check.
+        r.audio().set_output_failed(true);
+        r.run(600);
+        assert_eq!(
+            r.audio().st().rebinds,
+            vec![Some("ep2".to_string()), Some("ep2".to_string())]
+        );
+        r.audio().set_output_failed(false);
+        r.run(1_000);
+        assert_eq!(r.audio().st().rebinds.len(), 2);
+
+        // The player has no session any more and the output still works: keep the binding.
+        r.core.sessions().remove_session(SESSION2);
+        r.run(1_000);
+        assert_eq!(r.audio().st().rebinds.len(), 2);
+        // ...but a failed output then goes to the default endpoint.
+        r.audio().set_output_failed(true);
+        r.run(600);
+        assert_eq!(r.audio().st().rebinds.last(), Some(&None));
+    }
+
+    #[test]
+    fn attach_failure_returns_to_idle() {
+        // The restore file cannot be written: nothing is lowered.
+        let dir = TempDir::new("attach-fail");
+        let path = dir.0.join("missing").join("devocal-restore.json");
+        let mut r = Rig::with_path(dir, path);
+        let mut ev = r.send(attach());
+        ev.extend(r.run(100));
+        assert_eq!(errors(&ev), vec![ErrorCode::AttachFailed]);
+        assert_eq!(states(&ev), vec![ATTACHING, IDLE]);
+        assert_eq!(r.core.phase(), Phase::Idle);
+        assert_eq!(r.volume(SESSION), 0.8);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert!(!r.audio().st().running);
+        // A later attach works.
+        let ev = r.send(attach());
+        assert_eq!(states(&ev), vec![ATTACHING]);
+    }
+
+    #[test]
+    fn audio_start_failure_returns_to_idle_without_lowering() {
+        let mut r = Rig::new("start-fail");
+        r.audio().fail_next_start("process loopback unavailable");
+        let mut ev = r.send(attach());
+        ev.extend(r.run(100));
+        assert_eq!(errors(&ev), vec![ErrorCode::AttachFailed]);
+        assert!(error_messages(&ev)[0].contains("process loopback unavailable"));
+        assert_eq!(states(&ev), vec![ATTACHING, IDLE]);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert!(!r.restore.exists());
+    }
+
+    #[test]
+    fn holder_failure_during_attach_releases() {
+        let mut r = Rig::new("holder-fail");
+        r.core.sessions().fail_set_volume(SESSION);
+        let mut ev = r.send(attach());
+        ev.extend(r.run(100));
+        assert_eq!(errors(&ev), vec![ErrorCode::AttachFailed]);
+        assert_eq!(states(&ev), vec![ATTACHING, RELEASING, IDLE]);
+        assert!(!r.audio().st().running);
+    }
+
+    #[test]
+    fn unclean_attach_report_is_surfaced_but_attach_continues() {
+        let dir = TempDir::new("corrupt");
+        std::fs::write(dir.file(), b"not json").unwrap();
+        let path = dir.file();
+        let mut r = Rig::with_path(dir, path);
+        let mut ev = r.send(attach());
+        ev.extend(r.run(100));
+        assert_eq!(errors(&ev), vec![ErrorCode::AttachFailed]);
+        assert!(error_messages(&ev)[0].contains("restore"), "{ev:?}");
+        assert_eq!(states(&ev), vec![ATTACHING, ACTIVE_PASS]);
+        assert_eq!(r.volume(SESSION), HELD_VOLUME);
+    }
+
+    #[test]
+    fn capture_failure_releases() {
+        let (mut r, _) = Rig::attached("capture-fail");
+        r.audio().set_capture_failed();
+        let mut ev = r.run(1);
+        assert_eq!(errors(&ev), vec![ErrorCode::CaptureFailed]);
+        ev.extend(r.run(100));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        assert_eq!(r.volume(SESSION), 0.8);
+        assert!(!r.audio().st().running);
+        assert!(!r.core.exit_requested());
+    }
+
+    #[test]
+    fn render_failure_releases() {
+        let (mut r, _) = Rig::attached("render-fail");
+        r.audio().set_render_failed();
+        let mut ev = r.run(100);
+        assert_eq!(errors(&ev), vec![ErrorCode::RenderFailed]);
+        ev.extend(r.run(10));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        assert_eq!(r.volume(SESSION), 0.8);
+    }
+
+    #[test]
+    fn release_failure_still_ends_idle_and_keeps_the_restore_file() {
+        let (mut r, _) = Rig::attached("release-fail");
+        r.core.sessions().fail_set_volume(SESSION);
+        let mut ev = r.send(Command::Release);
+        ev.extend(r.run(200));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        assert!(r.restore.exists());
+        assert!(!r.audio().st().running);
+    }
+
+    #[test]
+    fn player_exit_goes_idle() {
+        let (mut r, _) = Rig::attached("player-exit");
+        r.core.sessions().set_process_created(PID, None);
+        let ev = r.run(600);
+        assert_eq!(states(&ev), vec![IDLE]);
+        assert_eq!(r.volume(SESSION), 0.8);
+        assert!(!r.audio().st().running);
+    }
+
+    #[test]
+    fn guard_request_runs_follow_at_once() {
+        let (mut r, _) = Rig::attached("guard");
+        // Something turned the session back up right after a follow pass.
+        r.run(450);
+        r.core.sessions().set_volume(SESSION, 0.8).unwrap();
+        r.run(1);
+        assert_eq!(r.volume(SESSION), 0.8, "no follow due yet");
+        r.audio().request_follow();
+        r.run(1);
+        assert_eq!(r.volume(SESSION), HELD_VOLUME);
+    }
+
+    #[test]
+    fn model_is_reloaded_for_the_next_attach() {
+        let (mut r, _) = Rig::attached("reload");
+        assert_eq!(r.loads.get(), 1);
+        r.send(Command::Release);
+        r.run(100);
+        let mut ev = r.send(attach());
+        ev.extend(r.run(100));
+        assert_eq!(r.loads.get(), 2);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert_eq!(r.audio().st().starts.len(), 2);
+        let ev = r.send(Command::SetMode { devocal: true });
+        assert!(errors(&ev).is_empty());
+    }
+
+    #[test]
+    fn attach_while_active_is_rejected() {
+        let (mut r, _) = Rig::attached("double-attach");
+        let ev = r.send(attach());
+        assert_eq!(errors(&ev), vec![ErrorCode::AttachFailed]);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert_eq!(r.audio().st().starts.len(), 1);
+    }
+
+    #[test]
+    fn stale_fallback_stage_does_not_hide_a_user_toggle() {
+        let (mut r, _) = Rig::attached("settle");
+        r.send(Command::SetMode { devocal: true });
+        r.run(10);
+        r.audio()
+            .set_stage(Stage::Fallback, Some(FallbackReason::Overload));
+        let mut ev = r.run(10);
+        // The processing thread applies the toggles later than they are sent.
+        r.audio().set_lazy_stage();
+        ev.extend(r.send(Command::SetMode { devocal: false }));
+        ev.extend(r.run(5));
+        ev.extend(r.send(Command::SetMode { devocal: true }));
+        ev.extend(r.run(5));
+        r.audio().set_stage(Stage::WarmingUp, None);
+        ev.extend(r.run(200));
+        let fallback = (
+            Phase::Active,
+            Some(Mode::Fallback),
+            Some(FallbackReason::Overload),
+        );
+        assert_eq!(states(&ev), vec![fallback, ACTIVE_PASS, ACTIVE_DEVOCAL]);
+
+        // A toggle the processor never acts on is reported truthfully after the settle time.
+        r.audio()
+            .set_stage(Stage::Fallback, Some(FallbackReason::Overload));
+        let mut ev = r.run(10);
+        ev.extend(r.send(Command::SetMode { devocal: false }));
+        ev.extend(r.send(Command::SetMode { devocal: true }));
+        ev.extend(r.run(200));
+        assert_eq!(
+            states(&ev),
+            vec![fallback, ACTIVE_PASS, ACTIVE_DEVOCAL, fallback]
+        );
+    }
+
+    #[test]
+    fn watchdog_exit_while_audio_starts_releases_without_lowering() {
+        let mut r = Rig::new("watchdog-early");
+        let mut ev = r.send(attach());
+        // The pipe closed before the first tick: begin_attach never runs.
+        ev.extend(r.core.request_exit(r.now));
+        ev.extend(r.run(100));
+        assert_eq!(states(&ev), vec![ATTACHING, RELEASING, IDLE]);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert!(r.core.exit_ready());
+        assert!(!r.restore.exists());
+    }
+
+    #[test]
+    fn overridden_sessions_are_counted_in_metrics() {
+        let (mut r, _) = Rig::attached("overridden");
+        r.core.sessions().set_volume(SESSION, 0.5).unwrap();
+        let m = metrics(&r.run(1_000));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].session_overridden, 1);
+        assert_eq!(r.volume(SESSION), HELD_VOLUME);
+    }
+
+    #[test]
+    fn args_parse() {
+        let args = |v: &[&str]| parse_args(v.iter().map(|s| s.to_string()));
+        assert_eq!(
+            args(&["--app-pid", "42", "--restore-file", r"C:\x\r.json"]),
+            Ok(Args {
+                app_pid: 42,
+                restore_file: PathBuf::from(r"C:\x\r.json"),
+            })
+        );
+        assert!(args(&["--app-pid", "42"]).is_err());
+        assert!(args(&["--restore-file", "r.json"]).is_err());
+        assert!(args(&["--app-pid", "-1", "--restore-file", "r.json"]).is_err());
+        assert!(args(&["--app-pid"]).is_err());
+        assert!(args(&["--verbose"]).is_err());
+    }
+
+    #[test]
+    fn requests_while_releasing_wait_for_the_next_attach() {
+        let (mut r, _) = Rig::attached("releasing");
+        r.send(Command::Release);
+        r.run(5);
+        assert_eq!(r.core.phase(), Phase::Releasing);
+        r.send(set_model("model2.onnx", "cpu"));
+        r.send(Command::SetMode { devocal: true });
+        assert_eq!(
+            r.audio().st().separators,
+            0,
+            "not sent to the stopping audio"
+        );
+        assert!(r.audio().st().devocal_calls.is_empty());
+        r.run(100);
+        r.send(attach());
+        r.run(100);
+        assert_eq!(r.loads.get(), 2, "the staged model is used, not reloaded");
+        assert_eq!(r.audio().st().devocal_calls, vec![true]);
+    }
+}

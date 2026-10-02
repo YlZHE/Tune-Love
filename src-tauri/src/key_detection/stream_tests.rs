@@ -240,7 +240,10 @@ fn an_opted_in_shorter_window_is_accepted_and_the_default_still_rejects_it() {
     let mut early = RollingDetector::with_min_seconds(3);
     assert!(early.analyze(&window(&pcm, 2 * SECOND)).is_err());
     let at_three = early.analyze(&window(&pcm, 3 * SECOND)).unwrap();
-    assert!(at_three.evidence.is_none(), "no complete libkeyfinder hop before ~3.75 s");
+    assert!(
+        at_three.evidence.is_none(),
+        "no complete libkeyfinder hop before ~3.75 s"
+    );
     let at_four = early.analyze(&window(&pcm, 4 * SECOND)).unwrap();
     assert!(at_four.evidence.is_some_and(|e| e.seconds > 0.0));
 }
@@ -270,11 +273,17 @@ fn rolling_reports_pitch_class_evidence_oriented_at_c_for_new_hops() {
         }
     }
     // Evidence should cover most of the 20 s of audio (the first window is one step).
-    assert!(total_seconds > 12.0 && total_seconds < 22.0, "{total_seconds}");
+    assert!(
+        total_seconds > 12.0 && total_seconds < 22.0,
+        "{total_seconds}"
+    );
     let diatonic: f64 = [0, 2, 4, 5, 7, 9, 11].iter().map(|pc| summed[*pc]).sum();
     let chromatic_rest: f64 = [1, 3, 6, 8, 10].iter().map(|pc| summed[*pc]).sum();
     assert!(diatonic > chromatic_rest * 3.0, "{summed:?}");
-    assert!(summed[0] > summed[1] && summed[0] > summed[11], "{summed:?}");
+    assert!(
+        summed[0] > summed[1] && summed[0] > summed[11],
+        "{summed:?}"
+    );
 
     let silent = PcmWindow {
         samples: vec![0.0; 8 * SECOND],

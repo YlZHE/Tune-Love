@@ -61,8 +61,11 @@ mod tests {
 
     impl Sandbox {
         fn new(name: &str) -> Self {
-            let base = std::env::temp_dir()
-                .join(format!("tunelove-migrate-{}-{}", std::process::id(), name));
+            let base = std::env::temp_dir().join(format!(
+                "tunelove-migrate-{}-{}",
+                std::process::id(),
+                name
+            ));
             let _ = fs::remove_dir_all(&base);
             fs::create_dir_all(&base).unwrap();
             Self { base }
@@ -138,7 +141,10 @@ mod tests {
         sb.write_legacy(r#"{"v":1}"#);
         // A plain file occupies the new directory's path, so creating it fails.
         fs::write(sb.new_dir(), "not a directory").unwrap();
-        assert!(matches!(migrate_song_cache(&sb.new_dir()), Migration::Failed(_)));
+        assert!(matches!(
+            migrate_song_cache(&sb.new_dir()),
+            Migration::Failed(_)
+        ));
         assert!(sb.new_dir().is_file());
         assert!(!sb
             .new_dir()

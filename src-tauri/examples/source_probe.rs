@@ -4,10 +4,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let controller = nowplaying::MediaController::new().await?;
     if let Some(session) = controller.current().await? {
         println!("{}", serde_json::to_string_pretty(&session.source)?);
-        let fallback = tune_love::source::fallback_name(
-            &session.source.id,
-            session.source.name.as_deref(),
-        );
+        let fallback =
+            tune_love::source::fallback_name(&session.source.id, session.source.name.as_deref());
         let identity = tokio::task::spawn_blocking(move || {
             tune_love::source::resolve(&session.source.id, &fallback)
         })

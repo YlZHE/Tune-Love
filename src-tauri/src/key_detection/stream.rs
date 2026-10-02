@@ -113,7 +113,12 @@ impl RollingDetector {
         window: &PcmWindow,
         requested: bool,
     ) -> Result<(StreamAnalysis, Option<KeyDiagnostics>), String> {
-        engine::validate_input_min(&window.samples, window.sample_rate, window.channels, self.min_seconds())?;
+        engine::validate_input_min(
+            &window.samples,
+            window.sample_rate,
+            window.channels,
+            self.min_seconds(),
+        )?;
         let frames = window.samples.len() / 2;
         let start = window
             .sample_end_sequence
@@ -211,7 +216,15 @@ impl RollingDetector {
         reset: bool,
         gain: f64,
         requested: bool,
-    ) -> Result<(Option<MusicalKey>, [u32; 4], Option<KeyDiagnostics>, [f64; 12]), String> {
+    ) -> Result<
+        (
+            Option<MusicalKey>,
+            [u32; 4],
+            Option<KeyDiagnostics>,
+            [f64; 12],
+        ),
+        String,
+    > {
         // Serialize FFTW planning, execution and destruction, including baseline calls.
         let _guard = engine::NATIVE_ANALYSIS
             .lock()
@@ -270,7 +283,15 @@ impl RollingDetector {
         _: bool,
         _: f64,
         _: bool,
-    ) -> Result<(Option<MusicalKey>, [u32; 4], Option<KeyDiagnostics>, [f64; 12]), String> {
+    ) -> Result<
+        (
+            Option<MusicalKey>,
+            [u32; 4],
+            Option<KeyDiagnostics>,
+            [f64; 12],
+        ),
+        String,
+    > {
         Err("libkeyfinder native adapter is currently available only on Windows".into())
     }
 }

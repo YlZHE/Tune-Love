@@ -13,8 +13,8 @@ mod diagnostics_tests;
 mod stream_tests;
 
 pub use engine::{detect, detect_with_diagnostics};
-pub use stream::{RollingDetector, StreamAnalysis};
 pub use scale_match::{AutoTuneTarget, Scale, TargetSource};
+pub use stream::{RollingDetector, StreamAnalysis};
 pub use types::{ChromaEvidence, DiagnosticAnalysis, KeyDiagnostics, KeyScore, Mode, MusicalKey};
 
 use crate::audio::{AnalysisContext, AudioState, PcmWindow};
@@ -144,10 +144,15 @@ impl KeyDetectionState {
     /// Remember the current song's target once it is well supported. Disk I/O
     /// happens here, on the analysis worker, with no other lock held.
     fn remember(&self, track_key: &str, target: &AutoTuneTarget) {
-        let Some(id) = song_cache::song_id(track_key) else { return };
+        let Some(id) = song_cache::song_id(track_key) else {
+            return;
+        };
         let (bytes, path) = {
             let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            (cache.put(&id, target, crate::audio::now_ms()), cache.path().map(|p| p.to_path_buf()))
+            (
+                cache.put(&id, target, crate::audio::now_ms()),
+                cache.path().map(|p| p.to_path_buf()),
+            )
         };
         if let (Some(bytes), Some(path)) = (bytes, path) {
             if let Err(error) = song_cache::persist(&path, &bytes) {
@@ -293,8 +298,12 @@ impl KeyDetectionState {
                     eprintln!("Key stream: fed_frames={} retained_hops={} buffered_samples={} reset={} batch_fallback={} evidence_seconds={:.2}",
                         result.fed_frames, result.retained_hops, result.buffered_samples, result.reset, result.batch_fallback,
                         result.evidence.map_or(0.0, |e| e.seconds));
-                    (label_vote(result.candidate, window.samples.len()), result.evidence, false,
-                        format!("{:?}", result.candidate))
+                    (
+                        label_vote(result.candidate, window.samples.len()),
+                        result.evidence,
+                        false,
+                        format!("{:?}", result.candidate),
+                    )
                 }
                 Ok(Err(error)) => {
                     eprintln!("Key analysis unavailable: {error}");

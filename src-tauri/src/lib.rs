@@ -22,7 +22,8 @@ pub fn run() {
             app.state::<audio::AudioState>().start();
             // Installed builds ship the bridge and Python under the resource dir.
             if let Ok(resource_dir) = app.path().resource_dir() {
-                app.state::<autotune::AutotuneState>().set_resource_dir(resource_dir);
+                app.state::<autotune::AutotuneState>()
+                    .set_resource_dir(resource_dir);
             }
             // Per-song Key/Scale memory (local only). Without a data dir the
             // feature is simply off; analysis is unaffected.

@@ -43,7 +43,12 @@ pub fn song_id(track_key: &str) -> Option<String> {
     if parts.len() != 4 {
         return None;
     }
-    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let norm = |s: &str| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
     let (title, artist, album) = (norm(&parts[1]), norm(&parts[2]), norm(&parts[3]));
     if title.is_empty() {
         return None;
@@ -75,7 +80,10 @@ impl SongCache {
             },
             Err(_) => HashMap::new(),
         };
-        Self { path: Some(path), entries }
+        Self {
+            path: Some(path),
+            entries,
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<CachedKey> {
@@ -85,7 +93,9 @@ impl SongCache {
     /// Remember `target` for `id` if it is well supported and differs from what
     /// is stored. Returns the serialized file to persist, or None if unchanged.
     pub fn put(&mut self, id: &str, target: &AutoTuneTarget, now_ms: u64) -> Option<Vec<u8>> {
-        if target.evidence_seconds < MIN_CACHE_EVIDENCE_SECONDS || !target.evidence_seconds.is_finite() {
+        if target.evidence_seconds < MIN_CACHE_EVIDENCE_SECONDS
+            || !target.evidence_seconds.is_finite()
+        {
             return None;
         }
         if self
@@ -105,8 +115,11 @@ impl SongCache {
             },
         );
         if self.entries.len() > MAX_ENTRIES {
-            let mut ages: Vec<(u64, String)> =
-                self.entries.iter().map(|(k, v)| (v.updated_ms, k.clone())).collect();
+            let mut ages: Vec<(u64, String)> = self
+                .entries
+                .iter()
+                .map(|(k, v)| (v.updated_ms, k.clone()))
+                .collect();
             ages.sort();
             for (_, old) in ages.into_iter().take(self.entries.len() - MAX_ENTRIES) {
                 self.entries.remove(&old);
@@ -116,10 +129,17 @@ impl SongCache {
         let mut entries: Vec<FileEntry> = self
             .entries
             .iter()
-            .map(|(id, value)| FileEntry { id: id.clone(), value: *value })
+            .map(|(id, value)| FileEntry {
+                id: id.clone(),
+                value: *value,
+            })
             .collect();
         entries.sort_by(|a, b| a.id.cmp(&b.id));
-        serde_json::to_vec(&CacheFile { version: FILE_VERSION, entries }).ok()
+        serde_json::to_vec(&CacheFile {
+            version: FILE_VERSION,
+            entries,
+        })
+        .ok()
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -142,7 +162,12 @@ mod tests {
     use super::*;
 
     fn target(key: u8, scale: Scale, seconds: f64) -> AutoTuneTarget {
-        AutoTuneTarget { key, scale, evidence_seconds: seconds, source: super::super::scale_match::TargetSource::Analysis }
+        AutoTuneTarget {
+            key,
+            scale,
+            evidence_seconds: seconds,
+            source: super::super::scale_match::TargetSource::Analysis,
+        }
     }
 
     fn track(source: &str, title: &str, artist: &str, album: &str) -> String {
@@ -161,13 +186,22 @@ mod tests {
 
     #[test]
     fn put_requires_evidence_and_only_reports_changes() {
-        let mut cache = SongCache { path: Some(PathBuf::from("unused.json")), ..Default::default() };
+        let mut cache = SongCache {
+            path: Some(PathBuf::from("unused.json")),
+            ..Default::default()
+        };
         assert!(cache.put("s", &target(6, Scale::Minor, 10.0), 1).is_none());
         assert!(cache.get("s").is_none());
         assert!(cache.put("s", &target(6, Scale::Minor, 40.0), 2).is_some());
-        assert!(cache.put("s", &target(6, Scale::Minor, 90.0), 3).is_none(), "same pair is not rewritten");
+        assert!(
+            cache.put("s", &target(6, Scale::Minor, 90.0), 3).is_none(),
+            "same pair is not rewritten"
+        );
         assert!(cache.put("s", &target(1, Scale::Major, 90.0), 4).is_some());
-        assert_eq!(cache.get("s").map(|c| (c.key, c.scale)), Some((1, Scale::Major)));
+        assert_eq!(
+            cache.get("s").map(|c| (c.key, c.scale)),
+            Some((1, Scale::Major))
+        );
     }
 
     #[test]
@@ -176,10 +210,15 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("song-keys-v1.json");
         let mut cache = SongCache::load(path.clone());
-        let bytes = cache.put("song", &target(9, Scale::Minor, 45.0), 7).unwrap();
+        let bytes = cache
+            .put("song", &target(9, Scale::Minor, 45.0), 7)
+            .unwrap();
         persist(&path, &bytes).unwrap();
         let loaded = SongCache::load(path.clone());
-        assert_eq!(loaded.get("song").map(|c| (c.key, c.scale, c.updated_ms)), Some((9, Scale::Minor, 7)));
+        assert_eq!(
+            loaded.get("song").map(|c| (c.key, c.scale, c.updated_ms)),
+            Some((9, Scale::Minor, 7))
+        );
 
         fs::write(&path, b"{broken").unwrap();
         let recovered = SongCache::load(path.clone());
@@ -190,7 +229,10 @@ mod tests {
 
     #[test]
     fn evicts_the_oldest_entries_beyond_the_bound() {
-        let mut cache = SongCache { path: Some(PathBuf::from("unused.json")), ..Default::default() };
+        let mut cache = SongCache {
+            path: Some(PathBuf::from("unused.json")),
+            ..Default::default()
+        };
         for i in 0..(MAX_ENTRIES as u64 + 3) {
             cache.put(&format!("s{i}"), &target(0, Scale::Major, 40.0), i);
         }

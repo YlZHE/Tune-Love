@@ -46,7 +46,9 @@ fn parse_all(args: &[String]) -> Result<(bool, usize, usize), String> {
 
 fn decode(bytes: &[u8]) -> Result<Vec<f32>, String> {
     if bytes.len() < MIN_BYTES || bytes.len() > MAX_BYTES || bytes.len() % 8 != 0 {
-        return Err(format!("stdin requires 6..{MAX_SECONDS} seconds of frame-aligned stereo 48 kHz f32le"));
+        return Err(format!(
+            "stdin requires 6..{MAX_SECONDS} seconds of frame-aligned stereo 48 kHz f32le"
+        ));
     }
     let pcm: Vec<_> = bytes
         .chunks_exact(4)
@@ -67,7 +69,11 @@ fn run() -> Result<Value, String> {
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     let pcm = decode(&bytes)?;
-    let mut detector = if first < 6 { RollingDetector::with_min_seconds(first) } else { RollingDetector::default() };
+    let mut detector = if first < 6 {
+        RollingDetector::with_min_seconds(first)
+    } else {
+        RollingDetector::default()
+    };
     let mut rows = Vec::new();
     for second in first..=end.min(pcm.len() / 96_000) {
         let end_frame = second * 48_000;
@@ -134,10 +140,22 @@ mod tests {
             (true, 6)
         );
         assert_eq!(parse_args(&["--end".into(), "30".into()]), Ok((false, 30)));
-        assert_eq!(parse_args(&["--end".into(), "900".into()]), Ok((false, 900)));
-        assert_eq!(parse_all(&["--first".into(), "3".into()]), Ok((false, 12, 3)));
+        assert_eq!(
+            parse_args(&["--end".into(), "900".into()]),
+            Ok((false, 900))
+        );
+        assert_eq!(
+            parse_all(&["--first".into(), "3".into()]),
+            Ok((false, 12, 3))
+        );
         assert!(parse_all(&["--first".into(), "2".into()]).is_err());
-        assert!(parse_all(&["--mode".into(), "batch".into(), "--first".into(), "4".into()]).is_err());
+        assert!(parse_all(&[
+            "--mode".into(),
+            "batch".into(),
+            "--first".into(),
+            "4".into()
+        ])
+        .is_err());
         for a in [
             vec!["--mode", "bad"],
             vec!["--end", "5"],

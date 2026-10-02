@@ -328,10 +328,19 @@ mod tests {
         for pc in [0, 2, 4, 5, 7, 9, 11] {
             chroma[pc] = 1.0;
         }
-        ChromaEvidence { chroma, seconds: 1.0, rms: 0.1 }
+        ChromaEvidence {
+            chroma,
+            seconds: 1.0,
+            rms: 0.1,
+        }
     }
 
-    fn obs(identity: Option<(&str, u64)>, playing: bool, capture: u64, sequence: u64) -> Observation {
+    fn obs(
+        identity: Option<(&str, u64)>,
+        playing: bool,
+        capture: u64,
+        sequence: u64,
+    ) -> Observation {
         Observation {
             identity: identity.map(|(track, target_generation)| Identity {
                 source_id: "player".into(),
@@ -352,20 +361,32 @@ mod tests {
         let other = serde_json::to_string(&["player", "Other", "Artist", "Album"]).unwrap();
         cache.lock().unwrap().put(
             &song_id(&track).unwrap(),
-            &AutoTuneTarget { key: 6, scale: Scale::Minor, evidence_seconds: 60.0, source: TargetSource::Analysis },
+            &AutoTuneTarget {
+                key: 6,
+                scale: Scale::Minor,
+                evidence_seconds: 60.0,
+                source: TargetSource::Analysis,
+            },
             1,
         );
         let mut stabilizer = Stabilizer::new();
         stabilizer.set_cache(cache);
         let seen = |key: &str| Observation {
-            identity: Some(Identity { source_id: "player".into(), track_key: key.into(), target_generation: 1 }),
+            identity: Some(Identity {
+                source_id: "player".into(),
+                track_key: key.into(),
+                target_generation: 1,
+            }),
             playing: true,
             capture_generation: 1,
             sample_end_sequence: 0,
         };
         stabilizer.observe(&seen(&track), 1);
         let target = stabilizer.snapshot().autotune_target.unwrap();
-        assert_eq!((target.key, target.scale, target.source), (6, Scale::Minor, TargetSource::Cache));
+        assert_eq!(
+            (target.key, target.scale, target.source),
+            (6, Scale::Minor, TargetSource::Cache)
+        );
         stabilizer.observe(&seen(&other), 2);
         assert!(stabilizer.snapshot().autotune_target.is_none());
     }
@@ -376,12 +397,22 @@ mod tests {
         let observed = obs(Some(("track", 1)), true, 1, 0);
         let mut now = 1;
         stabilizer.observe(&observed, now);
-        assert!(stabilizer.snapshot().autotune_target.is_none(), "undecided before evidence");
+        assert!(
+            stabilizer.snapshot().autotune_target.is_none(),
+            "undecided before evidence"
+        );
         for step in 1..=30_u64 {
             let current = obs(Some(("track", 1)), true, 1, step * 48_000);
             let token = stabilizer.begin(&current, now).expect("token");
             now += 1;
-            stabilizer.complete_with_evidence(&token, &current, Some(key(0)), Some(c_major_step()), false, now);
+            stabilizer.complete_with_evidence(
+                &token,
+                &current,
+                Some(key(0)),
+                Some(c_major_step()),
+                false,
+                now,
+            );
         }
         let target = stabilizer.snapshot().autotune_target.unwrap();
         assert_eq!((target.key, target.scale), (0, super::super::Scale::Major));
@@ -391,20 +422,58 @@ mod tests {
         let current = obs(Some(("track", 1)), true, 1, 31 * 48_000);
         let token = stabilizer.begin(&current, now).expect("token");
         let newer = obs(Some(("track", 1)), true, 2, 31 * 48_000);
-        stabilizer.complete_with_evidence(&token, &newer, Some(key(0)), Some(c_major_step()), false, now + 1);
-        assert_eq!(stabilizer.snapshot().autotune_target.unwrap().evidence_seconds, 30.0);
+        stabilizer.complete_with_evidence(
+            &token,
+            &newer,
+            Some(key(0)),
+            Some(c_major_step()),
+            false,
+            now + 1,
+        );
+        assert_eq!(
+            stabilizer
+                .snapshot()
+                .autotune_target
+                .unwrap()
+                .evidence_seconds,
+            30.0
+        );
 
         // A failed analysis carries no evidence either.
         let current = obs(Some(("track", 1)), true, 2, 32 * 48_000);
         let token = stabilizer.begin(&current, now + 2).expect("token");
-        stabilizer.complete_with_evidence(&token, &current, None, Some(c_major_step()), true, now + 3);
-        assert_eq!(stabilizer.snapshot().autotune_target.unwrap().evidence_seconds, 30.0);
+        stabilizer.complete_with_evidence(
+            &token,
+            &current,
+            None,
+            Some(c_major_step()),
+            true,
+            now + 3,
+        );
+        assert_eq!(
+            stabilizer
+                .snapshot()
+                .autotune_target
+                .unwrap()
+                .evidence_seconds,
+            30.0
+        );
 
         // Pause keeps the song's evidence; a new track forgets it.
         stabilizer.observe(&obs(Some(("track", 1)), false, 2, 32 * 48_000), now + 4);
-        assert_eq!(stabilizer.snapshot().autotune_target.unwrap().evidence_seconds, 30.0);
+        assert_eq!(
+            stabilizer
+                .snapshot()
+                .autotune_target
+                .unwrap()
+                .evidence_seconds,
+            30.0
+        );
         stabilizer.observe(&obs(Some(("next", 2)), true, 3, 0), now + 5);
-        assert!(stabilizer.snapshot().autotune_target.is_none(), "new track starts undecided");
+        assert!(
+            stabilizer.snapshot().autotune_target.is_none(),
+            "new track starts undecided"
+        );
         stabilizer.observe(&obs(None, false, 3, 0), now + 6);
         assert!(stabilizer.snapshot().autotune_target.is_none());
     }

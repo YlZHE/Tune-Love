@@ -210,7 +210,9 @@ fn detect_inner(
         });
     };
     let level = rms(
-        samples.chunks_exact(2).map(|frame| profile.mix.sample(frame)),
+        samples
+            .chunks_exact(2)
+            .map(|frame| profile.mix.sample(frame)),
         samples.len() / 2,
     );
     let mono: Vec<f64> = samples

@@ -1,8 +1,8 @@
 //! Single-flight, bounded IPC to the independent local Python bridge.
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, Read, Write},
     ffi::OsString,
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -64,13 +64,17 @@ fn validate_request(value: &Value) -> Result<(), String> {
                         .as_f64()
                         .is_some_and(|v| v.is_finite() && (0.0..=1.0).contains(&v))
                 } else if DISCRETE_ROLES.contains(&role.as_str()) {
-                    !value.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 32)
+                    !value
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty() && s.len() <= 32)
                 } else {
                     true
                 }
             })
         {
-            return Err("Only normalized continuous roles and key/scale option labels are supported".into());
+            return Err(
+                "Only normalized continuous roles and key/scale option labels are supported".into(),
+            );
         }
     }
     if op == "options"
@@ -97,47 +101,95 @@ fn failure(error: &str) -> Value {
 }
 
 fn validate_response(value: &Value, op: &str) -> Result<(), String> {
-    let object = value.as_object().ok_or("Worker response must be an object")?;
-    let ok = object.get("ok").and_then(Value::as_bool).ok_or("Worker response ok must be boolean")?;
-    if !ok && !object.get("error").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+    let object = value
+        .as_object()
+        .ok_or("Worker response must be an object")?;
+    let ok = object
+        .get("ok")
+        .and_then(Value::as_bool)
+        .ok_or("Worker response ok must be boolean")?;
+    if !ok
+        && !object
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    {
         return Err("Worker failure must include an error".into());
     }
-    let state = object.get("state").and_then(Value::as_object).ok_or("Worker state missing")?;
-    let phase = state.get("phase").and_then(Value::as_str).ok_or("Worker state phase missing")?;
+    let state = object
+        .get("state")
+        .and_then(Value::as_object)
+        .ok_or("Worker state missing")?;
+    let phase = state
+        .get("phase")
+        .and_then(Value::as_str)
+        .ok_or("Worker state phase missing")?;
     if !["disconnected", "awaiting", "ready", "error"].contains(&phase) {
         return Err("Invalid worker state phase".into());
     }
-    let connection = state.get("connectionId").ok_or("Worker connectionId missing")?;
+    let connection = state
+        .get("connectionId")
+        .ok_or("Worker connectionId missing")?;
     let target = state.get("target").ok_or("Worker target missing")?;
-    let capabilities = state.get("capabilities").and_then(Value::as_array).ok_or("Worker capabilities missing")?;
-    if capabilities.iter().any(|v| !v.as_str().is_some_and(|s| CONTINUOUS_ROLES.contains(&s) || DISCRETE_ROLES.contains(&s))) {
+    let capabilities = state
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .ok_or("Worker capabilities missing")?;
+    if capabilities.iter().any(|v| {
+        !v.as_str()
+            .is_some_and(|s| CONTINUOUS_ROLES.contains(&s) || DISCRETE_ROLES.contains(&s))
+    }) {
         return Err("Invalid worker capabilities".into());
     }
-    let count = state.get("instanceCount").and_then(Value::as_u64).ok_or("Worker instanceCount missing")?;
+    let count = state
+        .get("instanceCount")
+        .and_then(Value::as_u64)
+        .ok_or("Worker instanceCount missing")?;
     let delivery = state.get("delivery").ok_or("Worker delivery missing")?;
-    let error_ok = state.get("error").is_some_and(|v| v.is_null() || v.is_string());
+    let error_ok = state
+        .get("error")
+        .is_some_and(|v| v.is_null() || v.is_string());
     if !error_ok || state.get("audioVerified") != Some(&Value::Bool(false)) {
         return Err("Invalid worker error/audio state".into());
     }
     if phase == "awaiting" || phase == "ready" {
-            if !connection.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 128) || !target.is_object() || count == 0 && phase == "ready" {
-                return Err("Connected state is incomplete".into());
-            }
-            let target = target.as_object().unwrap();
-            if !target.get("pid").and_then(Value::as_u64).is_some_and(|n| n > 0)
-                || !target.get("processName").is_some_and(Value::is_string)
-                || !target.get("pluginName").is_some_and(Value::is_string)
-                || !target.get("profileId").is_some_and(Value::is_string) {
-                return Err("Connected target is incomplete".into());
-            }
+        if !connection
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s.len() <= 128)
+            || !target.is_object()
+            || count == 0 && phase == "ready"
+        {
+            return Err("Connected state is incomplete".into());
+        }
+        let target = target.as_object().unwrap();
+        if !target
+            .get("pid")
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0)
+            || !target.get("processName").is_some_and(Value::is_string)
+            || !target.get("pluginName").is_some_and(Value::is_string)
+            || !target.get("profileId").is_some_and(Value::is_string)
+        {
+            return Err("Connected target is incomplete".into());
+        }
     } else {
-            if !connection.is_null() || !target.is_null() || !delivery.is_null() || !capabilities.is_empty() || count != 0 {
-                return Err("Disconnected/error state contains live connection data".into());
-            }
+        if !connection.is_null()
+            || !target.is_null()
+            || !delivery.is_null()
+            || !capabilities.is_empty()
+            || count != 0
+        {
+            return Err("Disconnected/error state contains live connection data".into());
+        }
     }
     if let Some(delivery) = delivery.as_object() {
-        if !["cached","submitted"].contains(&delivery.get("stage").and_then(Value::as_str).unwrap_or(""))
-            || !delivery.get("sequence").and_then(Value::as_u64).is_some_and(|n| n > 0 && n <= 9_007_199_254_740_991) {
+        if !["cached", "submitted"]
+            .contains(&delivery.get("stage").and_then(Value::as_str).unwrap_or(""))
+            || !delivery
+                .get("sequence")
+                .and_then(Value::as_u64)
+                .is_some_and(|n| n > 0 && n <= 9_007_199_254_740_991)
+        {
             return Err("Invalid delivery state".into());
         }
     } else if !delivery.is_null() {
@@ -176,7 +228,9 @@ fn validate_response(value: &Value, op: &str) -> Result<(), String> {
             .ok_or("Profile options missing")?;
         if values.is_empty()
             || values.iter().any(|item| {
-                let Some(item) = item.as_object() else { return true };
+                let Some(item) = item.as_object() else {
+                    return true;
+                };
                 !item
                     .get("label")
                     .and_then(Value::as_str)
@@ -197,17 +251,32 @@ fn validate_response(value: &Value, op: &str) -> Result<(), String> {
         return Err("Invalid clear acknowledgement".into());
     }
     if op == "scan" {
-        let candidates = object.get("candidates").and_then(Value::as_array).ok_or("Scan candidates missing")?;
+        let candidates = object
+            .get("candidates")
+            .and_then(Value::as_array)
+            .ok_or("Scan candidates missing")?;
         if candidates.iter().any(|candidate| {
-            let Some(candidate) = candidate.as_object() else { return true };
-            !candidate.get("candidateId").is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
-                || !candidate.get("pid").and_then(Value::as_u64).is_some_and(|n| n > 0)
+            let Some(candidate) = candidate.as_object() else {
+                return true;
+            };
+            !candidate
+                .get("candidateId")
+                .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                || !candidate
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|n| n > 0)
                 || !candidate.get("processName").is_some_and(Value::is_string)
                 || !candidate.get("pluginName").is_some_and(Value::is_string)
-                || !candidate.get("profileId").is_some_and(|v| v.is_null() || v.is_string())
+                || !candidate
+                    .get("profileId")
+                    .is_some_and(|v| v.is_null() || v.is_string())
                 || !candidate.get("compatible").is_some_and(Value::is_boolean)
-                || !candidate.get("reason").is_some_and(|v| v.is_null() || v.is_string())
-        }) || !object.get("skippedCount").and_then(Value::as_u64).is_some() {
+                || !candidate
+                    .get("reason")
+                    .is_some_and(|v| v.is_null() || v.is_string())
+        }) || !object.get("skippedCount").and_then(Value::as_u64).is_some()
+        {
             return Err("Invalid scan result".into());
         }
     }
@@ -385,7 +454,11 @@ impl AutotuneState {
     }
 
     fn resource_dir(&self) -> Option<PathBuf> {
-        self.inner.resource_dir.lock().ok().and_then(|slot| slot.clone())
+        self.inner
+            .resource_dir
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     fn kill(&self) {
@@ -504,11 +577,17 @@ mod tests {
             response["error"] = json!("Request rejected; live session retained");
             assert!(validate_response(&response, op).is_ok(), "{op}");
             response["state"] = json!({"audioVerified": false});
-            assert!(validate_response(&response, op).is_err(), "{op}: incomplete state accepted");
+            assert!(
+                validate_response(&response, op).is_err(),
+                "{op}: incomplete state accepted"
+            );
         }
         let mut response = ready_response();
         response["ok"] = json!(false);
-        assert!(validate_response(&response, "status").is_err(), "missing error accepted");
+        assert!(
+            validate_response(&response, "status").is_err(),
+            "missing error accepted"
+        );
     }
 
     fn ready_response() -> Value {
@@ -523,19 +602,35 @@ mod tests {
         let valid = ready_response();
         assert!(validate_response(&valid, "status").is_ok());
         for (field, value) in [
-            ("phase", json!("unknown")), ("connectionId", json!(null)),
-            ("target", json!({"pid":1234})), ("capabilities", json!(["pitch"])),
-            ("instanceCount", json!(0)), ("instanceCount", json!(1.5)),
+            ("phase", json!("unknown")),
+            ("connectionId", json!(null)),
+            ("target", json!({"pid":1234})),
+            ("capabilities", json!(["pitch"])),
+            ("instanceCount", json!(0)),
+            ("instanceCount", json!(1.5)),
             ("delivery", json!({"stage":"audible","sequence":1})),
             ("delivery", json!({"stage":"cached","sequence":0})),
-            ("delivery", json!({"stage":"cached","sequence":9007199254740992u64})),
-            ("error", json!(false)), ("audioVerified", json!(true)),
+            (
+                "delivery",
+                json!({"stage":"cached","sequence":9007199254740992u64}),
+            ),
+            ("error", json!(false)),
+            ("audioVerified", json!(true)),
         ] {
             let mut bad = valid.clone();
             bad["state"][field] = value;
             assert!(validate_response(&bad, "status").is_err(), "{bad}");
         }
-        for field in ["phase","connectionId","target","capabilities","instanceCount","delivery","error","audioVerified"] {
+        for field in [
+            "phase",
+            "connectionId",
+            "target",
+            "capabilities",
+            "instanceCount",
+            "delivery",
+            "error",
+            "audioVerified",
+        ] {
             let mut bad = valid.clone();
             bad["state"].as_object_mut().unwrap().remove(field);
             assert!(validate_response(&bad, "status").is_err(), "{field}");
@@ -547,7 +642,8 @@ mod tests {
         }
         let candidate = json!({"candidateId":"candidate","pid":1234,"processName":"fixture.exe",
             "pluginName":"Fixture.vst3","profileId":"fixture","compatible":true,"reason":null});
-        let mut scan = json!({"ok":true,"state":state(None),"candidates":[candidate],"skippedCount":0});
+        let mut scan =
+            json!({"ok":true,"state":state(None),"candidates":[candidate],"skippedCount":0});
         assert!(validate_response(&scan, "scan").is_ok());
         scan["candidates"][0]["compatible"] = json!("yes");
         assert!(validate_response(&scan, "scan").is_err());
@@ -566,10 +662,12 @@ mod tests {
     fn validates_read_only_options_and_explicit_clear_contracts() {
         assert!(validate_request(&json!({
             "op":"options", "candidateId":"candidate", "role":"key"
-        })).is_ok());
+        }))
+        .is_ok());
         assert!(validate_request(&json!({
             "op":"clear", "connectionId":"connection"
-        })).is_ok());
+        }))
+        .is_ok());
 
         let options = json!({
             "ok":true,
@@ -591,14 +689,22 @@ mod tests {
 
     #[test]
     fn maximum_request_to_nonreading_worker_times_out_and_reaps() {
-        let mut manager = Manager { worker: Some(Worker::spawn(python("import time; time.sleep(4)")).unwrap()) };
+        let mut manager = Manager {
+            worker: Some(Worker::spawn(python("import time; time.sleep(4)")).unwrap()),
+        };
         let child = manager.worker.as_ref().unwrap().child.clone();
         let start = Instant::now();
-        let result = manager.worker.as_mut().unwrap().exchange(&"x".repeat(65535),
-            start + Duration::from_millis(150));
+        let result = manager
+            .worker
+            .as_mut()
+            .unwrap()
+            .exchange(&"x".repeat(65535), start + Duration::from_millis(150));
         assert!(result.is_err());
         manager.worker.take();
-        assert!(start.elapsed() < Duration::from_secs(5), "blocked stdin prevented deadline cleanup");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "blocked stdin prevented deadline cleanup"
+        );
         assert!(child.lock().unwrap().try_wait().unwrap().is_some());
     }
 
@@ -609,7 +715,10 @@ mod tests {
         let child = worker.child.clone();
         *shared.inner.child.lock().unwrap() = Some(child.clone());
         shared.inner.manager.lock().unwrap().worker = Some(worker);
-        let result = shared.execute(json!({"op":"status"}), Instant::now()+Duration::from_secs(3));
+        let result = shared.execute(
+            json!({"op":"status"}),
+            Instant::now() + Duration::from_secs(3),
+        );
         assert_eq!(result["ok"], false);
         assert_eq!(result["state"]["phase"], "error");
         assert!(shared.inner.manager.lock().unwrap().worker.is_none());
@@ -641,15 +750,13 @@ mod tests {
         )
         .is_ok());
         let mut capable = ready_response();
-        capable["state"]["capabilities"] = json!(["retune","key","scale"]);
+        capable["state"]["capabilities"] = json!(["retune", "key", "scale"]);
         assert!(validate_response(&capable, "status").is_ok());
     }
 
     fn temp_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "tune-love-test-{}-{name}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("tune-love-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
@@ -748,10 +855,7 @@ mod tests {
     }
 
     fn python(script: &str) -> Command {
-        let mut command = Command::new(resolve_python(
-            std::env::var_os("TUNE_LOVE_PYTHON"),
-            None,
-        ));
+        let mut command = Command::new(resolve_python(std::env::var_os("TUNE_LOVE_PYTHON"), None));
         command.args(["-u", "-c", script]);
         command
     }

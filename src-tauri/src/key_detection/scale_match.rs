@@ -82,7 +82,9 @@ fn mask(index: usize) -> [bool; 12] {
         Scale::Minor => &MINOR,
     };
     let mut allowed = [false; 12];
-    intervals.iter().for_each(|i| allowed[(key + i) as usize % 12] = true);
+    intervals
+        .iter()
+        .for_each(|i| allowed[(key + i) as usize % 12] = true);
     allowed
 }
 
@@ -183,7 +185,11 @@ impl ScaleMatcher {
         match self.current {
             // First evidence commits immediately: there is no neutral fallback.
             None => best,
-            Some(current) if best != current && costs[best] < costs[current] - self.params.margin => best,
+            Some(current)
+                if best != current && costs[best] < costs[current] - self.params.margin =>
+            {
+                best
+            }
             Some(current) => current,
         }
     }
@@ -196,7 +202,11 @@ impl ScaleMatcher {
                 key,
                 scale,
                 evidence_seconds: self.seconds,
-                source: if self.seeded { TargetSource::Cache } else { TargetSource::Analysis },
+                source: if self.seeded {
+                    TargetSource::Cache
+                } else {
+                    TargetSource::Analysis
+                },
             }
         })
     }
@@ -219,7 +229,11 @@ mod tests {
         for pc in pitch_classes {
             chroma[*pc] = 1.0;
         }
-        ChromaEvidence { chroma, seconds, rms: 0.1 }
+        ChromaEvidence {
+            chroma,
+            seconds,
+            rms: 0.1,
+        }
     }
 
     fn feed(matcher: &mut ScaleMatcher, pitch_classes: &[usize], steps: usize) {
@@ -279,8 +293,16 @@ mod tests {
         let mut quiet = evidence(&[0, 4, 7], 1.0);
         quiet.rms = 1.0e-4;
         matcher.add(&quiet);
-        matcher.add(&ChromaEvidence { chroma: [0.0; 12], seconds: 1.0, rms: 0.1 });
-        matcher.add(&ChromaEvidence { chroma: [f64::NAN; 12], seconds: 1.0, rms: 0.1 });
+        matcher.add(&ChromaEvidence {
+            chroma: [0.0; 12],
+            seconds: 1.0,
+            rms: 0.1,
+        });
+        matcher.add(&ChromaEvidence {
+            chroma: [f64::NAN; 12],
+            seconds: 1.0,
+            rms: 0.1,
+        });
         matcher.add(&evidence(&[0, 4, 7], 0.0));
         assert!(matcher.target().is_none());
     }
@@ -306,7 +328,12 @@ mod tests {
 
     #[test]
     fn transpose_shifts_key_only() {
-        let c_major = AutoTuneTarget { key: 0, scale: Scale::Major, evidence_seconds: 1.0, source: TargetSource::Analysis };
+        let c_major = AutoTuneTarget {
+            key: 0,
+            scale: Scale::Major,
+            evidence_seconds: 1.0,
+            source: TargetSource::Analysis,
+        };
         assert_eq!(transpose(c_major, 2).key, 2);
         assert_eq!(transpose(c_major, -1).key, 11);
         assert_eq!(transpose(c_major, 2).scale, Scale::Major);
@@ -333,7 +360,10 @@ mod tests {
         let mut matcher = ScaleMatcher::new(FROZEN);
         matcher.seed(6, Scale::Minor);
         let seeded = matcher.target().unwrap();
-        assert_eq!((seeded.key, seeded.scale, seeded.source), (6, Scale::Minor, TargetSource::Cache));
+        assert_eq!(
+            (seeded.key, seeded.scale, seeded.source),
+            (6, Scale::Minor, TargetSource::Cache)
+        );
         feed(&mut matcher, &[0, 2, 4, 5, 7, 9, 11], 19); // contrary, but under the hold
         assert_eq!(pair(&matcher), (6, Scale::Minor));
         assert_eq!(matcher.target().unwrap().source, TargetSource::Cache);

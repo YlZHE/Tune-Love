@@ -31,8 +31,8 @@ pub struct RestoreOutcome {
     pub restored: usize,
     pub left_changed: usize,
     pub gone: usize,
-    /// Entries that could not be evaluated or restored because of an error (session or volume
-    /// lookup, `set_volume`). They stay in the restore file for a later retry. An unreadable
+    /// Entries that could not be evaluated or restored because of an error (process, session or
+    /// volume lookup, `set_volume`). They stay in the restore file for a later retry. An unreadable
     /// restore file (I/O error other than corruption) counts as 1 here and is left untouched.
     pub failed: usize,
     pub corrupt: bool,
@@ -80,9 +80,9 @@ pub fn read(path: &Path) -> io::Result<Option<RestoreRecord>> {
 /// Restores every entry whose process (pid + creation time) and session still exist and whose
 /// volume is still the held value; anything else is left as the user has it.
 ///
-/// Entries that hit an error (session/volume lookup, `set_volume`) are counted in `failed` and
-/// kept: the file is rewritten atomically with only those entries, and deleted only when none
-/// remain. A file that does not parse (or has an unknown version) is renamed to
+/// Entries that hit an error (process/session/volume lookup, `set_volume`) are counted in
+/// `failed` and kept: the file is rewritten atomically with only those entries, and deleted only
+/// when none remain. A file that does not parse (or has an unknown version) is renamed to
 /// `<path>.corrupt` (left in place if the rename fails) and no volume is touched. Any other
 /// I/O error reading the file leaves it untouched and is reported as `failed = 1`.
 pub fn restore(path: &Path, sessions: &dyn SessionVolumes) -> RestoreOutcome {
@@ -106,9 +106,18 @@ pub fn restore(path: &Path, sessions: &dyn SessionVolumes) -> RestoreOutcome {
 
     let mut retry: Vec<RestoreEntry> = Vec::new();
     for e in &record.entries {
-        if sessions.process_created(e.pid) != Some(e.created_at) {
-            out.gone += 1;
-            continue;
+        match sessions.process_created(e.pid) {
+            Ok(Some(created)) if created == e.created_at => {}
+            Ok(_) => {
+                // Process gone, or the pid now belongs to a different process.
+                out.gone += 1;
+                continue;
+            }
+            Err(_) => {
+                out.failed += 1;
+                retry.push(e.clone());
+                continue;
+            }
         }
         match sessions.session(&e.instance_id) {
             Ok(Some(_)) => {}
@@ -370,6 +379,26 @@ mod tests {
 
         f.clear_failures();
         assert_eq!(restore(&dir.file(), &f).restored, 1);
+        assert!(!dir.file().exists());
+    }
+
+    #[test]
+    fn process_query_error_keeps_the_entry_for_retry() {
+        let dir = TempDir::new("procerr");
+        let f = two_held(&dir);
+        f.fail_process_created(10);
+
+        let out = restore(&dir.file(), &f);
+        assert_eq!((out.restored, out.failed, out.gone), (1, 1, 0));
+        assert_eq!(f.writes(), vec![("b".to_string(), 0.6)]);
+        assert_eq!(f.volume("a").unwrap(), 1.0e-4);
+        let kept = read(&dir.file()).unwrap().expect("file must still exist");
+        assert_eq!(kept.entries, vec![entry(10, 111, "a", 0.8)]);
+
+        f.clear_failures();
+        let out = restore(&dir.file(), &f);
+        assert_eq!((out.restored, out.failed), (1, 0));
+        assert_eq!(f.volume("a").unwrap(), 0.8);
         assert!(!dir.file().exists());
     }
 

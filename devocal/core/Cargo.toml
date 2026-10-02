@@ -7,5 +7,18 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[target.'cfg(windows)'.dependencies]
+# Win32_System_Com_StructuredStorage and Win32_System_Variant are required by
+# IMMDevice::Activate (its PROPVARIANT parameter is gated behind them).
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
+
 [features]
 fake = []

@@ -1,6 +1,6 @@
 //! Abstraction over the Windows per-process audio-session volume.
-//! The real implementation lives in the engine crate; `FakeSessions` is the
-//! test double (available with the `fake` feature).
+//! The real implementation is `sessions_win::WinSessions` (Windows only); `FakeSessions` is
+//! the test double (available with the `fake` feature).
 
 /// The volume the engine holds a player session at while it plays the audio itself (-80 dB).
 pub const HELD_VOLUME: f32 = 1.0e-4;
@@ -24,8 +24,12 @@ pub trait SessionVolumes {
     fn volume(&self, instance_id: &str) -> Result<f32, String>;
     fn set_volume(&self, instance_id: &str, volume: f32) -> Result<(), String>;
     fn muted(&self, instance_id: &str) -> Result<bool, String>;
-    /// Process creation time as a FILETIME; `None` when the process does not exist.
-    fn process_created(&self, pid: u32) -> Option<u64>;
+    /// Process creation time as a FILETIME.
+    ///
+    /// `Ok(Some(t))`: the process exists and was created at `t`. `Ok(None)`: the process
+    /// definitively does not exist. `Err`: the query failed for another reason (e.g. access
+    /// denied); callers must not treat that as "gone".
+    fn process_created(&self, pid: u32) -> Result<Option<u64>, String>;
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -54,6 +58,7 @@ mod fake {
         fail_session: HashSet<String>,
         fail_volume: HashSet<String>,
         fail_set_volume: HashSet<String>,
+        fail_process_created: HashSet<u32>,
     }
 
     /// Hook called as `(instance_id, volume)` at the start of every `set_volume`.
@@ -170,12 +175,18 @@ mod fake {
                 .insert(instance_id.into());
         }
 
+        /// Makes `process_created(pid)` return an error until `clear_failures`.
+        pub fn fail_process_created(&self, pid: u32) {
+            self.state.borrow_mut().fail_process_created.insert(pid);
+        }
+
         /// Clears all injected failures.
         pub fn clear_failures(&self) {
             let mut st = self.state.borrow_mut();
             st.fail_session.clear();
             st.fail_volume.clear();
             st.fail_set_volume.clear();
+            st.fail_process_created.clear();
         }
     }
 
@@ -261,8 +272,12 @@ mod fake {
                 .ok_or_else(|| format!("no such session: {instance_id}"))
         }
 
-        fn process_created(&self, pid: u32) -> Option<u64> {
-            self.state.borrow().created.get(&pid).copied()
+        fn process_created(&self, pid: u32) -> Result<Option<u64>, String> {
+            let st = self.state.borrow();
+            if st.fail_process_created.contains(&pid) {
+                return Err(format!("injected process_created failure: {pid}"));
+            }
+            Ok(st.created.get(&pid).copied())
         }
     }
 }
@@ -340,9 +355,13 @@ mod tests {
     fn fake_process_created_and_tree() {
         let f = FakeSessions::new();
         f.set_process_created(10, Some(111));
-        assert_eq!(f.process_created(10), Some(111));
+        assert_eq!(f.process_created(10), Ok(Some(111)));
+        f.fail_process_created(10);
+        assert!(f.process_created(10).is_err());
+        f.clear_failures();
+        assert_eq!(f.process_created(10), Ok(Some(111)));
         f.set_process_created(10, None);
-        assert_eq!(f.process_created(10), None);
+        assert_eq!(f.process_created(10), Ok(None));
 
         f.add_session(info("root", 10), 1.0, false);
         f.add_session(info("child", 11), 1.0, false);

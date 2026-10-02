@@ -1,7 +1,6 @@
 //! Controlled low-volume playback in two owned sibling processes; never controls a user player.
 #[cfg(windows)]
 mod native {
-    use tune_love::audio::capture::capture_process;
     use std::{
         io::{BufRead, BufReader, Write},
         os::windows::process::CommandExt,
@@ -9,6 +8,7 @@ mod native {
         sync::mpsc::{self, Receiver},
         time::{Duration, Instant},
     };
+    use tune_love::audio::capture::capture_process;
     use wasapi::*;
 
     type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

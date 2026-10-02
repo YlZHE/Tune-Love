@@ -1,10 +1,10 @@
 // Offline-only stdin probe. No file enumeration, capture, GUI or plugin APIs.
+use serde_json::{json, Value};
+use std::{io::Read, time::Instant};
 use tune_love::{
     audio::PcmWindow,
     key_detection::{detect_with_diagnostics, RollingDetector},
 };
-use serde_json::{json, Value};
-use std::{io::Read, time::Instant};
 
 const MIN_BYTES: usize = 6 * 48_000 * 2 * 4;
 // Whole songs are allowed so the rolling detector's evidence stream can be

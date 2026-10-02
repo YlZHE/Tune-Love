@@ -80,6 +80,13 @@ async function prepare(context: BrowserContext, enabled = false) {
   });
 }
 
+// GitHub-hosted runners have no GPU, so a WebGPU adapter is unavailable there.
+// These tests verify real GPU rendering; skip them only on CI without an adapter.
+async function requireGpu(page: Page) {
+  const available = await page.evaluate(async () => !!(await (navigator as any).gpu?.requestAdapter()));
+  test.skip(!available && !!process.env.CI, "No WebGPU adapter on this CI runner");
+}
+
 async function settings(page: Page) {
   const popup = page.waitForEvent("popup");
   await page.getByRole("button", { name: "设置", exact: true }).click();
@@ -115,7 +122,7 @@ test("background switch persists across windows and disabling removes its canvas
 });
 
 test("Aero Shards renders real pixels and shares one serialized audio loop with Strands", async ({ page, context }) => {
-  await prepare(context, true); await page.goto("/");
+  await prepare(context, true); await page.goto("/"); await requireGpu(page);
   const background = page.locator(".audio-background .aero-shards");
   await expect(background).toHaveAttribute("data-ready", "true", { timeout: 20000 });
   await expect(page.locator(".audio-strands canvas")).toBeVisible();
@@ -137,7 +144,7 @@ test("Aero Shards renders real pixels and shares one serialized audio loop with 
 });
 
 test("silence freezes the background and fresh audio wakes it again", async ({ page, context }) => {
-  await prepare(context, true); await page.goto("/");
+  await prepare(context, true); await page.goto("/"); await requireGpu(page);
   await expect(page.locator(".aero-shards")).toHaveAttribute("data-ready", "true", { timeout: 20000 });
   await page.evaluate(() => { (window as any).bands = [0, 0, 0]; });
   await page.waitForTimeout(1500);
@@ -151,7 +158,7 @@ test("silence freezes the background and fresh audio wakes it again", async ({ p
 });
 
 test("each band reaches its own real GPU parameters and disabling destroys owned devices", async ({ page, context }) => {
-  await prepare(context, true); await page.goto("/");
+  await prepare(context, true); await page.goto("/"); await requireGpu(page);
   await expect(page.locator(".aero-shards")).toHaveAttribute("data-ready", "true", { timeout: 20000 });
   await page.evaluate(() => { (window as any).bands = [1, 0, 0]; });
   await expect.poll(async () => Number((await frame(page)).shape[1].toFixed(3))).toBe(1.05);
@@ -185,7 +192,7 @@ test("reduced motion and unavailable WebGPU preserve a usable static player", as
 });
 
 test("pause, hidden windows, stale samples and another source cannot keep the background moving", async ({ page, context }) => {
-  await prepare(context, true); await page.goto("/");
+  await prepare(context, true); await page.goto("/"); await requireGpu(page);
   await expect(page.locator(".aero-shards")).toHaveAttribute("data-ready", "true", { timeout: 20000 });
   for (const override of [{ updatedAtMs: 1 }, { sourceId: "other.exe" }, { trackKey: "old-song" }, { status: "unavailable" }]) {
     await page.evaluate(value => { (window as any).audioOverride = value; }, override);
@@ -218,7 +225,7 @@ test("pause, hidden windows, stale samples and another source cannot keep the ba
 });
 
 test("all three live palette colors interpolate on the GPU even when the background is asleep", async ({ page, context }) => {
-  await prepare(context, true); await page.goto("/");
+  await prepare(context, true); await page.goto("/"); await requireGpu(page);
   await expect(page.locator(".aero-shards")).toHaveAttribute("data-ready", "true", { timeout: 20000 });
   await page.evaluate(() => { (window as any).bands = [0, 0, 0]; });
   await page.waitForTimeout(550);
@@ -255,7 +262,7 @@ test("a failed preference write does not falsely enable the background", async (
 });
 
 test("showing a window without a fresh matching source cannot replay its old bass pulse", async ({ page, context }) => {
-  await prepare(context, true); await page.goto("/");
+  await prepare(context, true); await page.goto("/"); await requireGpu(page);
   await expect(page.locator(".aero-shards")).toHaveAttribute("data-ready", "true", { timeout: 20000 });
   await expect.poll(async () => (await frame(page)).shape[1]).toBeGreaterThan(1.02);
   await page.evaluate(() => {
@@ -293,7 +300,7 @@ test("sustained bass does not prevent quality recovery after temporary GPU press
       return originalDraw.call(this, vertices, instances, ...rest);
     };
   });
-  await page.goto("/");
+  await page.goto("/"); await requireGpu(page);
   await expect(page.locator(".aero-shards")).toHaveAttribute("data-ready", "true", { timeout: 20000 });
   await expect.poll(async () => (await frame(page)).shape[1]).toBeGreaterThan(1.02);
   const instances = () => page.evaluate(() => (window as any).shardInstances as number);
@@ -307,7 +314,7 @@ test("sustained bass does not prevent quality recovery after temporary GPU press
 });
 
 test("bass changes depth without zooming or spreading and audio only gently changes transport speed", async ({ page, context }) => {
-  await prepare(context, true); await page.goto("/");
+  await prepare(context, true); await page.goto("/"); await requireGpu(page);
   await expect(page.locator(".aero-shards")).toHaveAttribute("data-ready", "true", { timeout: 20000 });
   const velocities: number[] = [];
   for (const bands of [[1, 0, 0], [0, 1, 0]]) {

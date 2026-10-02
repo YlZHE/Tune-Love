@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "profile_id": "autotune-pro-38c42d0b-x64",
+  "display_name": "Auto-Tune Pro, locally identified SHA-256 38c42d0b",
+  "architecture": "x64",
+  "plugin_file": "C:\\Program Files\\Common Files\\VST3\\Antares\\Auto-Tune Pro.vst3",
+  "sha256": "38c42d0b4b260fa72e7ed4af58cb9e271cc48c9fc72372463254f040bbbf76f3",
+  "cid": "415453563854413175746f2d54756e65",
+  "free_component": true,
+  "vst3_context_not_null": false,
+  "valid_params": [],
+  "roles": {
+    "retune": {"id": 4, "title": "Retune Speed", "domain": "normalized"},
+    "flex": {"id": 90, "title": "Flex-Tune", "domain": "normalized"},
+    "vibrato": {"id": 62, "title": "Natural Vibrato", "domain": "normalized"},
+    "humanize": {"id": 61, "title": "Humanize", "domain": "normalized"},
+    "key": {
+      "id": 2,
+      "title": "Key",
+      "domain": "normalized",
+      "options": {
+        "C": 0.0,
+        "C#": 0.09090909090909091,
+        "D": 0.18181818181818182,
+        "D#": 0.2727272727272727,
+        "E": 0.36363636363636365,
+        "F": 0.45454545454545453,
+        "F#": 0.5454545454545454,
+        "G": 0.6363636363636364,
+        "G#": 0.7272727272727273,
+        "A": 0.8181818181818182,
+        "A#": 0.9090909090909091,
+        "B": 1.0
+      }
+    },
+    "scale": {
+      "id": 162,
+      "title": "Modern Scale",
+      "domain": "normalized",
+      "options": {
+        "Chromatic": 0.0,
+        "Major": 0.07142857142857142,
+        "Minor": 0.14285714285714285,
+        "Harmonic Minor": 0.21428571428571427,
+        "Jazz Melodic Minor": 0.2857142857142857,
+        "Dorian": 0.35714285714285715,
+        "Phrygian": 0.42857142857142855,
+        "Lydian": 0.5,
+        "Mixolydian": 0.5714285714285714,
+        "Locrian": 0.6428571428571429,
+        "Major Pentatonic": 0.7142857142857143,
+        "Minor Pentatonic": 0.7857142857142857,
+        "Blues": 0.8571428571428571,
+        "Whole Tone": 0.9285714285714286,
+        "Diminished": 1.0
+      }
+    }
+  },
+  "compatibility": {
+    "status": "identified_not_runtime_validated",
+    "mapping_verified": true,
+    "reference_agent_in_real_host_verified": false,
+    "reference_audio_output_verified": false,
+    "gui_project_sync_verified": false
+  },
+  "evidence": {
+    "parameter_mapping": "Historical local work/six-realhost/evidence/early-01/captured-01.json, matching plugin SHA-256.",
+    "discrete_options": "Historical local work/six-realhost/evidence/early-01/options.json, plugin-declared step labels and normalized values.",
+    "component_cid": "2026-09-28 isolated reference/build/x64/describe.exe factory enumeration of the exact installed file; raw CID 415453563854413175746f2d54756e65, class name Auto-Tune Pro.",
+    "empty_valid_params": "This exact component does not expose IEditController by direct queryInterface. Native agent must require a unique matching prepared candidate when metadata is empty."
+  },
+  "limitations": [
+    "Only this exact SHA-256 and x64 build is identified. No other commercial product or version is implied.",
+    "Continuous values use normalized 0..1; GUI display units and nonlinear conversion are not inferred.",
+    "Key/Scale linked messages, automatic cache-clear timing, GUI/project synchronization and audio equivalence remain unverified.",
+    "Explicit clear empties the helper cache and does not restore plugin DSP state."
+  ]
+}

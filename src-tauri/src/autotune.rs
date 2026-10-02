@@ -386,7 +386,7 @@ impl AutotuneState {
                 let reference = std::env::var_os("AUTOTUNE_HELPER_REFERENCE")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
-                        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../reference")
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../reference")
                     });
                 let script = reference
                     .join("app_bridge.py")

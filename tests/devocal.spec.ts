@@ -1,7 +1,7 @@
 import { test, expect, type Page } from "@playwright/test";
 
 const OFF = { phase: "off", held: false, latencyMs: null, loadRatio: null, fallbackReason: null,
-  sessionOverridden: false, inputSilent: false, error: null };
+  sessionOverridden: false, inputSilent: false, waitingForPlayer: false, error: null };
 
 // Mocks the native boundary for the main window. `window.devocal` is the status
 // the fake engine reports; commands move it the way the real backend would.
@@ -25,7 +25,7 @@ async function prepare(page: Page, view = "/", initial: Record<string, unknown> 
           if (state.commandErrorMessage) throw new Error(state.commandErrorMessage);
           if (state.commandFailure) throw state.commandFailure;
           const action = args.request.action;
-          if (action === "enable") state.devocal = { ...state.devocal, phase: "devocal", held: true, latencyMs: 45.4 };
+          if (action === "enable") state.devocal = { ...state.devocal, phase: "devocal", held: true, latencyMs: 45.4, fallbackReason: null, error: null };
           if (action === "disable") state.devocal = { ...state.devocal, phase: "passthrough", held: true, latencyMs: null };
           if (action === "release") state.devocal = { ...OFF };
           return structuredClone(state.devocal);
@@ -52,7 +52,7 @@ test("the toggle sends enable then disable and follows the reported status", asy
   await button.click();
   const on = page.getByRole("button", { name: "关闭去人声", exact: true });
   await expect(on).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByText("去人声中 · 延迟 45 ms", { exact: true })).toBeVisible();
+  await expect(page.getByText("去人声中 · 延迟约 45 ms", { exact: true })).toBeVisible();
   expect(await requests(page)).toEqual([{ action: "enable" }]);
   await on.click();
   await expect(page.getByRole("button", { name: "开启去人声", exact: true })).toHaveAttribute("aria-pressed", "false");
@@ -61,11 +61,15 @@ test("the toggle sends enable then disable and follows the reported status", asy
   await expect(page.getByText("原声直通", { exact: true })).toBeVisible();
 });
 
-test("the status text is a polite live region", async ({ page }) => {
-  await prepare(page, "/", { phase: "devocal", held: true, latencyMs: 30 }); await reveal(page);
-  const label = page.getByText("去人声中 · 延迟 30 ms", { exact: true });
+test("the status text is a polite live region but the latency estimate is not announced", async ({ page }) => {
+  await prepare(page, "/", { phase: "devocal", held: true, latencyMs: 31.2 }); await reveal(page);
+  const label = page.locator(".devocal-status");
+  await expect(label).toHaveText("去人声中 · 延迟约 30 ms");
   await expect(label).toBeVisible();
-  await expect(label).toHaveAttribute("aria-live", "polite");
+  const live = label.locator("[aria-live]");
+  await expect(live).toHaveText("去人声中");
+  await expect(live).toHaveAttribute("aria-live", "polite");
+  await expect(page.locator("[aria-live]", { hasText: "延迟" })).toHaveCount(0);
   // The compact 468 px window must keep the label clear of the transport buttons.
   const text = (await label.boundingBox())!;
   const transport = (await page.locator(".transport-controls").boundingBox())!;
@@ -80,7 +84,7 @@ test("the button shows pressed while enabling and ignores clicks until the reque
   const pending = page.getByRole("button", { name: "关闭去人声", exact: true });
   await expect(pending).toHaveAttribute("aria-pressed", "true");
   await pending.click({ clickCount: 3, delay: 20 });
-  await expect(page.getByText("去人声中 · 延迟 45 ms", { exact: true })).toBeVisible();
+  await expect(page.getByText("去人声中 · 延迟约 45 ms", { exact: true })).toBeVisible();
   expect(await requests(page)).toEqual([{ action: "enable" }]);
 });
 
@@ -121,7 +125,7 @@ test("a warning stays visible without hover but a neutral label waits for hover"
   await page.screenshot({ path: "artifacts/devocal-warning-no-hover.png" });
   // Switching to a neutral state removes the warning; its text is hidden until hover.
   await page.evaluate(() => { (window as any).devocal = { ...(window as any).devocal, sessionOverridden: false }; });
-  const neutral = page.getByText("去人声中 · 延迟 45 ms", { exact: true });
+  const neutral = page.getByText("去人声中 · 延迟约 45 ms", { exact: true });
   await expect(page.locator(".devocal-warning")).toHaveText("");
   // The neutral label lives in the controls row, which is transparent until hover.
   await expect(neutral).toBeAttached();
@@ -168,4 +172,39 @@ test("settings: release player is disabled until the player is held, then sends 
   await release.click();
   await expect(release).toBeDisabled();
   expect(await requests(page)).toEqual([{ action: "release" }]);
+});
+
+test("clicking the toggle after a fallback retries devocal", async ({ page }) => {
+  await prepare(page, "/", { phase: "fallback", held: true, fallbackReason: "overload" });
+  await expect(page.getByText("性能不足，已退回原声", { exact: true })).toBeVisible();
+  await reveal(page);
+  const button = page.getByRole("button", { name: "开启去人声", exact: true });
+  await expect(button).toHaveAttribute("aria-pressed", "false");
+  await button.click();
+  await expect(page.getByRole("button", { name: "关闭去人声", exact: true })).toHaveAttribute("aria-pressed", "true");
+  expect(await requests(page)).toEqual([{ action: "enable" }]);
+  await expect(page.getByText("性能不足，已退回原声")).toHaveCount(0);
+  await expect(page.getByText("去人声中 · 延迟约 45 ms", { exact: true })).toBeVisible();
+});
+
+test("a model that failed to load is a visible warning and the toggle retries it", async ({ page }) => {
+  await prepare(page, "/", { phase: "passthrough", held: true, error: "model_load_failed: bad file" });
+  const warning = page.getByText("去人声模型加载失败，已保持原声", { exact: true });
+  await expect(warning).toBeVisible();
+  await expect(page.locator(".footer-controls")).toHaveCSS("opacity", "0");
+  await reveal(page);
+  await page.getByRole("button", { name: "开启去人声", exact: true }).click();
+  expect(await requests(page)).toEqual([{ action: "enable" }]);
+  await expect(warning).toHaveCount(0);
+});
+
+test("waiting for a player and a player that cannot be taken over have their own labels", async ({ page }) => {
+  await prepare(page, "/", { phase: "attaching", waitingForPlayer: true });
+  await reveal(page);
+  await expect(page.getByText("等待播放器", { exact: true })).toBeVisible();
+  await expect(page.getByText("正在接管播放器…")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "关闭去人声", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await page.evaluate(() => { (window as any).devocal = { ...(window as any).devocal, phase: "failed", waitingForPlayer: false, error: "attach_failed" }; });
+  await expect(page.getByText("无法接管这个播放器", { exact: true })).toBeVisible();
+  await expect(page.getByText("去人声引擎多次异常，已保持原声")).toHaveCount(0);
 });

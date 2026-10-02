@@ -505,7 +505,7 @@ pub(crate) mod tests {
             serde_json::json!({
                 "phase": "off", "held": false, "latencyMs": null, "loadRatio": null,
                 "fallbackReason": null, "sessionOverridden": false, "inputSilent": false,
-                "error": null
+                "waitingForPlayer": false, "error": null
             })
         );
     }

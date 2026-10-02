@@ -10,9 +10,13 @@
 //!   last State is `Idle` (a fresh engine starts `Idle`), so a player change sends `release`
 //!   and waits for `Idle` first.
 //! - `set_mode(true)` is sent only for a user `enable`, and to a freshly started engine
-//!   (restart) while the user still wants devocal; never on state sync.
-//! - `set_model` is sent to a new engine, when the model path changes, and once per user
-//!   action after `Error{ModelLoadFailed}` (followed by `set_mode(true)` if still wanted).
+//!   (restart) while the user still wants devocal; never on state sync. The engine ignores a
+//!   repeated "on" (obligation 1), so a user `enable` while the engine reports `Fallback` is
+//!   sent as `set_mode(false)` then `set_mode(true)`: that is the user's retry.
+//! - `set_model` is sent to a new engine, when the model path changes, once per user
+//!   action after `Error{ModelLoadFailed}` (followed by `set_mode(true)` if still wanted), and
+//!   on the next user `enable` after the engine gave up on the model (a second
+//!   `ModelLoadFailed`, or `NoModel`).
 //! - `Error{Protocol}` means a version mismatch only during the hello exchange (from the
 //!   spawn until the first State or Metrics); the engine is then shut down (killed after
 //!   2 s) and not restarted.
@@ -92,6 +96,10 @@ pub struct DevocalStatus {
     pub fallback_reason: Option<&'static str>,
     pub session_overridden: bool,
     pub input_silent: bool,
+    /// `attaching`/`restarting` only because there is no player to hold yet (nothing
+    /// playing). A separate flag, not a phase, so a status reader that does not know it still
+    /// sees `attaching`.
+    pub waiting_for_player: bool,
     pub error: Option<String>,
 }
 
@@ -105,6 +113,7 @@ impl DevocalStatus {
             fallback_reason: None,
             session_overridden: false,
             input_silent: false,
+            waiting_for_player: false,
             error: None,
         }
     }
@@ -182,6 +191,9 @@ struct Linked<L> {
     /// When the app sent that `release` (deadline [`RELEASE_DEADLINE_MS`]).
     release_sent_at: Option<u64>,
     sent_model: Option<PathBuf>,
+    /// The engine has no usable model: it gave up loading `sent_model` (a `ModelLoadFailed`
+    /// with no retry left) or answered `NoModel`. The next user `enable` sends `set_model`.
+    model_failed: bool,
     /// Last Metrics received while Active (cleared when leaving Active).
     metrics: Option<Metrics>,
     /// Baseline of the engine's `session_overridden` counter.
@@ -202,6 +214,7 @@ impl<L> Linked<L> {
             release_sent: false,
             release_sent_at: None,
             sent_model: None,
+            model_failed: false,
             metrics: None,
             overridden_seen: None,
             mismatch_at: None,
@@ -210,6 +223,15 @@ impl<L> Linked<L> {
 
     fn phase(&self) -> Phase {
         self.state.as_ref().map_or(Phase::Idle, |s| s.phase)
+    }
+
+    /// The last State says the engine fell back to the original sound while devocal was on.
+    fn in_fallback(&self) -> bool {
+        !self.release_sent
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|s| s.phase == Phase::Active && s.mode == Some(Mode::Fallback))
     }
 
     /// Sessions may be held, or are about to be: restore must not run.
@@ -259,6 +281,8 @@ pub struct Supervisor<L: EngineLink> {
     overridden_at: Option<u64>,
     now_ms: u64,
     media_playing: bool,
+    /// The last tick had a player to hold.
+    has_target: bool,
 }
 
 impl<L: EngineLink> Supervisor<L> {
@@ -297,6 +321,7 @@ impl<L: EngineLink> Supervisor<L> {
             overridden_at: None,
             now_ms: 0,
             media_playing: false,
+            has_target: false,
         }
     }
 
@@ -337,11 +362,23 @@ impl<L: EngineLink> Supervisor<L> {
             .engine
             .as_ref()
             .filter(|e| e.mismatch_at.is_none())
-            .map(|e| e.sent_model != self.model);
+            .map(|e| {
+                (
+                    e.sent_model != self.model || e.model_failed,
+                    e.in_fallback(),
+                )
+            });
         match live {
-            Some(model_changed) => {
+            Some((reload, fallback)) => {
                 self.user_on_pending = false;
-                if model_changed && !self.send_set_model() {
+                if reload && !self.send_set_model() {
+                    return;
+                }
+                // The engine still has devocal "on" after a fallback and ignores a repeated
+                // "on" (obligation 1): off-then-on is the user's retry. Only in Fallback: in
+                // Devocal the "off" would start a fade-out, and in Passthrough the toggle is
+                // already off so a plain "on" is forwarded.
+                if fallback && !self.send(&Command::SetMode { devocal: false }) {
                     return;
                 }
                 self.send(&Command::SetMode { devocal: true });
@@ -386,6 +423,7 @@ impl<L: EngineLink> Supervisor<L> {
         }
         self.now_ms = now_ms;
         self.media_playing = media_playing;
+        self.has_target = target.is_some();
         self.pump(now_ms);
         self.check_exit(now_ms);
         self.ensure_engine(target.as_ref());
@@ -437,6 +475,14 @@ impl<L: EngineLink> Supervisor<L> {
                 FallbackReason::Overload => "overload",
                 FallbackReason::ModelError => "model_error",
             });
+        // Nothing to attach to (no engine is spawned without a target, and an idle engine
+        // is sent no `attach`): say so instead of "taking over the player".
+        let attach_pending =
+            e.is_some_and(|e| e.attach_in_flight || e.phase() != Phase::Idle || e.release_sent);
+        let waiting_for_player = matches!(phase, "attaching" | "restarting")
+            && self.want_hold
+            && !self.has_target
+            && !attach_pending;
         DevocalStatus {
             phase,
             held,
@@ -448,6 +494,7 @@ impl<L: EngineLink> Supervisor<L> {
                 .is_some_and(|t| self.now_ms.saturating_sub(t) < OVERRIDE_WINDOW_MS),
             input_silent: self.media_playing
                 && active_metrics.is_some_and(|m| m.input_silent_ms >= INPUT_SILENT_MS),
+            waiting_for_player,
             error: self.error.clone(),
         }
     }
@@ -617,6 +664,9 @@ impl<L: EngineLink> Supervisor<L> {
                     }
                 } else {
                     self.error = Some(format!("model_load_failed: {message}"));
+                    if let Some(e) = self.engine.as_mut() {
+                        e.model_failed = true;
+                    }
                 }
             }
             ErrorCode::AttachFailed => {
@@ -635,7 +685,12 @@ impl<L: EngineLink> Supervisor<L> {
             }
             ErrorCode::CaptureFailed => self.error = Some(format!("capture_failed: {message}")),
             ErrorCode::RenderFailed => self.error = Some(format!("render_failed: {message}")),
-            ErrorCode::NoModel => self.error = Some(format!("no_model: {message}")),
+            ErrorCode::NoModel => {
+                self.error = Some(format!("no_model: {message}"));
+                if let Some(e) = self.engine.as_mut() {
+                    e.model_failed = true;
+                }
+            }
             ErrorCode::BadDevice => self.error = Some(format!("bad_device: {message}")),
         }
     }
@@ -838,6 +893,7 @@ impl<L: EngineLink> Supervisor<L> {
         }
         if let Some(e) = self.engine.as_mut() {
             e.sent_model = Some(path);
+            e.model_failed = false;
         }
         true
     }
@@ -1053,6 +1109,133 @@ mod tests {
         r.sup.tick(300, Some(p), true);
         assert_eq!(r.engine(0).sent(), vec![Command::SetMode { devocal: true }]);
         assert_eq!(r.spawns(), 1);
+    }
+
+    fn fallback(reason: FallbackReason) -> Event {
+        Event::State {
+            phase: Phase::Active,
+            mode: Some(Mode::Fallback),
+            fallback_reason: Some(reason),
+            attached_pid: Some(7),
+        }
+    }
+
+    #[test]
+    fn enable_after_a_fallback_sends_off_then_on() {
+        for reason in [FallbackReason::Overload, FallbackReason::ModelError] {
+            let mut r = rig();
+            let p = player(7);
+            r.hold(0, &p);
+            r.last().push(fallback(reason));
+            r.sup.tick(200, Some(p.clone()), true);
+            assert_eq!(r.phase(), "fallback");
+            r.last().clear_sent();
+            // The engine ignores a repeated "on" (obligation 1): the retry is off-then-on.
+            r.sup.enable(Some(model()));
+            assert_eq!(
+                r.last().sent(),
+                vec![
+                    Command::SetMode { devocal: false },
+                    Command::SetMode { devocal: true }
+                ]
+            );
+            // The engine leaves the fallback; a later enable is a plain "on" again.
+            r.last().push(state(Phase::Active, Some(Mode::Passthrough)));
+            r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+            r.sup.tick(300, Some(p.clone()), true);
+            assert_eq!(r.phase(), "devocal");
+            r.last().clear_sent();
+            r.sup.enable(Some(model()));
+            assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: true }]);
+        }
+    }
+
+    #[test]
+    fn enable_while_passthrough_or_devocal_sends_no_off() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.sup.disable();
+        r.last().push(state(Phase::Active, Some(Mode::Passthrough)));
+        r.sup.tick(200, Some(p), true);
+        r.last().clear_sent();
+        r.sup.enable(Some(model()));
+        assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: true }]);
+    }
+
+    #[test]
+    fn enable_after_the_engine_gave_up_on_the_model_reloads_it() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        // The automatic retry, then the engine gives up and clears its toggle.
+        r.last().push(error(ErrorCode::ModelLoadFailed));
+        r.sup.tick(200, Some(p.clone()), true);
+        r.last().push(error(ErrorCode::ModelLoadFailed));
+        r.last().push(state(Phase::Active, Some(Mode::Passthrough)));
+        r.sup.tick(300, Some(p.clone()), true);
+        let s = r.sup.status();
+        assert_eq!(s.phase, "passthrough");
+        assert!(s.error.unwrap().starts_with("model_load_failed"));
+        r.last().clear_sent();
+        r.sup.enable(Some(model()));
+        assert_eq!(
+            r.last().sent(),
+            vec![set_model(), Command::SetMode { devocal: true }]
+        );
+        assert_eq!(r.sup.status().error, None);
+        // Loaded this time: a later enable does not reload.
+        r.sup.disable();
+        r.last().clear_sent();
+        r.sup.enable(Some(model()));
+        assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: true }]);
+    }
+
+    #[test]
+    fn enable_after_no_model_reloads_it() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().push(error(ErrorCode::NoModel));
+        r.sup.tick(200, Some(p), true);
+        assert!(r.sup.status().error.unwrap().starts_with("no_model"));
+        r.last().clear_sent();
+        r.sup.enable(Some(model()));
+        assert_eq!(
+            r.last().sent(),
+            vec![set_model(), Command::SetMode { devocal: true }]
+        );
+    }
+
+    #[test]
+    fn waiting_for_player_while_there_is_nothing_to_hold() {
+        let mut r = rig();
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, None, false);
+        let s = r.sup.status();
+        assert_eq!(s.phase, "attaching", "phase unchanged for older readers");
+        assert!(s.waiting_for_player);
+        // A player appears: the attach starts and the wait is over.
+        let p = player(7);
+        r.sup.tick(100, Some(p.clone()), true);
+        assert!(!r.sup.status().waiting_for_player);
+        r.last().push(state(Phase::Attaching, None));
+        r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+        r.sup.tick(200, Some(p.clone()), true);
+        assert!(!r.sup.status().waiting_for_player);
+        // Held with no player reported: still held, not waiting.
+        r.sup.tick(300, None, false);
+        assert_eq!(r.phase(), "devocal");
+        assert!(!r.sup.status().waiting_for_player);
+        // The engine lets go and there is no player: waiting again.
+        r.last().push(state(Phase::Idle, None));
+        r.sup.tick(400, None, false);
+        let s = r.sup.status();
+        assert_eq!(s.phase, "attaching");
+        assert!(s.waiting_for_player);
+        // Off is not waiting.
+        r.sup.release();
+        assert!(!r.sup.status().waiting_for_player);
     }
 
     #[test]

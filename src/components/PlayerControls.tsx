@@ -41,6 +41,8 @@ export function PlayerControls({ children, hovered, playing, hasTrack, transport
   // Exactly one of the two live regions holds text, so nothing is announced twice.
   const warningText = devocalLine?.kind === "warning" ? devocalLine.text : "";
   const neutralText = devocalLine?.kind === "neutral" ? devocalLine.text : "";
+  // The latency detail sits next to the neutral text but outside the live region.
+  const neutralDetail = devocalLine?.kind === "neutral" ? devocalLine.detail ?? "" : "";
   const visible = hovered || focused || panel !== null || touch;
   const previousDisabled = !hasTrack || !transport?.canPrevious || transportPending;
   const nextDisabled = !hasTrack || !transport?.canNext || transportPending;
@@ -118,7 +120,7 @@ export function PlayerControls({ children, hovered, playing, hasTrack, transport
           <IconButton size="1" variant="ghost" radius="full" className={`footer-control-button vocal-removal-control ${vocalRemovalEnabled ? "is-enabled" : ""}`}
             aria-label={vocalRemovalEnabled ? "关闭去人声" : "开启去人声"} aria-pressed={vocalRemovalEnabled} onClick={() => { toggleDevocal().catch(error => onNotice(error instanceof Error ? error.message : "去人声未能切换，请重试")); }}><UserSound size={17} weight={vocalRemovalEnabled ? "fill" : "regular"} /></IconButton>
         </AppTooltip>
-        <span className="devocal-status" aria-live="polite">{neutralText}</span>
+        <span className="devocal-status"><span aria-live="polite">{neutralText}</span>{neutralDetail && <span className="devocal-status-detail">{neutralDetail}</span>}</span>
       </div>
       <div className="transport-controls" aria-busy={transportPending}>
         <AppTooltip content="上一首" side="top" disabled={previousDisabled || panel !== null}>

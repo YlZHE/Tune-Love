@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { devocalLabel, devocalLabelKind, isDevocalActive, parseDevocalStatus, OFF_STATUS, type DevocalStatus } from "./devocal";
+import { approxLatency, devocalLabel, devocalLabelKind, devocalNotice, isDevocalActive, parseDevocalStatus, OFF_STATUS, type DevocalStatus } from "./devocal";
 
 const status = (patch: Partial<DevocalStatus>): DevocalStatus => ({ ...OFF_STATUS, ...patch });
 
@@ -15,9 +15,15 @@ describe("devocalLabel", () => {
       .toBe("播放器音量被调整，请调本应用音量");
     expect(devocalLabel(status({ phase: "devocal", inputSilent: true, latencyMs: 40 }))).toBe("未录到播放器声音（可能是独占模式）");
   });
-  it("rounds latency while devocal is running", () => {
-    expect(devocalLabel(status({ phase: "devocal", held: true, latencyMs: 45.4 }))).toBe("去人声中 · 延迟 45 ms");
-    expect(devocalLabel(status({ phase: "devocal", held: true, latencyMs: 45.6 }))).toBe("去人声中 · 延迟 46 ms");
+  it("shows the latency as an estimate rounded to 5 ms while devocal is running", () => {
+    expect(devocalLabel(status({ phase: "devocal", held: true, latencyMs: 45.4 }))).toBe("去人声中 · 延迟约 45 ms");
+    expect(devocalLabel(status({ phase: "devocal", held: true, latencyMs: 77.4 }))).toBe("去人声中 · 延迟约 75 ms");
+    expect(devocalLabel(status({ phase: "devocal", held: true, latencyMs: 77.6 }))).toBe("去人声中 · 延迟约 80 ms");
+  });
+  it("keeps the latency out of the announced text", () => {
+    expect(devocalNotice(status({ phase: "devocal", held: true, latencyMs: 75.1 })))
+      .toEqual({ text: "去人声中", kind: "neutral", detail: " · 延迟约 75 ms" });
+    expect(devocalNotice(status({ phase: "devocal", held: true }))).toEqual({ text: "去人声中", kind: "neutral" });
   });
   it("omits the latency when the engine has not measured it yet", () => {
     expect(devocalLabel(status({ phase: "devocal", held: true, latencyMs: null }))).toBe("去人声中");
@@ -33,8 +39,29 @@ describe("devocalLabel", () => {
     expect(devocalLabel(status({ phase: "attaching" }))).toBe("正在接管播放器…");
     expect(devocalLabel(status({ phase: "restarting" }))).toBe("正在接管播放器…");
   });
+  it("says it is waiting for a player when there is nothing to take over", () => {
+    expect(devocalLabel(status({ phase: "attaching", waitingForPlayer: true }))).toBe("等待播放器");
+    expect(devocalLabel(status({ phase: "restarting", waitingForPlayer: true }))).toBe("等待播放器");
+    expect(devocalLabelKind(status({ phase: "attaching", waitingForPlayer: true }))).toBe("neutral");
+    expect(isDevocalActive("attaching")).toBe(true);
+  });
   it("reports a failed engine as holding the original sound", () => {
     expect(devocalLabel(status({ phase: "failed", error: "engine_crashed" }))).toBe("去人声引擎多次异常，已保持原声");
+  });
+  it("tells a player that cannot be taken over apart from an engine crash", () => {
+    expect(devocalLabel(status({ phase: "failed", error: "attach_failed" }))).toBe("无法接管这个播放器");
+    expect(devocalLabel(status({ phase: "failed", error: "attach_failed: access denied" }))).toBe("无法接管这个播放器");
+    expect(devocalLabelKind(status({ phase: "failed", error: "attach_failed" }))).toBe("warning");
+    expect(devocalLabel(status({ phase: "failed", error: "engine_crashed" }))).not.toBe("无法接管这个播放器");
+  });
+  it("warns when the engine could not load the model", () => {
+    expect(devocalLabel(status({ phase: "passthrough", held: true, error: "model_load_failed: bad file" }))).toBe("去人声模型加载失败，已保持原声");
+    expect(devocalLabel(status({ phase: "passthrough", held: true, error: "no_model: x" }))).toBe("去人声模型加载失败，已保持原声");
+    expect(devocalLabelKind(status({ phase: "passthrough", held: true, error: "model_load_failed: x" }))).toBe("warning");
+    // Other errors do not hide the passthrough label.
+    expect(devocalLabel(status({ phase: "passthrough", held: true, error: "capture_failed: x" }))).toBe("原声直通");
+    // A running devocal wins over a stale error.
+    expect(devocalLabel(status({ phase: "devocal", held: true, error: "model_load_failed: x" }))).toBe("去人声中");
   });
   it("tells a missing model apart from an engine that cannot start", () => {
     expect(devocalLabel(status({ phase: "unavailable", error: "model_not_found" }))).toBe("未找到去人声模型");
@@ -62,6 +89,9 @@ describe("devocalLabelKind", () => {
     ["fallback overload", { phase: "fallback", held: true, fallbackReason: "overload" }, "warning"],
     ["fallback model_error", { phase: "fallback", held: true, fallbackReason: "model_error" }, "warning"],
     ["attaching", { phase: "attaching" }, "neutral"],
+    ["waiting for a player", { phase: "attaching", waitingForPlayer: true }, "neutral"],
+    ["attach given up", { phase: "failed", error: "attach_failed" }, "warning"],
+    ["model load failed", { phase: "passthrough", held: true, error: "model_load_failed: x" }, "warning"],
     ["restarting", { phase: "restarting" }, "neutral"],
     ["failed", { phase: "failed" }, "warning"],
     ["unavailable, model missing", { phase: "unavailable", error: "model_not_found" }, "warning"],
@@ -93,8 +123,12 @@ describe("isDevocalActive", () => {
 describe("parseDevocalStatus", () => {
   it("accepts a well-formed status", () => {
     const value = { phase: "devocal", held: true, latencyMs: 12, loadRatio: 0.4, fallbackReason: null,
-      sessionOverridden: false, inputSilent: false, error: null };
+      sessionOverridden: false, inputSilent: false, waitingForPlayer: false, error: null };
     expect(parseDevocalStatus(value)).toEqual(value);
+    expect(parseDevocalStatus({ ...value, phase: "attaching", waitingForPlayer: true })?.waitingForPlayer).toBe(true);
+  });
+  it("reads a status without waitingForPlayer as not waiting", () => {
+    expect(parseDevocalStatus({ phase: "attaching" })?.waitingForPlayer).toBe(false);
   });
   it("rejects values without a known phase so a stub or null reply cannot change the UI", () => {
     expect(parseDevocalStatus(null)).toBeNull();
@@ -103,5 +137,14 @@ describe("parseDevocalStatus", () => {
   });
   it("fills missing or mistyped fields with safe defaults", () => {
     expect(parseDevocalStatus({ phase: "off", held: "yes", latencyMs: "x", fallbackReason: "weird" })).toEqual(OFF_STATUS);
+  });
+});
+
+describe("approxLatency", () => {
+  it("rounds to the nearest 5 ms", () => {
+    expect(approxLatency(75.1)).toBe("约 75 ms");
+    expect(approxLatency(72.4)).toBe("约 70 ms");
+    expect(approxLatency(72.5)).toBe("约 75 ms");
+    expect(approxLatency(0)).toBe("约 0 ms");
   });
 });

@@ -59,6 +59,9 @@ pub const OVERRIDE_WINDOW_MS: u64 = 10_000;
 pub const INPUT_SILENT_MS: u64 = 3_000;
 /// A version-mismatched engine that has not exited after `shutdown` is killed after this.
 pub const MISMATCH_KILL_MS: u64 = 2_000;
+/// An engine that has not reported `Idle` this long after the app sent `release` is killed
+/// (then restored and, if the hold is still wanted, restarted within the budget).
+pub const RELEASE_DEADLINE_MS: u64 = 20_000;
 /// How long [`Supervisor::shutdown`] waits for the engine to exit before killing it.
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
@@ -176,6 +179,8 @@ struct Linked<L> {
     attach_in_flight: bool,
     /// `release` sent, Idle not seen yet.
     release_sent: bool,
+    /// When the app sent that `release` (deadline [`RELEASE_DEADLINE_MS`]).
+    release_sent_at: Option<u64>,
     sent_model: Option<PathBuf>,
     /// Last Metrics received while Active (cleared when leaving Active).
     metrics: Option<Metrics>,
@@ -195,6 +200,7 @@ impl<L> Linked<L> {
             attached: None,
             attach_in_flight: false,
             release_sent: false,
+            release_sent_at: None,
             sent_model: None,
             metrics: None,
             overridden_seen: None,
@@ -527,6 +533,7 @@ impl<L: EngineLink> Supervisor<L> {
             Phase::Idle => {
                 e.attach_in_flight = false;
                 let requested = std::mem::replace(&mut e.release_sent, false);
+                e.release_sent_at = None;
                 let lost = e.attached.take();
                 self.apply_gate(GateKey::Unity, Some(1.0));
                 if let (false, Some(p)) = (requested, lost) {
@@ -565,8 +572,10 @@ impl<L: EngineLink> Supervisor<L> {
         let Some(e) = self.engine.as_mut() else {
             return;
         };
-        if e.phase() != Phase::Active {
-            return; // obligation 22
+        if e.phase() != Phase::Active || e.release_sent {
+            // Obligation 22; and Metrics the engine sent before it handled our `release`
+            // must not reopen the gate.
+            return;
         }
         let key = GateKey::Scaled {
             link: e.generation,
@@ -635,10 +644,17 @@ impl<L: EngineLink> Supervisor<L> {
         let exited = match self.engine.as_mut() {
             None => return,
             Some(e) => {
-                if !e.link.exited()
-                    && e.mismatch_at
-                        .is_some_and(|t| now_ms.saturating_sub(t) >= MISMATCH_KILL_MS)
-                {
+                let mismatch_due = e
+                    .mismatch_at
+                    .is_some_and(|t| now_ms.saturating_sub(t) >= MISMATCH_KILL_MS);
+                // A release that never reaches Idle (engine stalled with the pipe open).
+                let release_due = e
+                    .release_sent_at
+                    .is_some_and(|t| now_ms.saturating_sub(t) >= RELEASE_DEADLINE_MS);
+                if !e.link.exited() && (mismatch_due || release_due) {
+                    if release_due {
+                        eprintln!("devocal: engine did not finish releasing in 20 s; killing it");
+                    }
                     e.link.kill();
                 }
                 e.link.exited()
@@ -793,6 +809,7 @@ impl<L: EngineLink> Supervisor<L> {
         if needed && self.send(&Command::Release) {
             if let Some(e) = self.engine.as_mut() {
                 e.release_sent = true;
+                e.release_sent_at = Some(self.now_ms);
             }
             self.apply_gate(GateKey::Drop, None);
         }
@@ -870,6 +887,8 @@ mod tests {
         restores: Arc<Mutex<Vec<Option<f32>>>>,
         gate: Arc<AttenuationGate>,
         spawn_error: Arc<Mutex<Option<String>>>,
+        /// "spawn" / "restore" in call order.
+        order: Arc<Mutex<Vec<&'static str>>>,
     }
 
     fn rig() -> Rig {
@@ -883,6 +902,8 @@ mod tests {
         let spawn_error: Arc<Mutex<Option<String>>> = Arc::default();
         let (e, s) = (engines.clone(), spawn_error.clone());
         let (r, g) = (restores.clone(), gate.clone());
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+        let (o1, o2) = (order.clone(), order.clone());
         let sup = Supervisor::new(
             Box::new(move || {
                 if let Some(err) = s.lock().unwrap().clone() {
@@ -890,9 +911,13 @@ mod tests {
                 }
                 let engine = FakeEngine::default();
                 e.lock().unwrap().push(engine.clone());
+                o1.lock().unwrap().push("spawn");
                 Ok(engine.link())
             }),
-            Box::new(move || r.lock().unwrap().push(g.read().1)),
+            Box::new(move || {
+                r.lock().unwrap().push(g.read().1);
+                o2.lock().unwrap().push("restore");
+            }),
             gate.clone(),
         )
         .with_restore_pending(Box::new(move || restore_pending))
@@ -903,6 +928,7 @@ mod tests {
             restores,
             gate,
             spawn_error,
+            order,
         }
     }
 
@@ -1521,6 +1547,67 @@ mod tests {
         r.sup.tick(300, Some(p), true);
         assert_eq!(r.restores(), 1);
         assert_eq!(r.spawns(), 2);
+    }
+
+    #[test]
+    fn stuck_release_is_killed_and_restored_after_20s() {
+        let mut r = rig();
+        let (a, b) = (player(7), player(8));
+        r.hold(0, &a);
+        let first = r.last();
+        // Player change at 300: release sent; the engine says Releasing and then stalls.
+        r.sup.tick(300, Some(b.clone()), true);
+        assert_eq!(first.sent().last(), Some(&Command::Release));
+        first.push(state(Phase::Releasing, None));
+        for t in [1_000u64, 10_000, 20_299] {
+            r.sup.tick(t, Some(b.clone()), true);
+        }
+        assert!(!first.killed(), "deadline not reached yet");
+        assert_eq!(r.restores(), 0);
+        assert_eq!(r.phase(), "releasing");
+        assert_eq!(r.gate.read().1, None);
+
+        r.sup.tick(20_300, Some(b.clone()), true);
+        assert!(first.killed());
+        assert_eq!(*r.order.lock().unwrap(), vec!["spawn", "restore", "spawn"]);
+        assert_eq!(*r.restores.lock().unwrap(), vec![None]);
+        // The hold is still wanted: the restarted engine attaches the new player.
+        assert_eq!(r.last().sent(), handshake(&b));
+        assert_eq!(r.phase(), "restarting");
+    }
+
+    #[test]
+    fn stuck_user_release_is_killed_and_restored_without_restart() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.sup.tick(1_000, Some(p.clone()), true);
+        r.sup.release();
+        r.last().push(state(Phase::Releasing, None));
+        r.sup.tick(20_999, Some(p.clone()), true);
+        assert!(!r.last().killed());
+        r.sup.tick(21_000, Some(p), true);
+        assert!(r.last().killed());
+        assert_eq!(*r.order.lock().unwrap(), vec!["spawn", "restore"]);
+        assert_eq!(r.gate.read().1, Some(1.0));
+        assert_eq!(r.phase(), "off");
+    }
+
+    #[test]
+    fn metrics_after_release_sent_keep_the_gate_closed() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().push(metrics(1e-4, 1));
+        r.sup.tick(200, Some(p.clone()), true);
+        assert_eq!(r.gate.read().1, Some(10_000.0));
+        r.sup.release();
+        let (epoch, g) = r.gate.read();
+        assert_eq!(g, None);
+        // Sent by the engine before it handled the release (still Active, new epoch).
+        r.last().push(metrics(1e-4 / 0.5, 2));
+        r.sup.tick(300, Some(p), true);
+        assert_eq!(r.gate.read(), (epoch, None));
     }
 
     #[test]

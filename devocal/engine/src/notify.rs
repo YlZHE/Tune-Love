@@ -202,6 +202,11 @@ pub struct SessionWatcher {
     state_cb: IAudioSessionEvents,
     /// Sessions registered with `state_cb`, by instance id (the parked sessions).
     state_watches: Vec<(String, IAudioSessionControl2)>,
+    /// The sessions to watch (the last `watch_states` list); the ones missing from
+    /// `state_watches` are retried at every re-sync.
+    wanted: Vec<String>,
+    /// Sessions whose watch failed and was logged (once, until it succeeds).
+    watch_failed: Vec<String>,
     signals: Arc<SessionSignals>,
 }
 
@@ -235,6 +240,8 @@ impl SessionWatcher {
             managers: Vec::new(),
             state_cb,
             state_watches: Vec::new(),
+            wanted: Vec::new(),
+            watch_failed: Vec::new(),
             signals,
         };
         if let Err(e) = watcher.refresh() {
@@ -252,37 +259,54 @@ impl SessionWatcher {
         if let Err(e) = self.refresh() {
             eprintln!("devocal engine: session notifications: {e}");
         }
+        // Sessions on a returning endpoint can be found again.
+        self.sync_states();
         self.signals.notify_session_created();
     }
 
     /// Watches exactly the sessions in `instance_ids` for state changes (call it whenever the
     /// holder's parked set changes): unregisters the others, registers the new ones. A
-    /// session that cannot be found or registered is logged; the 0.5 s follow covers it. After
-    /// a new registration a follow is requested, in case the session turned active before.
+    /// session that cannot be found or registered is logged once and retried at the next
+    /// re-sync (this call, or an endpoint change in [`Self::maintain`]); the 0.5 s follow
+    /// covers it meanwhile. After a new registration a follow is requested, in case the
+    /// session turned active before.
     pub fn watch_states(&mut self, instance_ids: &[String]) {
+        self.wanted = instance_ids.to_vec();
+        self.sync_states();
+    }
+
+    fn sync_states(&mut self) {
         let cb = &self.state_cb;
+        let wanted = &self.wanted;
+        self.watch_failed.retain(|id| wanted.contains(id));
         self.state_watches.retain(|(id, ctl)| {
-            let keep = instance_ids.contains(id);
+            let keep = wanted.contains(id);
             if !keep {
                 let _ = unsafe { ctl.UnregisterAudioSessionNotification(cb) };
             }
             keep
         });
         let mut added = false;
-        for id in instance_ids {
+        for id in &self.wanted {
             if self.state_watches.iter().any(|(w, _)| w == id) {
                 continue;
             }
-            match devocal_core::sessions_win::session_control(id) {
+            let failure = match devocal_core::sessions_win::session_control(id) {
                 Ok(Some(ctl)) => match unsafe { ctl.RegisterAudioSessionNotification(cb) } {
                     Ok(()) => {
                         self.state_watches.push((id.clone(), ctl));
+                        self.watch_failed.retain(|f| f != id);
                         added = true;
+                        continue;
                     }
-                    Err(e) => eprintln!("devocal engine: watching session {id}: {e}"),
+                    Err(e) => e.to_string(),
                 },
-                Ok(None) => {} // gone; the next follow forgets or re-finds it
-                Err(e) => eprintln!("devocal engine: watching session {id}: {e}"),
+                Ok(None) => "no such session".to_string(),
+                Err(e) => e,
+            };
+            if !self.watch_failed.contains(id) {
+                eprintln!("devocal engine: watching session {id}: {failure} (retried later)");
+                self.watch_failed.push(id.clone());
             }
         }
         if added {
@@ -506,11 +530,19 @@ mod tests {
         w.maintain();
         assert_eq!(w.registered().len(), n);
         assert!(signals.take_session_created());
-        // An instance id that matches no session: nothing is watched, nothing requested.
-        w.watch_states(&["{no-such-endpoint}|nothing".to_string()]);
+        // An instance id that matches no session: nothing is watched, nothing requested, the
+        // failure is remembered for a retry at the next re-sync (logged once).
+        let missing = "{no-such-endpoint}|nothing".to_string();
+        w.watch_states(std::slice::from_ref(&missing));
         assert!(w.watched().is_empty());
+        assert_eq!(w.watch_failed, vec![missing.clone()]);
         assert!(!signals.take_state_changed());
+        signals.notify_endpoints_changed();
+        w.maintain();
+        assert_eq!(w.wanted, vec![missing]);
+        assert!(signals.take_session_created());
         w.watch_states(&[]);
+        assert!(w.watch_failed.is_empty());
         drop(w);
     }
 

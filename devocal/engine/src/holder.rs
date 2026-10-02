@@ -56,10 +56,14 @@
 //! "parked": set back to its recorded original (inaudible) and then dropped from the restore
 //! file, so a crash, a player exit or Windows' per-app-per-device volume memory never leaves it
 //! at the held volume. A new tree session in that state is owned parked without being lowered.
-//! Never parked: an active session, a session on a default endpoint, anything while the default
-//! is unknown (an `Err` or no default). A parked session is held again (written to the restore
+//! Never parked: an active session, a session on a default endpoint, a session on an endpoint
+//! the player is playing on (the endpoints of the tree's active sessions in the latest pass
+//! that saw any: a player pinned to a non-default device that pauses stops its stream there,
+//! and would otherwise be parked and resume unlowered for a few milliseconds), anything while
+//! the default or the playing endpoint is unknown (an `Err` or no default; no session has
+//! played since the attach). A parked session is held again (written to the restore
 //! file, its observed volume recorded in the gain history, then lowered) as soon as a pass
-//! finds it active or on a default endpoint: after a default device change that is the
+//! finds it active, on a default endpoint or on a playing endpoint: after a default device change that is the
 //! event-driven pass right after the change, before the player starts its stream there; for a
 //! player pinned to a non-default device the engine subscribes to the parked sessions' state
 //! changes ([`Holder::parked_sessions`]) and follows within one loop pass. Parking never
@@ -244,11 +248,28 @@ pub struct Holder<S: SessionVolumes> {
     device_mute: Option<DeviceMute>,
     /// Incremented whenever the set of parked sessions changes.
     parked_epoch: u64,
+    /// Endpoints the player is playing on: those of the tree's active sessions in the latest
+    /// pass (or the attach) that saw any. Empty = unknown.
+    playing: Vec<String>,
+    /// Log lines already written (`park:<id>`, `unpark:<id>`), so a repeating failure is
+    /// logged once until it clears.
+    logged: HashSet<String>,
 }
 
 /// True for a volume the holder lowers: finite, above `HELD_VOLUME` and not already held.
 fn should_lower(v: f32) -> bool {
     v.is_finite() && v > HELD_VOLUME && !is_held(v)
+}
+
+/// Endpoints of the active sessions in `tree`, without duplicates.
+fn active_endpoints(tree: &[SessionInfo]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in tree.iter().filter(|s| s.active) {
+        if !out.contains(&s.endpoint_id) {
+            out.push(s.endpoint_id.clone());
+        }
+    }
+    out
 }
 
 /// Geometric interpolation from `from` to `to`: step 0 is `from`, step `RAMP_STEPS` exactly `to`.
@@ -335,6 +356,8 @@ impl<S: SessionVolumes> Holder<S> {
             absorbed: HashSet::new(),
             device_mute: None,
             parked_epoch: 0,
+            playing: Vec::new(),
+            logged: HashSet::new(),
         }
     }
 
@@ -462,6 +485,8 @@ impl<S: SessionVolumes> Holder<S> {
         self.release_error = None;
         self.attach_unread = unread;
         self.device_mute = None;
+        self.playing = active_endpoints(&tree);
+        self.logged.clear();
         Ok(report)
     }
 
@@ -550,8 +575,21 @@ impl<S: SessionVolumes> Holder<S> {
                 .as_ref()
                 .is_some_and(|d| d.contains(&s.endpoint_id))
         };
-        // Plays nothing and cannot start playing unnoticed: inactive, default known, not on it.
-        let parkable = |s: &SessionInfo| !s.active && defaults.is_some() && !on_default(s);
+        let now_playing = active_endpoints(&tree);
+        if !now_playing.is_empty() {
+            self.playing = now_playing;
+        }
+        let playing = self.playing.clone();
+        let on_playing = |s: &SessionInfo| playing.contains(&s.endpoint_id);
+        // Plays nothing and cannot start playing unnoticed: inactive, default and playing
+        // endpoints known, on neither.
+        let parkable = |s: &SessionInfo| {
+            !s.active
+                && defaults.is_some()
+                && !playing.is_empty()
+                && !on_default(s)
+                && !on_playing(s)
+        };
         let mut parked_any = false;
         let mut new_parked: Vec<(SessionInfo, f32)> = Vec::new();
         // Sessions held by this pass (lowered or listed again), for the device-mute check.
@@ -571,7 +609,7 @@ impl<S: SessionVolumes> Holder<S> {
                 .position(|o| o.entry.instance_id == s.instance_id);
             match idx {
                 Some(i) if self.owned[i].parked => {
-                    if !(s.active || on_default(s)) {
+                    if !(s.active || on_default(s) || on_playing(s)) {
                         continue; // still cannot play
                     }
                     if should_lower(v) {
@@ -593,14 +631,20 @@ impl<S: SessionVolumes> Holder<S> {
                             // longer held, which a restore leaves alone.
                             let id = self.owned[i].entry.instance_id.clone();
                             let original = self.owned[i].entry.original_volume;
+                            // A failure is not an error of the pass: the session simply stays
+                            // held, which is safe. Logged once until it succeeds.
                             match self.sessions.set_volume(&id, original) {
                                 Ok(()) => {
                                     let o = &mut self.owned[i];
                                     o.parked = true;
                                     o.last_set = None;
                                     parked_any = true;
+                                    self.logged.remove(&format!("park:{id}"));
                                 }
-                                Err(e) => r.fail(format!("parking session {id} failed: {e}")),
+                                Err(e) => self.log_once(
+                                    format!("park:{id}"),
+                                    format!("parking session {id} failed (it stays held): {e}"),
+                                ),
                             }
                         }
                         continue;
@@ -667,8 +711,19 @@ impl<S: SessionVolumes> Holder<S> {
                     r.fail(format!("writing the restore file failed: {e}"));
                     degraded = true;
                     for c in &candidates {
-                        if let Candidate::Lower { volume, .. } = c {
-                            unlowered = unlowered.max(*volume);
+                        match c {
+                            Candidate::Lower { volume, .. } => unlowered = unlowered.max(*volume),
+                            Candidate::Unpark { owned } => {
+                                let id = self.owned[*owned].entry.instance_id.clone();
+                                self.log_once(
+                                    format!("unpark:{id}"),
+                                    format!(
+                                        "parked session {id} is at the held volume but could not \
+                                         be listed in the restore file ({e}); retrying"
+                                    ),
+                                );
+                            }
+                            Candidate::Adopt { .. } => {}
                         }
                     }
                 }
@@ -678,6 +733,8 @@ impl<S: SessionVolumes> Holder<S> {
                     for (i, lower) in targets {
                         let Some(v) = lower else {
                             // Adopted or listed again, already held.
+                            let key = format!("unpark:{}", self.owned[i].entry.instance_id);
+                            self.logged.remove(&key);
                             self.owned[i].last_set = Some(HELD_VOLUME);
                             held_now.push(self.owned[i].entry.instance_id.clone());
                             continue;
@@ -1046,6 +1103,14 @@ impl<S: SessionVolumes> Holder<S> {
         self.owned
             .extend(entries.into_iter().skip(known).map(Owned::new));
         Ok(targets)
+    }
+
+    /// Writes `message` to the engine log unless the line for `key` was already written (and
+    /// not cleared since).
+    fn log_once(&mut self, key: String, message: String) {
+        if self.logged.insert(key) {
+            eprintln!("devocal engine: {message}");
+        }
     }
 
     /// Forgets every owned session (bumping the parked epoch if any was parked).
@@ -2423,6 +2488,76 @@ mod tests {
         h.sessions().set_active("b", true);
         assert_eq!(h.follow(t + 20 * MS), FollowReport::default());
         assert!((h.capture_gain(t + 20 * MS) - 3000.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn a_pinned_player_pausing_on_a_non_default_endpoint_is_not_parked() {
+        let dir = TempDir::new("park-pinned");
+        let mut h = parking_holder(&dir, &[("p", "ep2", true, 0.4)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        assert_eq!(h.follow(T0 + 500 * MS), FollowReport::default());
+        // Pause: the client stops, the session goes inactive on the (non-default) ep2.
+        h.sessions().set_active("p", false);
+        let n = h.sessions().writes().len();
+        assert_eq!(h.follow(T0 + 1000 * MS), FollowReport::default());
+        assert_eq!(vol(&h, "p"), HELD_VOLUME, "the player is still on ep2");
+        assert!(h.parked_sessions().is_empty());
+        assert_eq!(h.sessions().writes().len(), n);
+        // The player moves to ep3 and plays there: ep2 is left behind and parked.
+        h.sessions().add_session(sess("q", "ep3", true), 1.0, false);
+        let r = h.follow(T0 + 1500 * MS);
+        assert_eq!(r.newly_lowered, 1);
+        assert_eq!((vol(&h, "p"), vol(&h, "q")), (0.4, HELD_VOLUME));
+        assert_eq!(h.parked_sessions(), vec!["p"]);
+        assert_eq!(entry_ids(&dir), vec!["q"]);
+        // ...and paused there, ep3 is not parked either.
+        h.sessions().set_active("q", false);
+        h.follow(T0 + 2000 * MS);
+        assert_eq!(vol(&h, "q"), HELD_VOLUME);
+        // Back to ep2: held again as soon as it plays there.
+        h.sessions().set_active("p", true);
+        assert_eq!(h.follow(T0 + 2500 * MS).newly_lowered, 1);
+        assert_eq!(vol(&h, "p"), HELD_VOLUME);
+    }
+
+    #[test]
+    fn nothing_is_parked_before_the_player_has_played() {
+        let dir = TempDir::new("park-unknown-playing");
+        // Attached while paused: no session active, so the playing endpoint is unknown.
+        let mut h = parking_holder(&dir, &[("p", "ep2", false, 0.4), ("o", "ep3", false, 0.5)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        assert_eq!(h.follow(T0 + 500 * MS), FollowReport::default());
+        assert!(h.parked_sessions().is_empty());
+        assert_eq!((vol(&h, "p"), vol(&h, "o")), (HELD_VOLUME, HELD_VOLUME));
+        // It plays on ep2: the idle ep3 session is parked, ep2 never.
+        h.sessions().set_active("p", true);
+        h.follow(T0 + 1000 * MS);
+        assert_eq!(h.parked_sessions(), vec!["o"]);
+        assert_eq!(vol(&h, "p"), HELD_VOLUME);
+    }
+
+    #[test]
+    fn a_failed_park_is_not_a_follow_error_and_the_session_stays_held() {
+        let dir = TempDir::new("park-fail");
+        let mut h = parking_holder(&dir, &[("a", "ep1", true, 0.3), ("b", "ep2", false, 0.6)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        h.sessions().fail_set_volume("b");
+        let t = T0 + 500 * MS;
+        for k in 0..3 {
+            assert_eq!(h.follow(t + k * 500 * MS), FollowReport::default());
+        }
+        assert_eq!(vol(&h, "b"), HELD_VOLUME);
+        assert!(h.parked_sessions().is_empty());
+        assert_eq!(entry_ids(&dir), vec!["a", "b"]);
+        assert!(h.logged.contains("park:b"), "logged once");
+        assert!(
+            (h.capture_gain(t + 2_000 * MS) - 3000.0).abs() < 0.05,
+            "not degraded"
+        );
+        h.sessions().clear_failures();
+        h.follow(t + 2_000 * MS);
+        assert_eq!(h.parked_sessions(), vec!["b"]);
+        assert!(!h.logged.contains("park:b"));
     }
 
     #[test]

@@ -3,44 +3,61 @@
 //! [`EngineCore`] owns the session [`Holder`], the audio side (behind [`AudioPort`], so tests
 //! use a fake) and the phase machine ([`state::next`](crate::state::next)). It does no I/O of
 //! its own: [`EngineCore::handle`] takes one command, [`EngineCore::tick`] advances time, and
-//! both return the events to send. [`run`] is the real process: the app pipe, the watchdog and
-//! a loop that calls `tick` every millisecond.
+//! both return the events to send. [`loop_once`] is one pass of the main loop; [`run`] is the
+//! real process: the app pipe, the watchdog and `loop_once` every millisecond.
 //!
-//! Attach order: `attach` loads the model again if the previous audio run consumed it, starts
-//! the audio threads (process loopback of the player tree, output on the player's endpoint)
-//! and only then, on the next tick, calls `Holder::begin_attach` with that tick's time, so the
-//! 30 ms volume ramp is not compressed by the audio start-up and nothing is lowered when
-//! the audio cannot start.
+//! Timestamps: every step reads the clock again (each command, the watchdog's exit request,
+//! the tick). A step that blocked (an audio start takes up to tens of milliseconds) must not
+//! leave the following steps with a stale time: the Holder's ramp and its gain history are
+//! stamped with these times, and a stale stamp both collapses the 30 ms ramp and ages the
+//! loud steps out of the conservative gain window.
+//!
+//! Models: loading never blocks the loop. `set_model` starts a load on a worker thread
+//! ([`ModelLoader`]) and every tick polls for the result; a newer `set_model` supersedes a
+//! pending one (the older result is dropped on its worker). A loaded model goes to the
+//! running audio (`set_separator`) or is staged for the next audio start. When the audio
+//! stops, the processing thread hands its model back; the engine `reset()`s it and stages it,
+//! so a re-attach does not load again. Only if nothing came back (a thread left detached, a
+//! failed start) does the next attach reload the model in the background.
+//!
+//! Attach order: `attach` stages the model (or starts that background reload), starts the
+//! audio threads (process loopback of the player tree, output on the player's endpoint) and
+//! only then, on the next tick, calls `Holder::begin_attach` with that tick's time, so the
+//! 30 ms volume ramp is not compressed by the audio start-up and nothing is lowered when the
+//! audio cannot start.
 //!
 //! Every tick (1 ms in [`run`]):
-//! 1. a pending `begin_attach` (see above);
-//! 2. audio thread failure (`capture_failed` -> `CaptureFailed`, other `failed` ->
+//! 1. a finished model load (installed or reported);
+//! 2. a pending `begin_attach` (see above);
+//! 3. audio thread failure (`capture_failed` -> `CaptureFailed`, other `failed` ->
 //!    `RenderFailed`) while attaching/active: release first, then report;
-//! 3. `Holder::tick`: `Held` while attaching -> `AttachDone`; `Failed` while attaching ->
+//! 4. `Holder::tick`: `Held` while attaching -> `AttachDone`; `Failed` while attaching ->
 //!    `Failure` + `begin_release`; `Failed` while releasing is one-shot (logged, the entry
 //!    stays in the restore file) and the next `Idle` is `ReleaseDone`;
-//! 4. every 0.5 s, and at once when the safety guard asks (`take_follow_request`):
+//! 5. every 0.5 s, and at once when the safety guard asks (`take_follow_request`):
 //!    `Holder::follow` while active; every 0.5 s also the output endpoint check;
-//! 5. `SharedGains` from the Holder (after the tick and follow, so the audio threads see the
+//! 6. `SharedGains` from the Holder (after the tick and follow, so the audio threads see the
 //!    gain that matches the volumes just set);
-//! 6. `Metrics` once per second;
-//! 7. a `State` event whenever phase, mode, fallback reason or attached pid changed.
+//! 7. `Metrics` once per second;
+//! 8. a `State` event whenever phase, mode, fallback reason or attached pid changed.
 //!
 //! Mode reporting (caller obligation 5), while `Active`:
 //! - user toggle off: `Passthrough` whatever the processor stage (an overload fallback while
 //!   the user has devocal off is plain passthrough, never "overload");
 //! - user toggle on: `Passthrough`/`WarmingUp`/`FadingIn`/`Devocal` report `Devocal`
-//!   (pending until the fade-in is done; the app shows the switch as on); `FadingOut` and
-//!   `Fallback` with a `fallback_reason` report `Fallback(reason)`; `FadingOut` without a reason
-//!   is a model swap in progress and stays `Devocal` (pending);
+//!   (pending until the fade-in is done, or until a pending model load finishes);
+//!   `FadingOut` and `Fallback` with a `fallback_reason` report `Fallback(reason)`;
+//!   `FadingOut` without a reason is a model swap in progress and stays `Devocal` (pending);
 //! - for up to 100 ms after a forwarded toggle, until the processor stage moves, the
 //!   requested mode is reported, so a stale stage (e.g. the old `Fallback`) does not flash.
 //!
-//! `set_mode(true)` reaches the audio side only when it changes the user's last requested
-//! value (caller obligation 1); a repeated "on" (state sync) never undoes an overload
-//! fallback. A new audio run (attach) starts with the toggle the user last requested.
+//! Toggle forwarding (caller obligation 1): the engine remembers what the running audio was
+//! told. "On" is sent only when the user wants it, the audio has a model and the audio was
+//! not already told "on"; a repeated "on" (state sync) therefore never undoes an overload
+//! fallback. "On" requested while a load is pending is sent after the model is installed;
+//! a failed load clears it. A new audio run starts "off" and gets the user's toggle once.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -119,11 +136,44 @@ pub trait AudioPort {
     /// The safety guard asks for an immediate `Holder::follow` (cleared by the call).
     fn take_follow_request(&self) -> bool;
     fn stats(&self) -> AudioSnapshot;
-    fn stop(&mut self);
+    /// Stops the audio and returns the model it held (if it came back).
+    fn stop(&mut self) -> Option<Box<dyn Separator>>;
 }
 
-/// Loads a model file with the given number of inference threads.
-pub type ModelLoader = Box<dyn FnMut(&Path, u16) -> Result<Box<dyn Separator>, String>>;
+/// Result channel of one model load.
+pub type LoadResult = mpsc::Receiver<Result<Box<dyn Separator>, String>>;
+
+/// Starts loading a model (path, inference threads) off the main loop; the result arrives on
+/// the returned channel. A receiver dropped before the result arrives abandons the load.
+pub type ModelLoader = Box<dyn FnMut(PathBuf, u16) -> LoadResult>;
+
+/// Loads StemgenRT models, each on its own worker thread.
+pub fn stemgen_loader() -> ModelLoader {
+    Box::new(|path: PathBuf, threads: u16| {
+        let (tx, rx) = mpsc::channel();
+        let on_spawn_error = tx.clone();
+        let spawned = thread::Builder::new()
+            .name("devocal-model-load".into())
+            .spawn(move || {
+                let model =
+                    StemgenRt::load(&path, threads).map(|m| Box::new(m) as Box<dyn Separator>);
+                // A superseded load: the receiver is gone and the model is dropped here.
+                let _ = tx.send(model);
+            });
+        if let Err(e) = spawned {
+            let _ = on_spawn_error.send(Err(format!("starting the model loader: {e}")));
+        }
+        rx
+    })
+}
+
+/// Drops a model on a short-lived thread (tearing down an inference session can take
+/// milliseconds; the main loop must not stall). Without a thread it is dropped here.
+fn retire(model: Box<dyn Separator>) {
+    let _ = thread::Builder::new()
+        .name("devocal-model-drop".into())
+        .spawn(move || drop(model));
+}
 
 /// Reported mode for the user's toggle and the processor's stage (see the module docs).
 pub fn mode_for(
@@ -161,6 +211,13 @@ struct ModelSpec {
     threads: u16,
 }
 
+struct PendingLoad {
+    spec: ModelSpec,
+    /// Reloading the current model (its separator did not come back), not a new `set_model`.
+    reload: bool,
+    rx: LoadResult,
+}
+
 type StateKey = (Phase, Option<Mode>, Option<FallbackReason>, Option<u32>);
 
 pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
@@ -169,12 +226,17 @@ pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     audio_running: bool,
     /// Set after a release: stop the audio at this time.
     audio_stop_at: Option<u64>,
+    /// The running audio has a model (started with one, or one was sent).
+    audio_model: bool,
+    /// The toggle the running audio was last told.
+    audio_toggle: bool,
     gains: Arc<SharedGains>,
     loader: ModelLoader,
-    /// The model last loaded successfully (reloaded for each new audio run).
+    /// The model last loaded successfully (in the audio, staged, or being reloaded).
     model: Option<ModelSpec>,
     /// A loaded model waiting for the next audio start.
     staged: Option<Box<dyn Separator>>,
+    pending_load: Option<PendingLoad>,
     phase: Phase,
     pid: Option<u32>,
     /// `begin_attach` runs on the next tick (after the audio started).
@@ -200,10 +262,13 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             audio,
             audio_running: false,
             audio_stop_at: None,
+            audio_model: false,
+            audio_toggle: false,
             gains: Arc::new(SharedGains::new(1.0, 0.0)),
             loader,
             model: None,
             staged: None,
+            pending_load: None,
             phase: Phase::Idle,
             pid: None,
             pending_attach: None,
@@ -293,7 +358,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
                 path,
                 device,
                 threads,
-            } => self.set_model(id, path, &device, threads, &mut ev),
+            } => self.set_model(id, path, &device, threads, now_us, &mut ev),
             Command::Release => self.release(now_us, &mut ev),
             Command::Shutdown => self.begin_exit(now_us, &mut ev),
         }
@@ -304,6 +369,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
     /// Advances the engine to `now_us` (see the module docs for the order).
     pub fn tick(&mut self, now_us: u64) -> Vec<Event> {
         let mut ev = Vec::new();
+        self.poll_model(now_us, &mut ev);
         self.start_pending_attach(now_us, &mut ev);
         self.check_audio(now_us, &mut ev);
         self.step_holder(now_us, &mut ev);
@@ -323,12 +389,22 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         ev
     }
 
-    /// Stops the audio threads now (no-op when stopped).
+    /// Stops the audio threads now (no-op when stopped) and keeps the model they hand back
+    /// for the next run (reset; a newer staged model wins).
     pub fn stop_audio(&mut self) {
         if self.audio_running {
-            self.audio.stop();
+            if let Some(mut model) = self.audio.stop() {
+                model.reset();
+                if self.staged.is_none() {
+                    self.staged = Some(model);
+                } else {
+                    retire(model);
+                }
+            }
             self.audio_running = false;
         }
+        self.audio_model = false;
+        self.audio_toggle = false;
         self.audio_stop_at = None;
         self.toggle_settle = None;
     }
@@ -364,9 +440,14 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             ));
             return;
         }
-        // The previous run may still be in its stop delay.
+        // The previous run may still be in its stop delay; its model comes back here.
         self.stop_audio();
-        self.stage_model(ev);
+        if self.staged.is_none() && self.pending_load.is_none() {
+            // Nothing came back from the last run: reload in the background.
+            if let Some(spec) = self.model.take() {
+                self.start_load(spec, true);
+            }
+        }
         self.pid = Some(pid);
         self.transition(Input::Attach, now_us, ev);
 
@@ -376,6 +457,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             .sessions_for_tree(pid)
             .ok()
             .and_then(|t| session_endpoint(&t));
+        let with_model = self.staged.is_some();
         let processor = Processor::new(self.staged.take());
         let cfg = AudioConfig {
             pid,
@@ -386,12 +468,12 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         match self.audio.start(cfg, self.gains.clone(), processor) {
             Ok(()) => {
                 self.audio_running = true;
+                self.audio_model = with_model;
+                self.audio_toggle = false;
                 self.bound_endpoint = endpoint;
                 self.pending_attach = Some((pid, created_at));
                 // A fresh processor: apply the user's current toggle once.
-                if self.user_devocal {
-                    self.forward_toggle(true, now_us);
-                }
+                self.sync_toggle(now_us);
             }
             Err(e) => {
                 ev.push(error(
@@ -403,49 +485,38 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         }
     }
 
-    /// Makes sure a loaded model is staged for the next audio start (a previous run
-    /// consumed the last one).
-    fn stage_model(&mut self, ev: &mut Vec<Event>) {
-        if self.staged.is_some() {
-            return;
-        }
-        let Some(spec) = &self.model else {
-            return;
-        };
-        match (self.loader)(&spec.path, spec.threads) {
-            Ok(s) => self.staged = Some(s),
-            Err(e) => {
-                ev.push(error(
-                    ErrorCode::ModelLoadFailed,
-                    format!("reloading model {} failed: {e}", spec.id),
-                ));
-                self.model = None;
-                self.user_devocal = false;
-            }
-        }
-    }
-
     fn set_mode(&mut self, devocal: bool, now_us: u64, ev: &mut Vec<Event>) {
-        if devocal && self.model.is_none() {
+        if self.exit_requested {
+            ev.push(error(
+                ErrorCode::Protocol,
+                "the engine is shutting down; set_mode ignored",
+            ));
+            return;
+        }
+        if devocal && self.model.is_none() && self.pending_load.is_none() {
             ev.push(error(
                 ErrorCode::NoModel,
                 "no model loaded (send set_model first)",
             ));
             return;
         }
-        if devocal == self.user_devocal {
-            return; // not a change: never re-sent (caller obligation 1)
-        }
         self.user_devocal = devocal;
-        if self.audio_live() {
-            self.forward_toggle(devocal, now_us);
-        }
+        self.sync_toggle(now_us);
     }
 
-    fn forward_toggle(&mut self, on: bool, now_us: u64) {
-        let before = self.audio.stage();
-        self.audio.set_devocal(on);
-        self.toggle_settle = Some((before, now_us + TOGGLE_SETTLE_US));
+    /// Tells the running audio the user's toggle if it differs from what it was told; "on"
+    /// only once the audio has a model (caller obligation 1).
+    fn sync_toggle(&mut self, now_us: u64) {
+        if !self.audio_live() {
+            return;
+        }
+        let want = self.user_devocal && self.audio_model;
+        if want != self.audio_toggle {
+            let before = self.audio.stage();
+            self.audio.set_devocal(want);
+            self.audio_toggle = want;
+            self.toggle_settle = Some((before, now_us + TOGGLE_SETTLE_US));
+        }
     }
 
     fn set_model(
@@ -454,8 +525,16 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         path: PathBuf,
         device: &str,
         threads: u16,
+        now_us: u64,
         ev: &mut Vec<Event>,
     ) {
+        if self.exit_requested {
+            ev.push(error(
+                ErrorCode::Protocol,
+                "the engine is shutting down; set_model ignored",
+            ));
+            return;
+        }
         if device != "cpu" {
             ev.push(error(
                 ErrorCode::BadDevice,
@@ -463,23 +542,64 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             ));
             return;
         }
-        match (self.loader)(&path, threads) {
-            Ok(sep) => {
-                if self.audio_live() {
-                    // The audio side fades out, swaps and turns back on if the toggle is on
-                    // (caller obligation 3).
-                    self.audio.set_separator(sep);
-                    self.staged = None;
-                } else {
-                    self.staged = Some(sep);
-                }
-                self.model = Some(ModelSpec { id, path, threads });
+        self.start_load(ModelSpec { id, path, threads }, false);
+        // A loader that finished at once is installed now.
+        self.poll_model(now_us, ev);
+    }
+
+    /// Starts a load; a pending older one is abandoned (its result is dropped on its worker).
+    fn start_load(&mut self, spec: ModelSpec, reload: bool) {
+        let rx = (self.loader)(spec.path.clone(), spec.threads);
+        self.pending_load = Some(PendingLoad { spec, reload, rx });
+    }
+
+    /// Installs or reports a finished load.
+    fn poll_model(&mut self, now_us: u64, ev: &mut Vec<Event>) {
+        let Some(pending) = &self.pending_load else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("the model loader ended without a result".to_string())
             }
-            // A previously loaded model stays in use.
-            Err(e) => ev.push(error(
-                ErrorCode::ModelLoadFailed,
-                format!("loading model {id} from {} failed: {e}", path.display()),
-            )),
+        };
+        let Some(PendingLoad { spec, reload, .. }) = self.pending_load.take() else {
+            return;
+        };
+        match result {
+            Ok(model) => {
+                self.model = Some(spec);
+                if self.audio_live() {
+                    // The audio side fades out, swaps and turns back on if it was on (caller
+                    // obligation 3); a pending user "on" is sent after the swap.
+                    self.audio.set_separator(model);
+                    self.audio_model = true;
+                    self.sync_toggle(now_us);
+                } else if let Some(old) = self.staged.replace(model) {
+                    retire(old);
+                }
+            }
+            Err(e) => {
+                ev.push(error(
+                    ErrorCode::ModelLoadFailed,
+                    format!(
+                        "{} model {} from {} failed: {e}",
+                        if reload { "reloading" } else { "loading" },
+                        spec.id,
+                        spec.path.display()
+                    ),
+                ));
+                if reload {
+                    self.model = None;
+                }
+                // A previously loaded model stays in use; without one a pending "on" is
+                // dropped.
+                if self.model.is_none() {
+                    self.user_devocal = false;
+                }
+            }
         }
     }
 
@@ -554,7 +674,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
     }
 
     fn check_audio(&mut self, now_us: u64, ev: &mut Vec<Event>) {
-        if !self.audio_live() || !matches!(self.phase, Phase::Attaching | Phase::Active) {
+        if !self.audio_live() {
             return;
         }
         let (code, message) = if self.audio.capture_failed() {
@@ -610,7 +730,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         if (due || requested) && self.phase == Phase::Active {
             self.follow(now_us, ev);
         }
-        if due && self.audio_live() && matches!(self.phase, Phase::Attaching | Phase::Active) {
+        if due && self.audio_live() {
             self.follow_endpoint();
         }
     }
@@ -760,7 +880,9 @@ impl AudioPort for RealAudio {
         gains: Arc<SharedGains>,
         processor: Processor,
     ) -> Result<(), String> {
-        self.stop();
+        if let Some(old) = self.stop() {
+            retire(old);
+        }
         self.handle = Some(AudioHandle::start(cfg, gains, processor)?);
         Ok(())
     }
@@ -826,11 +948,93 @@ impl AudioPort for RealAudio {
         }
     }
 
-    fn stop(&mut self) {
-        if let Some(h) = self.handle.take() {
-            h.stop();
+    fn stop(&mut self) -> Option<Box<dyn Separator>> {
+        self.handle.take().and_then(|h| h.stop())
+    }
+}
+
+/// What the main loop saw since the previous pass.
+#[derive(Debug, Default)]
+pub struct LoopInput {
+    /// Command lines received, in order.
+    pub lines: Vec<String>,
+    /// The pipe reached end of stream, or a read or write failed.
+    pub link_closed: bool,
+    /// The app process has exited.
+    pub app_exited: bool,
+}
+
+/// Main-loop state kept between passes.
+#[derive(Debug)]
+pub struct LoopState {
+    link_up: bool,
+    exit_deadline: Option<u64>,
+}
+
+impl Default for LoopState {
+    fn default() -> Self {
+        Self {
+            link_up: true,
+            exit_deadline: None,
         }
     }
+}
+
+impl LoopState {
+    /// Events may still be sent to the app.
+    pub fn link_up(&self) -> bool {
+        self.link_up
+    }
+}
+
+/// One pass of the main loop: the commands, the watchdog (pipe closed or app gone ->
+/// release and exit), the tick, and the exit decision (released and stopped, or 2 s after
+/// the exit request). `clock` is read again for every step. Appends the events to send to
+/// `out`; returns true when the engine should exit.
+pub fn loop_once<S: SessionVolumes, A: AudioPort>(
+    core: &mut EngineCore<S, A>,
+    st: &mut LoopState,
+    input: LoopInput,
+    clock: &mut dyn FnMut() -> u64,
+    out: &mut Vec<Event>,
+) -> bool {
+    for line in &input.lines {
+        out.extend(core.handle_line(line, clock()));
+    }
+    if input.link_closed {
+        st.link_up = false;
+    }
+    if !core.exit_requested() {
+        let why = if !st.link_up {
+            Some("the app pipe closed")
+        } else if input.app_exited {
+            Some("the app process exited")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            eprintln!("devocal engine: {why}; releasing and exiting");
+            out.extend(core.request_exit(clock()));
+        }
+    }
+    out.extend(core.tick(clock()));
+    if core.exit_requested() {
+        let now = clock();
+        let deadline = *st
+            .exit_deadline
+            .get_or_insert(now + EXIT_RELEASE_TIMEOUT_US);
+        if core.exit_ready() {
+            return true;
+        }
+        if now >= deadline {
+            eprintln!(
+                "devocal engine: the release did not finish within 2 s; exiting and leaving \
+                 the restore file for the app"
+            );
+            return true;
+        }
+    }
+    false
 }
 
 /// Command line: `--app-pid <u32> --restore-file <path>`.
@@ -970,62 +1174,40 @@ pub fn run(args: Args) -> i32 {
         return 1;
     }
 
-    let loader: ModelLoader = Box::new(|path: &Path, threads: u16| {
-        StemgenRt::load(path, threads).map(|m| Box::new(m) as Box<dyn Separator>)
-    });
-    let mut core = EngineCore::new(WinSessions, args.restore_file, RealAudio::default(), loader);
-
-    let mut link_up = true;
-    let mut exit_deadline: Option<u64> = None;
+    let mut core = EngineCore::new(
+        WinSessions,
+        args.restore_file,
+        RealAudio::default(),
+        stemgen_loader(),
+    );
+    let mut st = LoopState::default();
+    let mut clock = now_us;
+    let mut reader_done = false;
     loop {
-        let now = now_us();
-        let mut events = Vec::new();
-        while link_up {
+        let mut input = LoopInput::default();
+        while !reader_done {
             match line_rx.try_recv() {
-                Ok(Some(line)) => events.extend(core.handle_line(&line, now)),
-                Ok(None) | Err(mpsc::TryRecvError::Disconnected) => link_up = false,
+                Ok(Some(line)) => input.lines.push(line),
+                Ok(None) | Err(mpsc::TryRecvError::Disconnected) => reader_done = true,
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
-        if write_failed.load(Ordering::Acquire) {
-            link_up = false;
-        }
-        if !core.exit_requested() {
-            let why = if !link_up {
-                Some("the app pipe closed")
-            } else if app.exited() {
-                Some("the app process exited")
-            } else {
-                None
-            };
-            if let Some(why) = why {
-                eprintln!("devocal engine: {why}; releasing and exiting");
-                events.extend(core.request_exit(now));
-            }
-        }
-        events.extend(core.tick(now));
+        input.link_closed = reader_done || write_failed.load(Ordering::Acquire);
+        input.app_exited = app.exited();
+        let mut events = Vec::new();
+        let exit = loop_once(&mut core, &mut st, input, &mut clock, &mut events);
         for e in &events {
             match encode(e) {
                 Ok(line) => {
-                    if link_up {
+                    if st.link_up() {
                         let _ = out_tx.send(line);
                     }
                 }
                 Err(err) => eprintln!("devocal engine: cannot encode {e:?}: {err}"),
             }
         }
-        if core.exit_requested() {
-            let deadline = *exit_deadline.get_or_insert(now + EXIT_RELEASE_TIMEOUT_US);
-            if core.exit_ready() {
-                break;
-            }
-            if now >= deadline {
-                eprintln!(
-                    "devocal engine: the release did not finish within 2 s; exiting and \
-                     leaving the restore file for the app"
-                );
-                break;
-            }
+        if exit {
+            break;
         }
         thread::sleep(Duration::from_micros(TICK_US));
     }
@@ -1042,6 +1224,7 @@ mod tests {
     use devocal_core::protocol::{ErrorCode, PROTOCOL};
     use devocal_core::sessions::{FakeSessions, SessionInfo, HELD_VOLUME};
     use std::cell::{Cell, RefCell};
+    use std::path::Path;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1094,6 +1277,19 @@ mod tests {
         reason: Option<FallbackReason>,
         follow_request: bool,
         stats: AudioSnapshot,
+        /// The gains of the latest start (what the engine publishes).
+        gains: Option<Arc<SharedGains>>,
+        /// The model the running audio holds (from the start or `set_separator`).
+        model: Option<Box<dyn Separator>>,
+        /// Whether each start came with a model.
+        start_had_model: Vec<bool>,
+        /// Ordered `set_separator` / `set_devocal` calls.
+        log: Vec<String>,
+        /// `stop` hands no model back (a thread left detached).
+        lose_model_on_stop: bool,
+        /// `start` advances this clock by `start_delay_us` (a slow audio start).
+        clock: Option<Rc<Cell<u64>>>,
+        start_delay_us: u64,
     }
 
     /// Audio double: records every call; the test sets stage, failures and stats.
@@ -1138,16 +1334,23 @@ mod tests {
         fn start(
             &mut self,
             cfg: AudioConfig,
-            _gains: Arc<SharedGains>,
-            processor: Processor,
+            gains: Arc<SharedGains>,
+            mut processor: Processor,
         ) -> Result<(), String> {
             let mut s = self.0.borrow_mut();
             assert!(!s.running, "start while running");
             assert_eq!(cfg.pid, PID);
             assert_eq!(cfg.hop, processor.hop());
+            if let Some(c) = &s.clock {
+                c.set(c.get() + s.start_delay_us);
+            }
             if let Some(e) = s.start_error.take() {
                 return Err(e);
             }
+            let model = processor.take_separator();
+            s.start_had_model.push(model.is_some());
+            s.model = model;
+            s.gains = Some(gains);
             s.running = true;
             s.starts.push(cfg.output_endpoint);
             s.stage = Some(Stage::Passthrough);
@@ -1158,6 +1361,7 @@ mod tests {
             let mut s = self.0.borrow_mut();
             assert!(s.running, "set_devocal while stopped");
             s.devocal_calls.push(on);
+            s.log.push(format!("devocal:{on}"));
             if !s.lazy_stage {
                 s.stage = Some(if on {
                     Stage::Devocal
@@ -1167,8 +1371,12 @@ mod tests {
                 s.reason = None;
             }
         }
-        fn set_separator(&self, _s: Box<dyn Separator>) {
-            self.0.borrow_mut().separators += 1;
+        fn set_separator(&self, model: Box<dyn Separator>) {
+            let mut s = self.0.borrow_mut();
+            assert!(s.running, "set_separator while stopped");
+            s.separators += 1;
+            s.log.push("separator".into());
+            s.model = Some(model);
         }
         fn rebind_output(&self, endpoint: Option<String>) {
             self.0.borrow_mut().rebinds.push(endpoint);
@@ -1194,7 +1402,7 @@ mod tests {
         fn stats(&self) -> AudioSnapshot {
             self.st().stats
         }
-        fn stop(&mut self) {
+        fn stop(&mut self) -> Option<Box<dyn Separator>> {
             let mut s = self.0.borrow_mut();
             if s.running {
                 s.running = false;
@@ -1203,6 +1411,12 @@ mod tests {
             s.capture_failed = false;
             s.failed = false;
             s.output_failed = false;
+            let model = s.model.take();
+            if s.lose_model_on_stop {
+                None
+            } else {
+                model
+            }
         }
     }
 
@@ -1223,15 +1437,65 @@ mod tests {
         f
     }
 
-    /// Loads a `DelayOnly` for any path except `*bad.onnx`; counts calls.
-    fn loader(calls: Rc<Cell<usize>>) -> ModelLoader {
-        Box::new(move |path: &Path, _threads: u16| {
-            calls.set(calls.get() + 1);
-            if path.to_string_lossy().ends_with("bad.onnx") {
-                Err("cannot load model".into())
+    /// `DelayOnly` that counts `reset` calls.
+    struct TestSep {
+        inner: DelayOnly,
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl Separator for TestSep {
+        fn sample_rate(&self) -> u32 {
+            self.inner.sample_rate()
+        }
+        fn hop(&self) -> usize {
+            self.inner.hop()
+        }
+        fn latency_frames(&self) -> usize {
+            self.inner.latency_frames()
+        }
+        fn process(&mut self, input: &[f32], out: &mut [f32]) -> Result<(), String> {
+            self.inner.process(input, out)
+        }
+        fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+            self.inner.reset();
+        }
+    }
+
+    type LoadSender = mpsc::Sender<Result<Box<dyn Separator>, String>>;
+
+    /// Loads finish at once, or (`manual`) when the test says so.
+    #[derive(Default)]
+    struct FakeLoads {
+        calls: usize,
+        manual: bool,
+        pending: Vec<(PathBuf, LoadSender)>,
+        resets: Arc<AtomicUsize>,
+    }
+
+    /// A `TestSep` for any path except `*bad.onnx`.
+    fn fake_load(path: &Path, resets: &Arc<AtomicUsize>) -> Result<Box<dyn Separator>, String> {
+        if path.to_string_lossy().ends_with("bad.onnx") {
+            Err("cannot load model".into())
+        } else {
+            Ok(Box::new(TestSep {
+                inner: DelayOnly::new(128),
+                resets: resets.clone(),
+            }))
+        }
+    }
+
+    fn loader(loads: Rc<RefCell<FakeLoads>>) -> ModelLoader {
+        Box::new(move |path: PathBuf, _threads: u16| {
+            let (tx, rx) = mpsc::channel();
+            let mut l = loads.borrow_mut();
+            l.calls += 1;
+            if l.manual {
+                l.pending.push((path, tx));
             } else {
-                Ok(Box::new(DelayOnly::new(128)) as Box<dyn Separator>)
+                let _ = tx.send(fake_load(&path, &l.resets));
             }
+            rx
         })
     }
 
@@ -1239,7 +1503,7 @@ mod tests {
 
     struct Rig {
         core: Core,
-        loads: Rc<Cell<usize>>,
+        loads: Rc<RefCell<FakeLoads>>,
         now: u64,
         restore: PathBuf,
         _dir: TempDir,
@@ -1253,7 +1517,7 @@ mod tests {
         }
 
         fn with_path(dir: TempDir, restore: PathBuf) -> Self {
-            let loads = Rc::new(Cell::new(0));
+            let loads = Rc::new(RefCell::new(FakeLoads::default()));
             let core = EngineCore::new(
                 fake_sessions(),
                 restore.clone(),
@@ -1285,6 +1549,25 @@ mod tests {
 
         fn audio(&self) -> &FakeAudio {
             self.core.audio()
+        }
+
+        fn loads(&self) -> usize {
+            self.loads.borrow().calls
+        }
+
+        fn manual_loads(&self) {
+            self.loads.borrow_mut().manual = true;
+        }
+
+        /// Completes manual load `i`; false if the engine had abandoned it.
+        fn finish_load(&self, i: usize) -> bool {
+            let l = self.loads.borrow();
+            let (path, tx) = &l.pending[i];
+            tx.send(fake_load(path, &l.resets)).is_ok()
+        }
+
+        fn resets(&self) -> usize {
+            self.loads.borrow().resets.load(Ordering::Relaxed)
         }
 
         fn volume(&self, id: &str) -> f32 {
@@ -1405,7 +1688,7 @@ mod tests {
         assert_eq!(st.stops, 1);
         assert!(!st.running);
         drop(st);
-        assert_eq!(r.loads.get(), 1);
+        assert_eq!(r.loads(), 1);
         assert!(!r.core.exit_requested());
     }
 
@@ -1414,7 +1697,7 @@ mod tests {
         let mut r = Rig::new("bad-device");
         let ev = r.send(set_model("model.onnx", "dml"));
         assert_eq!(errors(&ev), vec![ErrorCode::BadDevice]);
-        assert_eq!(r.loads.get(), 0, "the model is not loaded");
+        assert_eq!(r.loads(), 0, "the model is not loaded");
         // Still no model.
         let ev = r.send(Command::SetMode { devocal: true });
         assert_eq!(errors(&ev), vec![ErrorCode::NoModel]);
@@ -1800,18 +2083,217 @@ mod tests {
     }
 
     #[test]
-    fn model_is_reloaded_for_the_next_attach() {
-        let (mut r, _) = Rig::attached("reload");
-        assert_eq!(r.loads.get(), 1);
+    fn reattach_reuses_the_returned_separator() {
+        let (mut r, _) = Rig::attached("reuse");
+        assert_eq!(r.loads(), 1);
         r.send(Command::Release);
         r.run(100);
+        assert!(r.resets() >= 1, "the returned model is reset");
         let mut ev = r.send(attach());
         ev.extend(r.run(100));
-        assert_eq!(r.loads.get(), 2);
+        assert_eq!(r.loads(), 1, "no second load");
         assert_eq!(r.core.phase(), Phase::Active);
-        assert_eq!(r.audio().st().starts.len(), 2);
+        assert_eq!(r.audio().st().start_had_model, vec![true, true]);
         let ev = r.send(Command::SetMode { devocal: true });
         assert!(errors(&ev).is_empty());
+        assert_eq!(r.audio().st().devocal_calls, vec![true]);
+    }
+
+    #[test]
+    fn reattach_reloads_in_background_when_nothing_came_back() {
+        let (mut r, _) = Rig::attached("lost-model");
+        r.audio().0.borrow_mut().lose_model_on_stop = true;
+        r.send(Command::Release);
+        r.run(100);
+        r.manual_loads();
+        let mut ev = r.send(attach());
+        ev.extend(r.run(100));
+        assert_eq!(r.loads(), 2, "reloaded in the background");
+        assert_eq!(
+            r.core.phase(),
+            Phase::Active,
+            "the attach does not wait for it"
+        );
+        assert_eq!(r.audio().st().start_had_model, vec![true, false]);
+        let ev = r.send(Command::SetMode { devocal: true });
+        assert!(
+            errors(&ev).is_empty(),
+            "accepted while the reload is pending"
+        );
+        assert!(r.audio().st().log.is_empty());
+        assert!(r.finish_load(0));
+        r.run(1);
+        assert_eq!(r.audio().st().log, vec!["separator", "devocal:true"]);
+    }
+
+    #[test]
+    fn model_load_does_not_block_the_loop() {
+        let mut r = Rig::new("async-load");
+        r.manual_loads();
+        r.send(attach());
+        r.run(100);
+        let ev = r.send(set_model("model.onnx", "cpu"));
+        assert!(errors(&ev).is_empty());
+        assert_eq!(r.loads(), 1);
+        // The player is turned up while the load takes 1.2 s of (fake) time.
+        r.core.sessions().set_volume(SESSION, 0.8).unwrap();
+        let during = r.run(1_200);
+        assert_eq!(r.volume(SESSION), HELD_VOLUME, "follow ran during the load");
+        assert!(!metrics(&during).is_empty(), "metrics kept coming");
+        assert_eq!(r.audio().st().separators, 0);
+        assert!(r.finish_load(0));
+        let ev = r.run(1);
+        assert!(errors(&ev).is_empty());
+        assert_eq!(r.audio().st().separators, 1);
+    }
+
+    #[test]
+    fn set_mode_during_pending_load_is_applied_after_load() {
+        let mut r = Rig::new("pending-on");
+        r.manual_loads();
+        let mut ev = r.send(attach());
+        ev.extend(r.run(100));
+        ev.extend(r.send(set_model("model.onnx", "cpu")));
+        let on = r.send(Command::SetMode { devocal: true });
+        assert!(errors(&on).is_empty(), "{on:?}");
+        ev.extend(on);
+        ev.extend(r.run(300));
+        assert!(
+            r.audio().st().log.is_empty(),
+            "nothing sent before the model"
+        );
+        assert!(r.finish_load(0));
+        ev.extend(r.run(10));
+        assert_eq!(r.audio().st().log, vec!["separator", "devocal:true"]);
+        // Devocal (pending) from the request on.
+        assert_eq!(states(&ev), vec![ATTACHING, ACTIVE_PASS, ACTIVE_DEVOCAL]);
+
+        // A failed load drops the pending "on".
+        let mut r = Rig::new("pending-on-fail");
+        r.manual_loads();
+        r.send(attach());
+        r.run(100);
+        r.send(set_model("bad.onnx", "cpu"));
+        r.send(Command::SetMode { devocal: true });
+        assert!(r.finish_load(0));
+        let ev = r.run(10);
+        assert_eq!(errors(&ev), vec![ErrorCode::ModelLoadFailed]);
+        assert_eq!(states(&ev), vec![ACTIVE_PASS]);
+        assert!(r.audio().st().log.is_empty());
+        let ev = r.send(Command::SetMode { devocal: true });
+        assert_eq!(errors(&ev), vec![ErrorCode::NoModel]);
+    }
+
+    #[test]
+    fn newer_set_model_supersedes_a_pending_load() {
+        let mut r = Rig::new("supersede");
+        r.manual_loads();
+        r.send(attach());
+        r.run(100);
+        r.send(set_model("old.onnx", "cpu"));
+        r.send(set_model("new.onnx", "cpu"));
+        assert!(!r.finish_load(0), "the older load was abandoned");
+        r.run(5);
+        assert_eq!(r.audio().st().separators, 0);
+        assert!(r.finish_load(1));
+        r.run(1);
+        assert_eq!(r.audio().st().separators, 1);
+    }
+
+    #[test]
+    fn commands_after_exit_request_are_rejected() {
+        let (mut r, _) = Rig::attached("after-exit");
+        r.send(Command::Shutdown);
+        let ev = r.send(set_model("model.onnx", "cpu"));
+        assert_eq!(errors(&ev), vec![ErrorCode::Protocol]);
+        assert_eq!(r.loads(), 1);
+        let ev = r.send(Command::SetMode { devocal: true });
+        assert_eq!(errors(&ev), vec![ErrorCode::Protocol]);
+        assert!(r.audio().st().devocal_calls.is_empty());
+    }
+
+    #[test]
+    fn attach_ramp_survives_a_slow_handshake() {
+        let mut r = Rig::new("slow-handshake");
+        let clock = Rc::new(Cell::new(T0));
+        {
+            let mut s = r.audio().0.borrow_mut();
+            s.clock = Some(clock.clone());
+            s.start_delay_us = 500 * MS; // the audio start blocks for 500 ms
+        }
+        // Every volume write with the (real) time it happened.
+        let writes: Rc<RefCell<Vec<(u64, f32)>>> = Rc::default();
+        {
+            let (w, c) = (writes.clone(), clock.clone());
+            r.core
+                .sessions()
+                .on_set_volume(Box::new(move |_, v| w.borrow_mut().push((c.get(), v))));
+        }
+        let original = 0.8_f32;
+        // Highest volume in effect during [from, to]: the loopback still carries audio made
+        // at these volumes.
+        let max_volume = |from: u64, to: u64| -> f32 {
+            let w = writes.borrow();
+            let at_from = w
+                .iter()
+                .rev()
+                .find(|(t, _)| *t <= from)
+                .map_or(original, |&(_, v)| v);
+            w.iter()
+                .filter(|(t, _)| *t > from && *t <= to)
+                .map(|&(_, v)| v)
+                .fold(at_from, f32::max)
+        };
+        let handshake = [
+            Command::Hello { version: PROTOCOL },
+            set_model("model.onnx", "cpu"),
+            attach(),
+        ];
+        let mut st = LoopState::default();
+        let mut out = Vec::new();
+        let mut attach_start = None;
+        for pass in 0..140 {
+            let input = LoopInput {
+                lines: if pass == 0 {
+                    handshake.iter().map(|c| encode(c).unwrap()).collect()
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            let c = clock.clone();
+            assert!(!loop_once(
+                &mut r.core,
+                &mut st,
+                input,
+                &mut move || c.get(),
+                &mut out
+            ));
+            let now = clock.get();
+            if pass == 0 {
+                attach_start = Some(now);
+            }
+            if let Some(g) = r.audio().st().gains.as_ref() {
+                let gain = g.capture_gain();
+                let loudest = max_volume(now.saturating_sub(20 * MS), now);
+                assert!(
+                    gain * loudest <= original * 1.001,
+                    "pass {pass}: gain {gain} with volume {loudest} in the last 20 ms"
+                );
+            }
+            clock.set(now + MS);
+        }
+        let t1 = attach_start.unwrap();
+        assert!(t1 >= T0 + 500 * MS);
+        let times: Vec<u64> = writes.borrow().iter().map(|w| w.0).collect();
+        assert_eq!(
+            times,
+            vec![t1, t1 + 10 * MS, t1 + 20 * MS, t1 + 30 * MS],
+            "four ramp steps 10 ms apart"
+        );
+        assert_eq!(r.volume(SESSION), HELD_VOLUME);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert!(errors(&out).is_empty(), "{out:?}");
     }
 
     #[test]
@@ -1916,7 +2398,7 @@ mod tests {
         r.run(100);
         r.send(attach());
         r.run(100);
-        assert_eq!(r.loads.get(), 2, "the staged model is used, not reloaded");
+        assert_eq!(r.loads(), 2, "the staged model is used, not reloaded");
         assert_eq!(r.audio().st().devocal_calls, vec![true]);
     }
 }

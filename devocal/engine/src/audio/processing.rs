@@ -90,7 +90,9 @@ struct State {
     last_block_us: u64,
 }
 
-pub(crate) fn run(mut ctx: ProcessingCtx) {
+/// Runs until the stop flag; returns the model (the newest one handed over: a pending swap
+/// wins over the installed model) so the engine can reuse it for the next run.
+pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
     let _mmcss = Mmcss::pro_audio("processing");
     let hop = ctx.processor.hop();
     let mut st = State {
@@ -208,6 +210,16 @@ pub(crate) fn run(mut ctx: ProcessingCtx) {
             let _ = ctx.out_markers.push(st.out_pos);
             st.fade_in.start(0);
         }
+    }
+    let installed = ctx.processor.take_separator();
+    match st.pending.take() {
+        Some(newest) => {
+            if let Some(old) = installed {
+                retire(old);
+            }
+            Some(newest)
+        }
+        None => installed,
     }
 }
 
@@ -423,5 +435,65 @@ mod tests {
             false,
             true
         ));
+    }
+
+    /// Runs the processing thread without devices (rings only) and stops it.
+    fn run_and_stop(
+        processor: Processor,
+        commands: Vec<ProcCommand>,
+    ) -> Option<Box<dyn Separator>> {
+        use super::super::OwnedEvent;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (_in_tx, in_rx) = rtrb::RingBuffer::<f32>::new(HOP * 2 * 4);
+        let (_mk_tx, mk_rx) = rtrb::RingBuffer::<InputMarker>::new(8);
+        let (out_tx, _out_rx) = rtrb::RingBuffer::<f32>::new(HOP * 2 * 4);
+        let (omk_tx, _omk_rx) = rtrb::RingBuffer::<u64>::new(8);
+        let (mut ctl_tx, ctl_rx) = rtrb::RingBuffer::<ProcCommand>::new(8);
+        let shared = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            start_us: now_us(),
+            last_input_us: AtomicU64::new(0),
+            capture_packet_frames: AtomicU32::new(0),
+            in_ring_frames: AtomicU32::new(0),
+            proc_latency_frames: AtomicU32::new(0),
+            proc_hop: AtomicU32::new(0),
+            output_failed: AtomicBool::new(false),
+            preroll_request: AtomicBool::new(false),
+            underrun_snapshot: AtomicU64::new(0),
+            wake: OwnedEvent::new().unwrap(),
+        });
+        let ctx = ProcessingCtx {
+            processor,
+            input: in_rx,
+            in_markers: mk_rx,
+            output: out_tx,
+            out_markers: omk_tx,
+            control: ctl_rx,
+            shared: shared.clone(),
+            stats: Arc::new(AudioStats::default()),
+        };
+        let thread = std::thread::spawn(move || run(ctx));
+        for c in commands {
+            assert!(ctl_tx.push(c).is_ok());
+        }
+        shared.wake.set();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        shared.stop.store(true, Ordering::Release);
+        shared.wake.set();
+        thread.join().unwrap()
+    }
+
+    #[test]
+    fn processing_thread_hands_its_model_back_at_stop() {
+        use crate::separator::DelayOnly;
+        let back = run_and_stop(Processor::new(Some(Box::new(DelayOnly::new(256)))), vec![]);
+        assert_eq!(back.map(|m| m.latency_frames()), Some(256));
+        assert!(run_and_stop(Processor::new(None), vec![]).is_none());
+        // The newest model handed over is the one returned.
+        let back = run_and_stop(
+            Processor::new(Some(Box::new(DelayOnly::new(256)))),
+            vec![ProcCommand::SetSeparator(Box::new(DelayOnly::new(512)))],
+        );
+        assert_eq!(back.map(|m| m.latency_frames()), Some(512));
     }
 }

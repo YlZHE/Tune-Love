@@ -113,6 +113,16 @@ impl Processor {
         old
     }
 
+    /// Removes the model so it can be reused (e.g. after the processing thread ends); the
+    /// processor is the no-model delay again.
+    pub fn take_separator(&mut self) -> Option<Box<dyn Separator>> {
+        let s = self.separator.take();
+        if s.is_some() {
+            self.configure(NO_MODEL_HOP, NO_MODEL_LATENCY_FRAMES);
+        }
+        s
+    }
+
     fn configure(&mut self, hop: usize, latency_frames: usize) {
         self.hop = hop.max(1);
         self.latency_frames = latency_frames;
@@ -1005,5 +1015,18 @@ mod tests {
         p.on_discontinuity();
         p.process_block(&input, &mut out);
         assert_eq!(alloc_count::this_thread() - before, 0);
+    }
+
+    #[test]
+    fn take_separator_returns_the_model_and_leaves_a_plain_delay() {
+        let mut p = Processor::new(Some(Box::new(DelayOnly::new(256))));
+        assert_eq!(p.latency_frames(), 256);
+        p.request_devocal(true);
+        let model = p.take_separator();
+        assert_eq!(model.map(|m| m.latency_frames()), Some(256));
+        assert_eq!(p.stage(), Stage::Passthrough);
+        assert_eq!(p.latency_frames(), NO_MODEL_LATENCY_FRAMES);
+        assert_eq!(p.hop(), NO_MODEL_HOP);
+        assert!(p.take_separator().is_none());
     }
 }

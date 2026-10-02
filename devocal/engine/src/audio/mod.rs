@@ -449,7 +449,10 @@ impl AudioHandle {
         handle.spawn(
             "devocal-capture",
             |s| &s.capture_failed,
-            move || capture::run(ctx, ready_tx),
+            move || {
+                capture::run(ctx, ready_tx);
+                None
+            },
         )?;
         handle.await_ready("capture", &ready_rx)?;
 
@@ -466,7 +469,10 @@ impl AudioHandle {
         handle.spawn(
             "devocal-render",
             |s| &s.render_failed,
-            move || render::run(ctx, ready_tx),
+            move || {
+                render::run(ctx, ready_tx);
+                None
+            },
         )?;
         handle.await_ready("render", &ready_rx)?;
         Ok(handle)
@@ -529,9 +535,11 @@ impl AudioHandle {
         self.follow_now.swap(false, Ordering::AcqRel)
     }
 
-    /// Stops and joins the three threads (bounded by [`STOP_TIMEOUT_MS`]).
-    pub fn stop(mut self) {
-        self.shutdown();
+    /// Stops and joins the three threads (bounded by [`STOP_TIMEOUT_MS`]) and returns the
+    /// model the processing thread held, for reuse. `None` if there was none, or if the
+    /// processing thread did not stop in time (left detached) or panicked.
+    pub fn stop(mut self) -> Option<Box<dyn Separator>> {
+        self.shutdown()
     }
 
     fn send_proc(&self, cmd: ProcCommand) {
@@ -545,12 +553,12 @@ impl AudioHandle {
     }
 
     /// Spawns an audio thread; `failed` selects the stats flag set if the thread ends
-    /// without a stop request (or panics).
+    /// without a stop request (or panics). The processing thread returns its model.
     fn spawn(
         &mut self,
         name: &'static str,
         failed: fn(&AudioStats) -> &AtomicBool,
-        f: impl FnOnce() + Send + 'static,
+        f: impl FnOnce() -> Option<Box<dyn Separator>> + Send + 'static,
     ) -> Result<(), String> {
         let exited = Arc::new(AtomicBool::new(false));
         let flag = ExitFlag {
@@ -598,9 +606,10 @@ impl AudioHandle {
         Ok(())
     }
 
-    fn shutdown(&mut self) {
+    /// Stops the threads; returns the model a joined thread handed back.
+    fn shutdown(&mut self) -> Option<Box<dyn Separator>> {
         if self.workers.is_empty() {
-            return;
+            return None;
         }
         self.shared.stop.store(true, Ordering::Release);
         self.shared.wake.set();
@@ -613,13 +622,15 @@ impl AudioHandle {
         {
             thread::sleep(Duration::from_millis(2));
         }
+        let mut model = None;
         for mut w in self.workers.drain(..) {
             let Some(handle) = w.handle.take() else {
                 continue;
             };
             if w.exited.load(Ordering::Acquire) {
-                if handle.join().is_err() {
-                    eprintln!("devocal audio: {} thread panicked", w.name);
+                match handle.join() {
+                    Ok(m) => model = model.or(m),
+                    Err(_) => eprintln!("devocal audio: {} thread panicked", w.name),
                 }
             } else {
                 // Stuck in a driver call (e.g. loopback activation never completing):
@@ -630,6 +641,7 @@ impl AudioHandle {
                 );
             }
         }
+        model
     }
 }
 
@@ -641,7 +653,7 @@ impl Drop for AudioHandle {
 
 struct Worker {
     name: &'static str,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Option<Box<dyn Separator>>>>,
     exited: Arc<AtomicBool>,
 }
 

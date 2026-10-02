@@ -37,6 +37,7 @@ jobs:
           "version=$out" >> $env:GITHUB_OUTPUT
 
   ci:
+    needs: version
     uses: ./.github/workflows/ci.yml
 
   package:
@@ -84,14 +85,16 @@ jobs:
 
       - name: Checksums
         run: |
-          $installer = Join-Path 'src-tauri/target/release/bundle/nsis' "Tune Love_${env:VERSION}_x64-setup.exe"
-          if (-not (Test-Path -LiteralPath $installer)) { throw "installer not found: $installer" }
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLowerInvariant()
-          $name = Split-Path -Leaf $installer
+          $built = Join-Path 'src-tauri/target/release/bundle/nsis' "Tune Love_${env:VERSION}_x64-setup.exe"
+          if (-not (Test-Path -LiteralPath $built)) { throw "installer not found: $built" }
+          # GitHub renames release assets containing spaces, so publish under a space-free name.
+          $name = "Tune-Love_${env:VERSION}_x64-setup.exe"
+          Copy-Item -LiteralPath $built -Destination $name
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $name).Hash.ToLowerInvariant()
           # sha256sum format, binary mode: "<hash> *<file name>"
           [System.IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS.txt'), "$hash *$name`n")
           Get-Content SHA256SUMS.txt
-          "INSTALLER=$installer" >> $env:GITHUB_ENV
+          "INSTALLER=$name" >> $env:GITHUB_ENV
 
       - name: Create draft release
         run: |

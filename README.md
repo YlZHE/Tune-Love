@@ -95,7 +95,7 @@ PCM 为 48 kHz、双声道 f32，后台只保留最近最多 8 秒的内存缓�
 
 ## 下载与安装
 
-安装包发布在 [GitHub Releases](https://github.com/YlZHE/Tune-Love/releases)（仅 Windows x64），下载 `Tune Love_<版本>_x64-setup.exe` 运行即可，默认装到 `%LOCALAPPDATA%\Tune Love\`，无需管理员权限；同页的 `SHA256SUMS.txt` 可用来核对文件。
+安装包发布在 [GitHub Releases](https://github.com/YlZHE/Tune-Love/releases)（仅 Windows x64），下载 `Tune-Love_<版本>_x64-setup.exe` 运行即可，默认装到 `%LOCALAPPDATA%\Tune Love\`，无需管理员权限；同页的 `SHA256SUMS.txt` 可用来核对文件。
 
 - 安装包**未签名**：SmartScreen 提示时点“更多信息 → 仍要运行”。
 - Auto-Tune 控制会向宿主进程注入 agent 并挂钩插件，**可能被杀毒软件误报**；agent 源码在 `reference/`，可自行审阅编译。

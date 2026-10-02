@@ -31,9 +31,9 @@ use windows::Win32::System::Com::CLSCTX_ALL;
 
 use super::endpoint::{find_render_device, low_latency_eligible, read_mix_format, CoTaskFormat};
 use super::{
-    count_underrun, edge_fade_frames, is_backlogged, now_us, stage_from_code, stage_runs_model,
-    AudioStats, ComGuard, FadeIn, Mmcss, OwnedEvent, RenderCommand, Shared, SharedGains,
-    Starvation, INPUT_FLOWING_US, MAX_EXTRA_HEADROOM_FRAMES, PREROLL_FRAMES,
+    count_underrun, edge_fade_frames, is_backlogged, now_us, pack_starvation, stage_from_code,
+    stage_runs_model, AudioStats, ComGuard, FadeIn, Mmcss, OwnedEvent, RenderCommand, Shared,
+    SharedGains, Starvation, INPUT_FLOWING_US, MAX_EXTRA_HEADROOM_FRAMES, PREROLL_FRAMES,
 };
 use crate::dsp::{fade_edges, frames_for_ms, SAMPLE_RATE};
 
@@ -145,6 +145,36 @@ impl UnderrunJudge {
 /// frames of extra headroom in total.
 pub fn grow_headroom(extra: usize, hop: usize, cap: usize) -> usize {
     (extra + hop).min(cap)
+}
+
+/// Pre-roll size for an accepted "on" (0 = none). Never stacks: nothing while a pre-roll is
+/// still being written, nothing when the queue (ring B + device) already holds target + hop,
+/// and never more than the headroom left below `cap`: the pre-roll is counted inside the
+/// headroom (`extra`), so the target rises with it and the standing latency stays within
+/// period + hop + `cap`.
+pub fn preroll_frames(
+    active: bool,
+    queued: usize,
+    target: usize,
+    hop: usize,
+    extra: usize,
+    cap: usize,
+) -> usize {
+    if active || queued >= target + hop {
+        return 0;
+    }
+    PREROLL_FRAMES.min(cap.saturating_sub(extra))
+}
+
+/// Ramps from the last output frame to silence across `out` (interleaved stereo; the last
+/// frame is 0), so silence that starts with no real frames to fade does not step.
+pub(crate) fn decay_from(last: [f32; 2], out: &mut [f32]) {
+    let frames = out.len() / 2;
+    for (i, f) in out.chunks_exact_mut(2).enumerate() {
+        let g = 1.0 - (i + 1) as f32 / frames as f32;
+        f[0] = last[0] * g;
+        f[1] = last[1] * g;
+    }
 }
 
 /// Fades out the frames before each gap marker (a ring B position where the output jumps to
@@ -527,6 +557,8 @@ struct Renderer {
     /// Pre-roll silence still to write, and whether its leading fade-out is still to do.
     preroll_left: usize,
     preroll_fade: bool,
+    /// Last frame written (before the output gain), for `decay_from`.
+    last_frame: [f32; 2],
     last_gain: f32,
 }
 
@@ -548,6 +580,7 @@ impl Renderer {
             extra: 0,
             preroll_left: 0,
             preroll_fade: false,
+            last_frame: [0.0; 2],
             last_gain: 0.0,
         }
     }
@@ -621,6 +654,7 @@ impl Renderer {
         self.ctx.stats.headroom_frames.store(0, Ordering::Relaxed);
         self.preroll_left = 0;
         self.preroll_fade = false;
+        self.last_frame = [0.0; 2];
         self.ctx
             .shared
             .preroll_request
@@ -688,11 +722,10 @@ impl Renderer {
         let last_input = self.ctx.shared.last_input_us.load(Ordering::Acquire);
         if let Some(seen) = self.underruns.poll(last_input, now) {
             // Snapshot first, then the count (the processing thread reads them in that order).
-            let sh = &self.ctx.shared;
-            sh.underrun_ran_model
-                .store(seen.ran_model, Ordering::Release);
-            sh.underrun_backlog_frames
-                .store(seen.backlog_frames as u32, Ordering::Release);
+            self.ctx
+                .shared
+                .underrun_snapshot
+                .store(pack_starvation(seen), Ordering::Release);
             self.ctx.stats.underruns.fetch_add(1, Ordering::AcqRel);
             if !is_backlogged(seen.ran_model, seen.backlog_frames, hop) {
                 // Jitter, not a slow model: more headroom instead of a fallback.
@@ -703,10 +736,37 @@ impl Renderer {
                     .store(self.extra as u32, Ordering::Relaxed);
             }
         }
+        let mut avail = self.ctx.input.slots() / 2;
+        // Pre-roll request from an accepted "on": always consumed (never latched), sized by
+        // `preroll_frames` and added to the headroom, so the target includes it.
+        if self
+            .ctx
+            .shared
+            .preroll_request
+            .swap(false, Ordering::AcqRel)
+        {
+            let base = (period + hop + self.extra).min(buffer);
+            let n = preroll_frames(
+                self.preroll_left > 0,
+                avail + padding,
+                base,
+                hop,
+                self.extra,
+                MAX_EXTRA_HEADROOM_FRAMES,
+            );
+            if n > 0 {
+                self.preroll_left = n;
+                self.preroll_fade = true;
+                self.extra += n;
+                self.ctx
+                    .stats
+                    .headroom_frames
+                    .store(self.extra as u32, Ordering::Relaxed);
+            }
+        }
         let target = (period + hop + self.extra).min(buffer);
         self.trim.set_target(target);
 
-        let mut avail = self.ctx.input.slots() / 2;
         if let Some(d) = self.trim.observe(avail + padding, now) {
             self.drop_pending = d;
         }
@@ -717,16 +777,6 @@ impl Renderer {
             return Ok(padding);
         }
 
-        if self.preroll_left == 0
-            && self
-                .ctx
-                .shared
-                .preroll_request
-                .swap(false, Ordering::AcqRel)
-        {
-            self.preroll_left = PREROLL_FRAMES;
-            self.preroll_fade = true;
-        }
         if self.preroll_left > 0 {
             // Pre-roll: fade out, then silence while input keeps filling ring B.
             let mut w = 0;
@@ -738,6 +788,10 @@ impl Renderer {
                 w = k;
             }
             self.staging[w * 2..need * 2].fill(0.0);
+            if w == 0 {
+                let f = self.fade_frames.min(need);
+                decay_from(self.last_frame, &mut self.staging[..f * 2]);
+            }
             self.preroll_left = self.preroll_left.saturating_sub(need - w);
             if self.preroll_left == 0 {
                 self.fade_in.start(0);
@@ -769,6 +823,10 @@ impl Renderer {
             let k = w.min(self.fade_frames);
             fade_edges(&mut self.staging[(w - k) * 2..w * 2], false, true, k);
             self.staging[w * 2..need * 2].fill(0.0);
+            if w == 0 {
+                let f = self.fade_frames.min(need);
+                decay_from(self.last_frame, &mut self.staging[..f * 2]);
+            }
             if self.primed {
                 let seen = Starvation {
                     ran_model: stage_runs_model(stage_from_code(
@@ -789,6 +847,9 @@ impl Renderer {
 
     /// Output gain ramp, clamp, and write of `staging[..w]`; returns the new padding.
     fn write_out(&mut self, w: usize, padding: usize) -> Result<usize, String> {
+        if w > 0 {
+            self.last_frame = [self.staging[(w - 1) * 2], self.staging[(w - 1) * 2 + 1]];
+        }
         let gain = self.ctx.gains.output_gain();
         finish_block(&mut self.staging[..w * 2], self.last_gain, gain);
         self.last_gain = gain;
@@ -891,10 +952,64 @@ mod tests {
             steps.push(extra);
         }
         assert_eq!(steps, vec![128, 256, 384, 441, 441, 441]);
-        // Budget: 10 ms packet + 1 hop in ring A + 128 model + (441 period + 128 hop + 441)
-        // stays under 50 ms at 44.1 kHz.
-        let worst = 441 + 128 + 128 + 441 + 128 + cap;
-        assert!(worst * 1000 / 44_100 < 50, "{worst} frames");
+    }
+
+    /// Worst-case standing latency with jitter headroom and pre-roll both at their limit:
+    /// 10 ms capture packet + 1 hop in ring A + 128 model latency + (441 period + 128 hop +
+    /// extra), where extra (jitter growth and every pre-roll together) is capped at 441.
+    #[test]
+    fn standing_latency_with_preroll_stays_within_budget() {
+        let (packet, hop, model, period) = (441, 128, 128, 441);
+        let cap = MAX_EXTRA_HEADROOM_FRAMES;
+        // Grow the headroom by jitter, then accept "on" several times: extra never passes cap.
+        let mut extra = 0;
+        for _ in 0..2 {
+            extra = grow_headroom(extra, hop, cap);
+        }
+        for _ in 0..5 {
+            let base = period + hop + extra;
+            let n = preroll_frames(false, base, base, hop, extra, cap);
+            extra += n;
+            assert!(extra <= cap, "{extra}");
+        }
+        assert_eq!(extra, cap);
+        let worst = packet + hop + model + period + hop + extra;
+        assert!(
+            worst <= crate::audio::LATENCY_BUDGET_FRAMES,
+            "{worst} frames = {} ms",
+            worst * 1000 / 44_100
+        );
+    }
+
+    #[test]
+    fn preroll_never_stacks() {
+        let (target, hop, cap) = (569, 128, MAX_EXTRA_HEADROOM_FRAMES);
+        // First accepted "on": a full packet of pre-roll.
+        assert_eq!(
+            preroll_frames(false, target, target, hop, 0, cap),
+            PREROLL_FRAMES
+        );
+        // A second "on" while that pre-roll is still being written adds nothing.
+        assert_eq!(preroll_frames(true, target, target, hop, 0, cap), 0);
+        // A later "on" while the queue still holds the first pre-roll adds nothing.
+        assert_eq!(
+            preroll_frames(false, target + PREROLL_FRAMES, target, hop, 0, cap),
+            0
+        );
+        assert_eq!(preroll_frames(false, target + hop, target, hop, 0, cap), 0);
+        // Headroom already used up: nothing; partly used: only the rest.
+        assert_eq!(preroll_frames(false, target, target, hop, cap, cap), 0);
+        assert_eq!(
+            preroll_frames(false, target, target, hop, 300, cap),
+            cap - 300
+        );
+    }
+
+    #[test]
+    fn decay_ramps_from_last_frame_to_zero() {
+        let mut out = vec![9.0f32; 4 * 2];
+        decay_from([0.8, -0.4], &mut out);
+        assert_eq!(out, vec![0.6, -0.3, 0.4, -0.2, 0.2, -0.1, 0.0, 0.0]);
     }
 
     #[test]

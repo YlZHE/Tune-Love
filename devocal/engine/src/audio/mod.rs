@@ -174,18 +174,42 @@ pub struct Starvation {
     pub backlog_frames: usize,
 }
 
+const SNAPSHOT_MODEL_BIT: u64 = 1 << 63;
+
+/// Packs a [`Starvation`] into one word (bit 63 = model ran, low bits = backlog frames) so
+/// the render thread publishes it atomically, without a torn pair across two underruns.
+pub fn pack_starvation(s: Starvation) -> u64 {
+    let backlog = (s.backlog_frames as u64).min(SNAPSHOT_MODEL_BIT - 1);
+    if s.ran_model {
+        backlog | SNAPSHOT_MODEL_BIT
+    } else {
+        backlog
+    }
+}
+
+/// Inverse of [`pack_starvation`].
+pub fn unpack_starvation(word: u64) -> Starvation {
+    Starvation {
+        ran_model: word & SNAPSHOT_MODEL_BIT != 0,
+        backlog_frames: (word & !SNAPSHOT_MODEL_BIT) as usize,
+    }
+}
+
 /// Ruling 18: the processing thread is behind when the model runs and ring A holds at least
 /// one hop of unprocessed input at the moment the output starves.
 pub fn is_backlogged(ran_model: bool, backlog_frames: usize, hop: usize) -> bool {
     ran_model && backlog_frames >= hop
 }
 
-/// Extra render headroom never exceeds about one capture packet (10 ms), which keeps
-/// capture packet + ring A + model latency + (period + hop + headroom) inside the 50 ms
-/// devocal budget for engine periods up to 10 ms.
+/// Extra render headroom (jitter growth and pre-roll together) never exceeds about one
+/// capture packet (10 ms), which keeps capture packet + ring A + model latency + (period +
+/// hop + headroom) inside the 50 ms devocal budget for engine periods up to 10 ms.
 pub const MAX_EXTRA_HEADROOM_FRAMES: usize = 441;
-/// One-time render pre-roll when a user "on" is accepted (about one capture packet).
+/// One-time render pre-roll when a user "on" is accepted (about one capture packet), counted
+/// inside the headroom.
 pub const PREROLL_FRAMES: usize = 441;
+/// Devocal latency budget (50 ms at 44.1 kHz).
+pub const LATENCY_BUDGET_FRAMES: usize = 2_205;
 
 /// Gains as `f32` bit patterns; published by the engine loop from the Holder every 1 ms.
 #[derive(Debug)]
@@ -318,10 +342,9 @@ pub(crate) struct Shared {
     pub output_failed: AtomicBool,
     /// Set by processing when it accepts a user "on"; render takes it and pre-rolls once.
     pub preroll_request: AtomicBool,
-    /// Snapshot taken when the output starved (published with each counted underrun, before
-    /// `AudioStats::underruns` is incremented): did the model run, and ring A's backlog.
-    pub underrun_ran_model: AtomicBool,
-    pub underrun_backlog_frames: AtomicU32,
+    /// Snapshot taken when the output starved ([`pack_starvation`]), published with each
+    /// counted underrun before `AudioStats::underruns` is incremented.
+    pub underrun_snapshot: AtomicU64,
     /// Wakes the processing thread (capture pushed data, control message, stop).
     pub wake: OwnedEvent,
 }
@@ -377,8 +400,7 @@ impl AudioHandle {
             proc_hop: AtomicU32::new(processor.hop() as u32),
             output_failed: AtomicBool::new(false),
             preroll_request: AtomicBool::new(false),
-            underrun_ran_model: AtomicBool::new(false),
-            underrun_backlog_frames: AtomicU32::new(0),
+            underrun_snapshot: AtomicU64::new(0),
             wake: OwnedEvent::new()?,
         });
 
@@ -871,6 +893,27 @@ mod tests {
         assert_eq!(reason_from_code(9), None);
         assert!(stage_runs_model(Stage::WarmingUp) && stage_runs_model(Stage::FadingOut));
         assert!(!stage_runs_model(Stage::Passthrough) && !stage_runs_model(Stage::Fallback));
+    }
+
+    #[test]
+    fn starvation_snapshot_packs_into_one_word() {
+        for s in [
+            Starvation {
+                ran_model: true,
+                backlog_frames: 0,
+            },
+            Starvation {
+                ran_model: false,
+                backlog_frames: 44_100,
+            },
+            Starvation {
+                ran_model: true,
+                backlog_frames: 300,
+            },
+        ] {
+            assert_eq!(unpack_starvation(pack_starvation(s)), s);
+        }
+        assert!(!unpack_starvation(0).ran_model);
     }
 
     #[test]

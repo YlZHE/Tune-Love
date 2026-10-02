@@ -6,15 +6,15 @@
 //! frames pushed to ring B. Input frame `x` of a block leaves the processor `latency` frames
 //! later, at output frame `x + (out_pos - in_pos) + latency`.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use devocal_core::protocol::FallbackReason;
 use rtrb::{Consumer, Producer};
 
 use super::{
-    edge_fade_frames, is_backlogged, now_us, reason_code, stage_code, AudioStats, FadeIn,
-    InputMarker, Mmcss, ProcCommand, Shared, Starvation,
+    edge_fade_frames, is_backlogged, now_us, reason_code, stage_code, unpack_starvation,
+    AudioStats, FadeIn, InputMarker, Mmcss, ProcCommand, Shared, Starvation,
 };
 use crate::dsp::SAMPLE_RATE;
 use crate::load::LoadMonitor;
@@ -54,6 +54,17 @@ pub fn should_force_fallback(
         return false;
     }
     overloaded || underrun.is_some_and(|u| is_backlogged(u.ran_model, u.backlog_frames, hop))
+}
+
+/// Pops one block from ring A into `block` and publishes the input still waiting behind it.
+/// The published backlog therefore never includes the block about to be processed, so a
+/// starvation during `process_block` sees only genuinely unprocessed input (ruling 18).
+pub(crate) fn pop_block(input: &mut Consumer<f32>, block: &mut [f32], backlog: &AtomicU32) -> bool {
+    if input.pop_entire_slice(block).is_err() {
+        return false;
+    }
+    backlog.store((input.slots() / 2) as u32, Ordering::Release);
+    true
 }
 
 fn block_us(hop: usize) -> f64 {
@@ -149,7 +160,7 @@ pub(crate) fn run(mut ctx: ProcessingCtx) {
                 }
             }
         }
-        if ctx.input.pop_entire_slice(&mut st.in_block).is_err() {
+        if !pop_block(&mut ctx.input, &mut st.in_block, &ctx.shared.in_ring_frames) {
             continue;
         }
         st.in_pos += st.hop as u64;
@@ -169,10 +180,8 @@ pub(crate) fn run(mut ctx: ProcessingCtx) {
         }
         // The render thread publishes the starvation snapshot before incrementing the count.
         let underruns = ctx.stats.underruns.load(Ordering::Acquire);
-        let underrun = (underruns > st.underrun_base).then(|| Starvation {
-            ran_model: ctx.shared.underrun_ran_model.load(Ordering::Acquire),
-            backlog_frames: ctx.shared.underrun_backlog_frames.load(Ordering::Acquire) as usize,
-        });
+        let underrun = (underruns > st.underrun_base)
+            .then(|| unpack_starvation(ctx.shared.underrun_snapshot.load(Ordering::Acquire)));
         let overloaded = report.ran_model && st.load.overloaded();
         if should_force_fallback(underrun, st.hop, st.user_on, report.ran_model, overloaded) {
             ctx.processor.force_fallback(FallbackReason::Overload);
@@ -314,6 +323,30 @@ mod tests {
             ran_model,
             backlog_frames,
         })
+    }
+
+    #[test]
+    fn backlog_excludes_the_block_being_processed() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::<f32>::new(HOP * 2 * 8);
+        let backlog = AtomicU32::new(u32::MAX);
+        let mut block = vec![0.0f32; HOP * 2];
+        // Exactly one block waiting: once it is taken for processing, nothing is behind.
+        tx.push_entire_slice(&[0.5f32; HOP * 2]).unwrap();
+        assert!(pop_block(&mut rx, &mut block, &backlog));
+        assert_eq!(backlog.load(Ordering::Acquire), 0);
+        assert!(!is_backlogged(
+            true,
+            backlog.load(Ordering::Acquire) as usize,
+            HOP
+        ));
+        // Three blocks waiting: two remain behind the one in flight.
+        tx.push_entire_slice(&[0.5f32; 3 * HOP * 2]).unwrap();
+        assert!(pop_block(&mut rx, &mut block, &backlog));
+        assert_eq!(backlog.load(Ordering::Acquire), 2 * HOP as u32);
+        // Less than a block: nothing popped, backlog untouched.
+        tx.push_entire_slice(&[0.5f32; 10]).unwrap();
+        rx.pop_entire_slice(&mut [0.0; 4 * HOP]).unwrap();
+        assert!(!pop_block(&mut rx, &mut block, &backlog));
     }
 
     #[test]

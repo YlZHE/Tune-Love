@@ -76,6 +76,22 @@ impl Crossfade {
         self.pos = 0;
     }
 
+    /// Restarts `pos` frames into the fade (clamped to `frames()`). Reversing a fade is
+    /// `start_at(frames() - position())` with `from` and `to` swapped: equal-power gains are
+    /// symmetric, so the output continues from the current mix without a jump.
+    pub fn start_at(&mut self, pos: usize) {
+        self.pos = pos.min(self.frames);
+    }
+
+    /// Frames already mixed: 0 = all `from`, `frames()` = complete (all `to`).
+    pub fn position(&self) -> usize {
+        self.pos.min(self.frames)
+    }
+
+    pub fn frames(&self) -> usize {
+        self.frames
+    }
+
     /// Mixes interleaved stereo blocks; processes whole frames up to the shortest of the
     /// three slices. Returns true once the fade has completed (afterwards output equals `to`).
     pub fn mix(&mut self, from: &[f32], to: &[f32], out: &mut [f32]) -> bool {
@@ -269,6 +285,28 @@ mod tests {
         let mut after = vec![9.0f32; 20];
         assert!(c.mix(&from[..20], &to[..20], &mut after));
         assert!(after.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn crossfade_reverses_from_its_position() {
+        let mut c = Crossfade::new(100);
+        assert_eq!(c.frames(), 100);
+        assert_eq!(c.position(), 100, "idle crossfade is complete");
+        c.start();
+        let from = vec![1.0f32; 2 * 40];
+        let to = vec![0.0f32; 2 * 40];
+        let mut out = vec![0.0f32; 2 * 40];
+        c.mix(&from, &to, &mut out);
+        assert_eq!(c.position(), 40);
+        let last = out[39 * 2];
+        // Reverse: swap the streams and continue from the mirrored position.
+        c.start_at(c.frames() - c.position());
+        assert_eq!(c.position(), 60);
+        let mut back = vec![0.0f32; 2];
+        c.mix(&to[..2], &from[..2], &mut back);
+        assert!((back[0] - last).abs() <= 0.02, "{last} -> {}", back[0]);
+        c.start_at(1000);
+        assert_eq!(c.position(), 100, "clamped");
     }
 
     #[test]

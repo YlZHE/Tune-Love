@@ -4,6 +4,8 @@ mod dsp;
 #[allow(dead_code)]
 mod load;
 #[allow(dead_code)]
+mod processor;
+#[allow(dead_code)]
 mod separator;
 #[allow(dead_code)]
 mod stemgen;

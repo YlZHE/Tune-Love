@@ -427,7 +427,7 @@ mod tests {
 /// Counts Rust heap allocations per thread in the test binary (ONNX Runtime's own C++
 /// allocations are not seen; this guards our wrapper code).
 #[cfg(test)]
-mod alloc_count {
+pub(crate) mod alloc_count {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 

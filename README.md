@@ -91,6 +91,15 @@ PCM 为 48 kHz、双声道 f32，后台只保留最近最多 8 秒的内存缓�
 
 采集复用固定版本 `wasapi 0.24.0`，窄范围本地补丁保护 SILENT / null 数据包，出处及改动见 `src-tauri/vendor/wasapi/PATCHES.md`。上游音频激活包含同步等待，因此放在独立线程，并在返回后重新验证来源；不承诺 Windows 激活本身有严格时间上限。
 
+## 从源码构建
+
+新克隆的仓库需要先取得两个未入库的工具（仅 Windows，需要 PowerShell 7 的 `pwsh`）：
+
+- `npm run fetch:cmake`：下载固定版本 CMake 3.30.5 到 `src-tauri/vendor/tools`，校验 SHA-256。任何 Rust 构建（含 `npm run tauri dev`）之前都要先运行，`src-tauri/build.rs` 用它编译 FFTW。
+- `npm run fetch:python`：下载固定版本的官方嵌入式 Python 到 `src-tauri/python`，校验 SHA-256，并在 `python313._pth` 中加入 `..\reference`。只在打包安装包时需要，日常开发不用。
+
+两个脚本都可重复运行：目标已存在时只提示 `already present`，不会再次下载。`-Destination <目录>` 可改变解压位置，`-SelfTest` 在临时目录里自检。
+
 ## 开发
 
 需要 Node.js、Rust stable、MSVC Build Tools 和 WebView2。

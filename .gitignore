@@ -8,6 +8,7 @@ artifacts/
 
 # Large third-party tool binaries and source archives (fetched locally, not redistributed here)
 src-tauri/vendor/tools/
+src-tauri/python/
 src-tauri/vendor/**/*.zip
 src-tauri/vendor/**/*.tar.gz
 # Sidecar binaries produced by scripts/build-devocal-engine.mjs

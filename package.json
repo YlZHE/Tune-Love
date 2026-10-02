@@ -10,7 +10,9 @@
     "test:ui": "playwright test",
     "test:native": "node scripts/verify-native.mjs",
     "tauri": "tauri",
-    "fetch:stemgenrt": "node scripts/fetch-stemgenrt.mjs"
+    "fetch:stemgenrt": "node scripts/fetch-stemgenrt.mjs",
+    "fetch:cmake": "pwsh -File scripts/fetch-cmake.ps1",
+    "fetch:python": "pwsh -File scripts/fetch-python-embed.ps1"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.7",

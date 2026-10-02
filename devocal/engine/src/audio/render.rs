@@ -636,8 +636,11 @@ impl Renderer {
     /// `shared.preroll_request` is deliberately NOT cleared (ruling 23): the render thread
     /// reports `ready` before `run` calls this, so the engine's first "on" can already have
     /// been accepted and have set the request; wiping it here lost the pre-roll and led to
-    /// underruns and a forced fallback. A request that is stale for a new device only costs
-    /// one bounded, non-stacking pre-roll in `fill`.
+    /// underruns and a forced fallback. The request persists until a sink consumes it in
+    /// `fill`, so it also survives a failed rebind (no sink, `fill` not called) and is
+    /// consumed by the next stream that opens. Consumed, it starts one non-stacking pre-roll
+    /// that is added to `extra`: a standing headroom of at most `MAX_EXTRA_HEADROOM_FRAMES`
+    /// that lasts until the next open resets `extra` here.
     fn after_open(&mut self) {
         self.discard_all();
         if let Some(s) = &self.sink {
@@ -655,7 +658,8 @@ impl Renderer {
         self.drop_pending = 0;
         self.primed = false;
         self.underruns.reset();
-        // A new device starts without learned headroom or a stale pre-roll.
+        // A new stream starts without learned headroom (which includes any earlier pre-roll)
+        // and without a pre-roll in progress; a pending request is kept (see above).
         self.extra = 0;
         self.ctx.stats.headroom_frames.store(0, Ordering::Relaxed);
         self.preroll_left = 0;
@@ -744,8 +748,12 @@ impl Renderer {
             }
         }
         let mut avail = self.ctx.input.slots() / 2;
-        // Pre-roll request from an accepted "on": always consumed (never latched), sized by
-        // `preroll_frames` and added to the headroom, so the target includes it.
+        // Pre-roll request from an accepted "on". It stays set until a fill with a sink
+        // consumes it here (also across a failed rebind). Consuming it may start no pre-roll
+        // (`preroll_frames` returns 0 while one is in progress, when the queue is already
+        // deep, or at the cap). A started pre-roll is added to `extra`, so the target
+        // includes it and it remains as standing headroom (`extra` <= `MAX_EXTRA_HEADROOM_FRAMES`)
+        // until the next `after_open`.
         if self
             .ctx
             .shared
@@ -999,11 +1007,20 @@ mod tests {
     #[test]
     fn after_open_keeps_a_pending_preroll_request() {
         let (mut r, shared) = test_renderer(None);
+        // Per-stream state left by an earlier stream: headroom and a pre-roll in progress.
+        r.extra = MAX_EXTRA_HEADROOM_FRAMES;
+        r.preroll_left = PREROLL_FRAMES;
+        r.preroll_fade = true;
+        r.ctx
+            .stats
+            .headroom_frames
+            .store(MAX_EXTRA_HEADROOM_FRAMES as u32, Ordering::Relaxed);
         shared.preroll_request.store(true, Ordering::Release);
         r.after_open();
         assert!(shared.preroll_request.load(Ordering::Acquire));
         // Still resets the per-stream state.
         assert_eq!((r.extra, r.preroll_left, r.preroll_fade), (0, 0, false));
+        assert_eq!(r.ctx.stats.headroom_frames.load(Ordering::Relaxed), 0);
     }
 
     #[test]

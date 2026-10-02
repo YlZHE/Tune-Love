@@ -55,6 +55,8 @@ pub struct BlockReport {
 pub struct Processor {
     separator: Option<Box<dyn Separator>>,
     hop: usize,
+    /// Passthrough delay in frames (the model's latency).
+    latency_frames: usize,
     delay: DelayLine,
     stage: Stage,
     /// Set while falling back (fading out towards, or in, `Fallback`).
@@ -79,6 +81,7 @@ impl Processor {
         let mut p = Self {
             separator: None,
             hop: NO_MODEL_HOP,
+            latency_frames: NO_MODEL_LATENCY_FRAMES,
             delay: DelayLine::new(NO_MODEL_LATENCY_FRAMES),
             stage: Stage::Passthrough,
             fallback: None,
@@ -107,6 +110,7 @@ impl Processor {
 
     fn configure(&mut self, hop: usize, latency_frames: usize) {
         self.hop = hop.max(1);
+        self.latency_frames = latency_frames;
         self.delay = DelayLine::new(latency_frames);
         self.stage = Stage::Passthrough;
         self.fallback = None;
@@ -205,6 +209,17 @@ impl Processor {
     /// Block size in frames; `process_block` takes `hop() * 2` interleaved samples.
     pub fn hop(&self) -> usize {
         self.hop
+    }
+
+    /// Output delay relative to the input in frames (passthrough and accompaniment alike).
+    pub fn latency_frames(&self) -> usize {
+        self.latency_frames
+    }
+
+    /// Current stage (changes immediately on `request_devocal`/`force_fallback`, and on
+    /// `process_block`).
+    pub fn stage(&self) -> Stage {
+        self.stage
     }
 
     /// Processes one block of `hop() * 2` samples. Never allocates, panics or outputs
@@ -503,6 +518,8 @@ mod tests {
         for sep in [Some(const_sep().0), None] {
             let mut rig = Rig::new(Processor::new(sep), ramp);
             assert_eq!(rig.p.hop(), HOP);
+            assert_eq!(rig.p.latency_frames(), HOP);
+            assert_eq!(rig.p.stage(), Stage::Passthrough);
             let r = rig.block();
             assert_eq!(
                 r,
@@ -868,6 +885,8 @@ mod tests {
         rig.run_until(Stage::Fallback);
 
         rig.p.set_separator(Box::new(DelayOnly::new(300)));
+        assert_eq!(rig.p.latency_frames(), 300);
+        assert_eq!(rig.p.stage(), Stage::Passthrough);
         assert_eq!(rig.p.fallback_reason(), None);
         assert_eq!(rig.p.hop(), 128);
         rig.reference = DelayLine::new(300);

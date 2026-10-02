@@ -1,4 +1,6 @@
-// DSP primitives and separators are not wired into the engine yet (later tasks).
+// Audio I/O, DSP primitives and separators are not wired into the engine yet (later tasks).
+#[allow(dead_code)]
+mod audio;
 #[allow(dead_code)]
 mod dsp;
 #[allow(dead_code)]

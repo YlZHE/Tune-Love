@@ -93,7 +93,9 @@ impl Processor {
             acc: Vec::new(),
         };
         match separator {
-            Some(s) => p.set_separator(s),
+            Some(s) => {
+                p.set_separator(s);
+            }
             None => p.configure(NO_MODEL_HOP, NO_MODEL_LATENCY_FRAMES),
         }
         p
@@ -101,11 +103,14 @@ impl Processor {
 
     /// Installs a new model: back to `Passthrough` (fallback cleared) with the passthrough
     /// delay set to the model's latency. Allocates; call off the audio path or between blocks.
-    pub fn set_separator(&mut self, s: Box<dyn Separator>) {
+    /// Returns the previous model so the caller can drop it off the audio thread (tearing
+    /// down an inference session can take milliseconds).
+    pub fn set_separator(&mut self, s: Box<dyn Separator>) -> Option<Box<dyn Separator>> {
         let hop = s.hop();
         let latency = s.latency_frames();
-        self.separator = Some(s);
+        let old = self.separator.replace(s);
         self.configure(hop, latency);
+        old
     }
 
     fn configure(&mut self, hop: usize, latency_frames: usize) {
@@ -884,7 +889,8 @@ mod tests {
         rig.p.force_fallback(FallbackReason::Overload);
         rig.run_until(Stage::Fallback);
 
-        rig.p.set_separator(Box::new(DelayOnly::new(300)));
+        let old = rig.p.set_separator(Box::new(DelayOnly::new(300)));
+        assert!(old.is_some(), "the previous model is handed back");
         assert_eq!(rig.p.latency_frames(), 300);
         assert_eq!(rig.p.stage(), Stage::Passthrough);
         assert_eq!(rig.p.fallback_reason(), None);

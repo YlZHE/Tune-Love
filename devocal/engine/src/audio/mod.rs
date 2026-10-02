@@ -344,7 +344,7 @@ impl AudioHandle {
     }
 
     /// Installs a new model: devocal off, wait for the fade-out, swap, back on if the user
-    /// toggle is on (caller obligation 3). The old model is dropped on the processing thread.
+    /// toggle is on (caller obligation 3). The old model is dropped on a helper thread.
     pub fn set_separator(&self, s: Box<dyn Separator>) {
         self.send_proc(ProcCommand::SetSeparator(s));
     }

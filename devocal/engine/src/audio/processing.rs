@@ -198,7 +198,9 @@ fn apply_command(ctx: &mut ProcessingCtx, st: &mut State, cmd: ProcCommand) {
         ProcCommand::SetSeparator(s) => {
             // Caller obligation 3: off first, swap once the fade-out is over.
             ctx.processor.request_devocal(false);
-            st.pending = Some(s);
+            if let Some(replaced) = st.pending.replace(s) {
+                retire(replaced);
+            }
         }
     }
 }
@@ -225,7 +227,9 @@ fn try_swap(ctx: &mut ProcessingCtx, st: &mut State) {
         return;
     };
     // Allocates (and drops the old model) between blocks; not on the per-block path.
-    ctx.processor.set_separator(s);
+    if let Some(old) = ctx.processor.set_separator(s) {
+        retire(old);
+    }
     st.hop = ctx.processor.hop();
     st.latency = ctx.processor.latency_frames();
     // Re-chunk at the new hop: nothing partial is held (blocks are read whole from ring A).
@@ -239,6 +243,16 @@ fn try_swap(ctx: &mut ProcessingCtx, st: &mut State) {
         ctx.processor.request_devocal(true);
         accept_on(ctx, st);
     }
+}
+
+/// Drops a replaced model on a short-lived thread: tearing down an inference session can
+/// take milliseconds, which would starve the output (and, with input flowing, count as an
+/// underrun against the new model). If no thread can be spawned, the closure (and the model)
+/// is dropped here instead.
+fn retire(old: Box<dyn Separator>) {
+    let _ = std::thread::Builder::new()
+        .name("devocal-model-drop".into())
+        .spawn(move || drop(old));
 }
 
 fn publish_config(ctx: &ProcessingCtx, st: &State) {

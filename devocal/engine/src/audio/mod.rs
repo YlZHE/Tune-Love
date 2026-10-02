@@ -113,6 +113,93 @@ pub struct AudioStats {
     pub processing_failed: AtomicBool,
     pub capture_failed: AtomicBool,
     pub render_failed: AtomicBool,
+    /// Diagnostic counters, logged once a second when `DEVOCAL_DIAG` is set.
+    pub diag: DiagCounters,
+}
+
+/// Monotonic counters for the `DEVOCAL_DIAG` log (relaxed increments only).
+#[derive(Debug, Default)]
+pub struct DiagCounters {
+    pub capture_packets: AtomicU64,
+    pub capture_frames: AtomicU64,
+    pub capture_flag_discontinuity: AtomicU64,
+    pub capture_flag_timestamp: AtomicU64,
+    pub capture_ring_overflow_frames: AtomicU64,
+    pub proc_blocks: AtomicU64,
+    pub proc_resets: AtomicU64,
+    pub proc_ring_b_drops: AtomicU64,
+    pub render_wakes: AtomicU64,
+    pub render_real_frames: AtomicU64,
+    pub render_pad_events: AtomicU64,
+    pub render_pad_frames: AtomicU64,
+    pub render_trim_frames: AtomicU64,
+    pub render_preroll_frames: AtomicU64,
+}
+
+/// Env var that turns on the once-a-second diagnostic log.
+pub const DIAG_ENV: &str = "DEVOCAL_DIAG";
+
+/// Logs counter deltas once a second until `shared.stop`.
+fn diag_loop(stats: Arc<AudioStats>, shared: Arc<Shared>, gains: Arc<SharedGains>) {
+    let d = &stats.diag;
+    let read = || {
+        [
+            &d.capture_packets,
+            &d.capture_frames,
+            &d.capture_flag_discontinuity,
+            &d.capture_flag_timestamp,
+            &d.capture_ring_overflow_frames,
+            &d.proc_blocks,
+            &d.proc_resets,
+            &d.proc_ring_b_drops,
+            &d.render_wakes,
+            &d.render_real_frames,
+            &d.render_pad_events,
+            &d.render_pad_frames,
+            &d.render_trim_frames,
+            &d.render_preroll_frames,
+            &stats.unattenuated_blocks,
+            &stats.underruns,
+        ]
+        .map(|a| a.load(Ordering::Relaxed))
+    };
+    let names = [
+        "cap_pkts",
+        "cap_frames",
+        "cap_disc",
+        "cap_ts_err",
+        "cap_overflow",
+        "proc_blocks",
+        "proc_resets",
+        "proc_b_drops",
+        "r_wakes",
+        "r_real",
+        "r_pad_ev",
+        "r_pad_fr",
+        "r_trim",
+        "r_preroll",
+        "guard",
+        "underruns",
+    ];
+    let mut last = read();
+    while !shared.stop.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(1000));
+        let now = read();
+        let mut line = String::from("devocal diag:");
+        for ((name, n), l) in names.iter().zip(now).zip(last) {
+            line.push_str(&format!(" {name}={}", n - l));
+        }
+        line.push_str(&format!(
+            " stage={} in_ring={} headroom={} cap_gain={:.1} out_gain={:.3}",
+            stats.stage.load(Ordering::Relaxed),
+            shared.in_ring_frames.load(Ordering::Relaxed),
+            stats.headroom_frames.load(Ordering::Relaxed),
+            gains.capture_gain(),
+            gains.output_gain(),
+        ));
+        eprintln!("{line}");
+        last = now;
+    }
 }
 
 /// [`AudioStats::stage`] encoding.
@@ -455,6 +542,14 @@ impl AudioHandle {
             },
         )?;
         handle.await_ready("capture", &ready_rx)?;
+
+        if std::env::var_os(DIAG_ENV).is_some() {
+            let (st, sh, g) = (stats.clone(), shared.clone(), gains.clone());
+            // Detached: ends at the next tick after the stop flag.
+            let _ = thread::Builder::new()
+                .name("devocal-diag".into())
+                .spawn(move || diag_loop(st, sh, g));
+        }
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let ctx = render::RenderCtx {

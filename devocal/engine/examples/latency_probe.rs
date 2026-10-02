@@ -15,7 +15,11 @@
 //!
 //! Usage:
 //!   latency_probe --pid <player root pid> --seconds <s> [--endpoint <render endpoint id>]
-//!                 [--out probe.json]
+//!                 [--out probe.json] [--dump <prefix>]
+//!
+//! `--dump` also writes the raw recordings (interleaved stereo f32 LE, 44.1 kHz) to
+//! `<prefix>-source.f32` and `<prefix>-output.f32`, and their first-packet QPC times to
+//! `<prefix>-times.json`, for offline analysis.
 
 use std::thread;
 use std::time::Instant;
@@ -41,10 +45,11 @@ struct Args {
     endpoint: Option<String>,
     seconds: f64,
     out: Option<String>,
+    dump: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let (mut pid, mut seconds, mut endpoint, mut out) = (None, None, None, None);
+    let (mut pid, mut seconds, mut endpoint, mut out, mut dump) = (None, None, None, None, None);
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -59,6 +64,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--endpoint" => endpoint = Some(value()?),
             "--out" => out = Some(value()?),
+            "--dump" => dump = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -72,6 +78,7 @@ fn parse_args() -> Result<Args, String> {
         endpoint,
         seconds,
         out,
+        dump,
     })
 }
 
@@ -86,6 +93,10 @@ struct Recording {
     /// QPC time of the first frame, in 100 ns units.
     first_qpc: u64,
     discontinuities: usize,
+    /// Packets flagged AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR / SILENT, and packets read.
+    timestamp_errors: usize,
+    silent_packets: usize,
+    packets: usize,
 }
 
 fn record(src: Source, seconds: f64) -> Result<Recording, String> {
@@ -125,6 +136,9 @@ fn record(src: Source, seconds: f64) -> Result<Recording, String> {
             samples: Vec::with_capacity((seconds * RATE as f64) as usize * 2 + RATE),
             first_qpc: 0,
             discontinuities: 0,
+            timestamp_errors: 0,
+            silent_packets: 0,
+            packets: 0,
         };
         let mut bytes = vec![0u8; RATE * 8];
         let start = Instant::now();
@@ -140,6 +154,13 @@ fn record(src: Source, seconds: f64) -> Result<Recording, String> {
                     .map_err(|e| e.to_string())?;
                 if rec.samples.is_empty() {
                     rec.first_qpc = info.timestamp;
+                }
+                rec.packets += 1;
+                if info.flags.timestamp_error {
+                    rec.timestamp_errors += 1;
+                }
+                if info.flags.silent {
+                    rec.silent_packets += 1;
                 }
                 if info.flags.data_discontinuity && !rec.samples.is_empty() {
                     rec.discontinuities += 1;
@@ -159,6 +180,18 @@ fn record(src: Source, seconds: f64) -> Result<Recording, String> {
     })();
     wasapi::deinitialize();
     result
+}
+
+fn dump(prefix: &str, src: &Recording, out: &Recording) -> Result<(), String> {
+    for (name, rec) in [("source", src), ("output", out)] {
+        let path = format!("{prefix}-{name}.f32");
+        let bytes: Vec<u8> = rec.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).map_err(|e| format!("write {path}: {e}"))?;
+    }
+    let times =
+        json!({ "sourceFirstQpc": src.first_qpc, "outputFirstQpc": out.first_qpc, "rate": RATE });
+    let path = format!("{prefix}-times.json");
+    std::fs::write(&path, times.to_string()).map_err(|e| format!("write {path}: {e}"))
 }
 
 fn mono(stereo: &[f32]) -> Vec<f32> {
@@ -302,6 +335,9 @@ fn run() -> Result<(), String> {
     let src = src.join().map_err(|_| "source capture panicked")??;
     let out = out.join().map_err(|_| "output capture panicked")??;
 
+    if let Some(prefix) = &args.dump {
+        dump(prefix, &src, &out)?;
+    }
     let src_m = mono(&src.samples);
     let out_m = mono(&out.samples);
     if src_m.len() < RATE || out_m.len() < RATE {
@@ -340,6 +376,12 @@ fn run() -> Result<(), String> {
         "outputRms": rms(&out_m),
         "sourceDiscontinuities": src.discontinuities,
         "outputDiscontinuities": out.discontinuities,
+        "sourcePackets": src.packets,
+        "sourceTimestampErrors": src.timestamp_errors,
+        "sourceSilentPackets": src.silent_packets,
+        "outputPackets": out.packets,
+        "outputTimestampErrors": out.timestamp_errors,
+        "outputSilentPackets": out.silent_packets,
         "endpoint": args.endpoint,
     });
     let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;

@@ -147,6 +147,7 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
                         st.in_pos += skip as u64;
                     }
                     ctx.processor.on_discontinuity();
+                    ctx.stats.diag.proc_resets.fetch_add(1, Ordering::Relaxed);
                     begin_gap(&mut ctx, &mut st);
                     continue 'outer;
                 }
@@ -166,6 +167,7 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
             continue;
         }
         st.in_pos += st.hop as u64;
+        ctx.stats.diag.proc_blocks.fetch_add(1, Ordering::Relaxed);
 
         let t0 = now_us();
         let report = ctx.processor.process_block(&st.in_block, &mut st.out_block);
@@ -207,6 +209,10 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
             st.out_pos += st.hop as u64;
         } else {
             // Ring B full (render stalled): drop the block, fade around the jump.
+            ctx.stats
+                .diag
+                .proc_ring_b_drops
+                .fetch_add(1, Ordering::Relaxed);
             let _ = ctx.out_markers.push(st.out_pos);
             st.fade_in.start(0);
         }

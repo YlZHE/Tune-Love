@@ -97,6 +97,14 @@ impl Conditioner {
     }
 }
 
+/// Pushes as much of `pkt` (interleaved stereo) into ring A as fits; returns the number of
+/// frames written.
+pub(crate) fn push_frames(output: &mut Producer<f32>, pkt: &[f32]) -> usize {
+    // `push_partial_slice` returns (pushed, remainder).
+    let (pushed, _) = output.push_partial_slice(pkt);
+    pushed.len() / 2
+}
+
 pub(crate) struct CaptureCtx {
     pub pid: u32,
     pub output: Producer<f32>,
@@ -183,6 +191,15 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
             }
             let n = match cap.read_from_device(&mut bytes) {
                 Ok((n, info)) => {
+                    let d = &ctx.stats.diag;
+                    d.capture_packets.fetch_add(1, Ordering::Relaxed);
+                    d.capture_frames.fetch_add(n as u64, Ordering::Relaxed);
+                    if info.flags.data_discontinuity {
+                        d.capture_flag_discontinuity.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if info.flags.timestamp_error {
+                        d.capture_flag_timestamp.fetch_add(1, Ordering::Relaxed);
+                    }
                     if info.flags.data_discontinuity || info.flags.timestamp_error {
                         ctx.stats.discontinuities.fetch_add(1, Ordering::Relaxed);
                         pending_reset = true;
@@ -221,10 +238,13 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
             conditioner.condition(pkt, gain, &ctx.stats, &ctx.follow_now, |offset| {
                 let _ = markers.push(InputMarker::GuardGap(pushed + offset as u64));
             });
-            let (written, _) = ctx.output.push_partial_slice(pkt);
-            let written_frames = (pkt.len() - written.len()) / 2;
+            let written_frames = push_frames(&mut ctx.output, pkt);
             pushed += written_frames as u64;
             if written_frames < n {
+                ctx.stats
+                    .diag
+                    .capture_ring_overflow_frames
+                    .fetch_add((n - written_frames) as u64, Ordering::Relaxed);
                 // Ring A full (processing stalled): the rest is dropped.
                 ctx.stats.discontinuities.fetch_add(1, Ordering::Relaxed);
                 pending_reset = true;
@@ -250,6 +270,21 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real-machine regression (2026-10-03): every packet was counted as a ring A overflow,
+    /// so a discontinuity marker reset the processor every 10 ms.
+    #[test]
+    fn push_frames_reports_the_frames_written() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::<f32>::new(8 * 2);
+        let pkt: Vec<f32> = (0..5 * 2).map(|i| i as f32).collect();
+        assert_eq!(push_frames(&mut tx, &pkt), 5, "everything fits");
+        assert_eq!(push_frames(&mut tx, &pkt), 3, "only 3 frames of room left");
+        assert_eq!(push_frames(&mut tx, &pkt), 0, "ring full");
+        let mut out = vec![0.0f32; 8 * 2];
+        rx.pop_entire_slice(&mut out).unwrap();
+        assert_eq!(&out[..10], &pkt[..]);
+        assert_eq!(&out[10..], &pkt[..6]);
+    }
 
     #[test]
     fn guard_silences_unattenuated_block() {

@@ -714,6 +714,11 @@ impl Renderer {
             return Ok(0);
         };
         sink.wait(WAIT_MS);
+        self.ctx
+            .stats
+            .diag
+            .render_wakes
+            .fetch_add(1, Ordering::Relaxed);
         let padding = sink.padding()?;
         let period = sink.period_frames();
         let buffer = sink.buffer_frames().min(self.staging.len() / 2);
@@ -792,6 +797,11 @@ impl Renderer {
                 let f = self.fade_frames.min(need);
                 decay_from(self.last_frame, &mut self.staging[..f * 2]);
             }
+            self.ctx
+                .stats
+                .diag
+                .render_preroll_frames
+                .fetch_add((need - w) as u64, Ordering::Relaxed);
             self.preroll_left = self.preroll_left.saturating_sub(need - w);
             if self.preroll_left == 0 {
                 self.fade_in.start(0);
@@ -807,6 +817,11 @@ impl Renderer {
             fade_edges(&mut self.staging[..k * 2], false, true, k);
             avail -= k;
             let d = self.drop_pending.min(avail);
+            self.ctx
+                .stats
+                .diag
+                .render_trim_frames
+                .fetch_add(d as u64, Ordering::Relaxed);
             self.skip(d);
             avail -= d;
             self.drop_pending = 0;
@@ -816,8 +831,14 @@ impl Renderer {
         let real = (need - w).min(avail);
         self.take(w, real);
         w += real;
+        let diag = &self.ctx.stats.diag;
+        diag.render_real_frames
+            .fetch_add(real as u64, Ordering::Relaxed);
 
         if w < must {
+            diag.render_pad_events.fetch_add(1, Ordering::Relaxed);
+            diag.render_pad_frames
+                .fetch_add((need - w) as u64, Ordering::Relaxed);
             // The device would starve before the next wake: pad with silence up to the
             // target (ruling 18), not just one period.
             let k = w.min(self.fade_frames);

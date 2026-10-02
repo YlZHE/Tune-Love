@@ -1,0 +1,12 @@
+.autotune-settings { border: 1px solid #ffffff12; border-radius: 16px; padding: 24px; background: #ffffff03; }
+.autotune-settings .color-heading { margin-bottom: 18px; }
+.autotune-settings .color-heading > .rt-Badge { margin-left: auto; flex-shrink: 0; }
+.autotune-connection { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text, #e8ebf2); }
+.autotune-dot { width: 7px; height: 7px; border-radius: 50%; background: #697080; }
+.autotune-dot[data-ready="true"] { background: var(--accent, #c9eee2); }
+.autotune-target { font-size: 12px; color: var(--muted, #9a9fac); overflow-wrap: anywhere; margin: 8px 0; }
+.autotune-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; align-items: center; }
+.autotune-actions .rt-SelectTrigger { flex: 1; min-width: 200px; max-width: 100%; }
+.autotune-note { font-size: 12px; color: var(--muted, #9a9fac); line-height: 1.7; margin: 6px 0; }
+.autotune-error { color: #f0a2a2; font-size: 12px; overflow-wrap: anywhere; }
+.control-connection-note { display: block; color: var(--muted, #9a9fac); font-size: 10px; line-height: 12px; text-align: center; margin-top: 3px; }

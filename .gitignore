@@ -1,0 +1,26 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/vendor/*/target/
+src-tauri/gen/
+artifacts/
+*.log
+
+# Large third-party tool binaries and source archives (fetched locally, not redistributed here)
+src-tauri/vendor/tools/
+src-tauri/vendor/**/*.zip
+src-tauri/vendor/**/*.tar.gz
+# Sidecar binaries produced by scripts/build-devocal-engine.mjs
+src-tauri/binaries/
+devocal/target/
+# Model weights, audio and caches never belong in the repo
+*.onnx
+*.pth
+*.npy
+*.wav
+*.mp3
+*.flac
+__pycache__/
+.pytest_cache/
+test-results/
+playwright-report/

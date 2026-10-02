@@ -1,0 +1,90 @@
+MIT + Commons Clause License Condition v1.0
+
+Components used: Warm Tooltip, Strands, Shiny Text, Star Border, Aero Shards,
+Elastic Slider and Comet Dial.
+Comet Dial source: https://reactbits.dev/r/CometDial-TS-CSS.json
+Retrieved: 2026-09-29. Retains official angular pointer handling, dead zone,
+velocity-smoothed segmented comet, spring animation, keyboard controls and
+reduced-motion behavior. Product settings: size 86, sweep 260, speed 59,
+tapBounce 0.26, flickBounce 0.12. Momentum is set to 0 so releasing a parameter
+does not fling its committed value. The visual spring still animates.
+Local adaptations: exact committed ARIA values and rounded decimal steps;
+an editable readout slot; interaction notifications for the existing black,
+arrow-free Warm Tooltip with Lean; lost-capture and RAF cleanup; controlled
+value reconciliation after dragging; pointer selection publishes after an
+input blur commit so the last action wins. The product wrapper handles range
+validation, direct input, tooltip dismissal and below-label fallback when the
+small native window has no space above. No new dependencies are required.
+Elastic Slider source: https://reactbits.dev/r/ElasticSlider-TS-CSS.json
+Retrieved: 2026-09-29. Retains the official sigmoid overflow decay, Motion
+stretch/thickness/opacity transforms and spring return. Local adaptations:
+controlled 0-100 preview value; existing Radix Slider for pointer capture,
+clamping, focus and keyboard/ARIA; reduced-motion and animation cleanup;
+scoped CSS; original 50 px maximum overflow and compact 1.12 hover scale;
+single-row endpoint labels that move with the stretch in a 230 x 50 popup.
+An independent surface shares the slider's elastic state without distorting
+text, with viewport clearance reserved to keep the shape inside the window.
+Warm Tooltip adds optional controlled visibility, live content updates and
+animated-anchor following for the exact drag percentage; ordinary hover and
+keyboard tooltip behavior is retained. The slider value is hidden at rest.
+Volume icons are removed. Existing Motion
+and Radix dependencies are reused; Chakra and react-icons are not required.
+Aero Shards sources:
+https://raw.githubusercontent.com/DavidHDev/react-bits/main/src/ts-default/Backgrounds/AeroShards/AeroShards.tsx
+https://raw.githubusercontent.com/DavidHDev/react-bits/main/src/ts-default/Backgrounds/AeroShards/AeroShards.css
+Retrieved: 2026-09-29. The original procedural shaders, geometry, materials,
+render graph, quality adaptation and resource lifecycle are retained. Local
+additions: validated player-band input, bounded bass depth, gentle mid transport/turbulence,
+treble highlights, live three-color palette input, wake controls, and sleeping
+after silence. The product wrapper supplies compact background defaults,
+disables mouse interaction, lowers visual prominence, and provides a static
+fallback for reduced motion or unavailable WebGPU. Uses vgpu 0.3.1; its MIT
+license is in licenses/vgpu.txt. No raw audio is passed to the GPU renderer.
+Star Border sources:
+https://raw.githubusercontent.com/DavidHDev/react-bits/main/src/ts-default/Animations/StarBorder/StarBorder.tsx
+https://raw.githubusercontent.com/DavidHDev/react-bits/main/src/ts-default/Animations/StarBorder/StarBorder.css
+Retrieved: 2026-09-29. StarBorder.tsx and StarBorder.css preserve the original
+two opposing radial gradients, translating/fading alternate animations, and
+opaque inner-content structure. Local additions: an animated flag and aria-hidden
+decoration. Progress-specific CSS changes only the geometry to a 6 px full-width
+track with 1 px edges and a 4 px inner Radix Progress; it does not clip the border
+to played progress. PlaybackProgress disables decoration when paused, hidden,
+reduced-motion, complete or without a timeline. This replaces the earlier
+single-sweep StarBorderBeam adaptation; existing historical evidence is retained.
+Shiny Text source: https://raw.githubusercontent.com/DavidHDev/react-bits/main/src/ts-default/TextAnimations/ShinyText/ShinyText.tsx
+Retrieved: 2026-09-28. The official TypeScript animation logic is preserved.
+Its CSS is reduced to layout to prevent a second legacy CSS animation from
+overriding Motion's timing. PlaybackLabel handles reduced motion and visibility.
+Strands source: https://reactbits.dev/r/Strands-TS-CSS.json
+Retrieved: 2026-09-28. The vertex shader is preserved. The fragment shader is
+adapted to three independent PCM frequency bands and fixed per-strand palette
+colors. Autonomous time/phase/hue motion is removed; the official strand/glow
+rendering math is retained with compact-layout adjustments. The React lifecycle
+handles validated native audio, interpolated colors, idle/hidden/reduced-motion
+states and GPU disposal.
+The optional glass pass is unused and is not allocated by this compact glyph.
+OGL runtime dependency is pinned to 1.0.11 (Unlicense).
+
+Copyright (c) 2026 David Haz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, and distribute the Software **as part of an application, website, or product**, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+## Commons Clause Restriction
+
+You may use this Software, including for any commercial purpose, **so long as you do not sell, sublicense, or redistribute the components themselves-whether alone, in a bundle, or as a ported version.**
+
+## No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

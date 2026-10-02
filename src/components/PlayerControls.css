@@ -1,0 +1,32 @@
+.player-footer { position: relative; display: block; height: 39px; }
+.footer-information, .footer-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 26px; transition: opacity .16s ease, transform .16s ease; }
+.footer-information { opacity: 1; }
+.footer-controls { position: absolute; inset: 13px 0 auto; opacity: 0; pointer-events: none; transform: translateY(4px); }
+.player-footer[data-controls-visible="true"] .footer-information { opacity: 0; pointer-events: none; }
+.player-footer[data-controls-visible="true"] .footer-controls { opacity: 1; pointer-events: auto; transform: translateY(0); }
+.effect-controls, .transport-controls { display: flex; align-items: center; gap: 5px; }
+.footer-control-button.rt-IconButton { width: 26px; height: 26px; min-width: 26px; margin: 0; color: var(--muted, #9a9fac); transition: color .15s, background-color .15s, transform .15s; }
+.footer-control-button:hover:not(:disabled),
+.footer-control-button[data-state="open"]:not(:disabled) { color: var(--accent); background-color: color-mix(in srgb, var(--accent) 12%, transparent); }
+.footer-control-button:active:not(:disabled) { transform: scale(.92); }
+.footer-control-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.footer-control-button.is-enabled, .footer-control-button.transport-primary { color: var(--accent); }
+.footer-control-button.transport-primary { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.footer-control-button:disabled { opacity: .3; cursor: default; }
+.controls-accessible-note { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; pointer-events: none; }
+.control-popover.rt-PopoverContent, .control-details.rt-PopoverContent { background: #11151eef; color: #f0f1f6; border: 1px solid #ffffff24; border-radius: 14px; box-shadow: 0 10px 32px #00000070; backdrop-filter: blur(18px); transition: --accent .45s ease; padding: 13px 15px; }
+.control-popover.rt-PopoverContent { width: min(230px, calc(100vw - 160px)); max-height: calc(100dvh - 24px); padding: 2px 12px; overflow: visible; background: transparent; border-color: transparent; box-shadow: none; backdrop-filter: none; }
+.control-details.rt-PopoverContent { width: min(340px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); padding: 8px 16px; overflow: visible; }
+.parameter-dial-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.parameter-dial { display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 0; }
+.parameter-dial__body { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.parameter-dial__body > label { color: #c7cbd5; font-size: 11px; line-height: 16px; white-space: nowrap; cursor: text; }
+.parameter-dial__help { display: block; width: max-content; max-width: min(240px, calc(100vw - 48px)); line-height: 1.5; }
+.parameter-dial .comet-dial__ring:focus-visible { outline: 1px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: 2px; }
+.parameter-dial__number.rt-TextFieldRoot { width: 54px; height: 26px; pointer-events: auto; background: transparent; box-shadow: none; border-radius: 6px; --text-field-selection-color: color-mix(in srgb, var(--accent) 32%, transparent); }
+.parameter-dial__number .rt-TextFieldInput { padding: 0 2px; text-indent: 0; font-size: 17px; font-weight: 500; letter-spacing: -.04em; line-height: 1; text-align: center; font-variant-numeric: tabular-nums; color: var(--accent); }
+.parameter-dial__number.rt-TextFieldRoot:hover { background: #ffffff06; }
+.parameter-dial__number.rt-TextFieldRoot:focus-within { background: #11151e; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent); }
+.parameter-dial__number input::-webkit-inner-spin-button { display: none; }
+.music-window > .notice { bottom: 5px; padding: 5px 8px; font-size: 10px; pointer-events: none; }
+@media (prefers-reduced-motion: reduce) { .footer-information, .footer-controls { transition: none; transform: none; } }

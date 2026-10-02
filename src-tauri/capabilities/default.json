@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Local music display and its own floating window controls.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default", "core:window:allow-start-dragging", "core:window:allow-close",
+    "core:window:allow-set-always-on-top", "core:window:allow-is-always-on-top"
+  ]
+}

@@ -1,0 +1,4 @@
+/* Sits between the bordered Auto-Tune card and the colour section. */
+.auto-apply-settings { margin: 0 26px; padding: 26px 0 23px; border-bottom: 1px solid #ffffff14; }
+.auto-apply-settings .color-mode-row { margin-bottom: 0; border-bottom: 0; }
+.auto-apply-note { margin: 0; color: #757c8a; font-size: 11px; line-height: 1.6; }

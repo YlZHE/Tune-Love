@@ -1,0 +1,8 @@
+{
+  "name": "key-engine-evaluation-lab",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"test": "node --test *.test.mjs", "compare": "node compare.mjs"},
+  "dependencies": {"essentia.js": "0.1.3"}
+}

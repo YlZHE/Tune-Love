@@ -1,0 +1,14 @@
+/* React Bits Elastic Slider. Compact, scoped adaptation; see licenses/React-Bits.txt. */
+.elastic-slider { position: relative; width: 100%; }
+.elastic-slider__surface { position: absolute; inset: -3px -13px; background: #11151eef; border: 1px solid #ffffff24; border-radius: 14px; box-shadow: 0 10px 32px #00000070; backdrop-filter: blur(18px); }
+.elastic-slider__wrapper { position: relative; display: flex; width: 100%; align-items: center; gap: 8px; touch-action: none; user-select: none; }
+.elastic-slider__label { flex: none; color: #b4bac7; font-size: 11px; line-height: 16px; white-space: nowrap; }
+.elastic-slider__root { position: relative; display: flex; flex: 1; min-width: 0; height: 44px; align-items: center; cursor: grab; touch-action: none; user-select: none; }
+.elastic-slider__root:active { cursor: grabbing; }
+.elastic-slider__track-wrapper { position: relative; display: flex; width: 100%; pointer-events: none; }
+.elastic-slider__track { position: relative; height: 100%; flex-grow: 1; overflow: hidden; border-radius: 9999px; background-color: #ffffff2b; }
+.elastic-slider__range { position: absolute; height: 100%; border-radius: inherit; background-color: var(--accent); }
+.elastic-slider__thumb { display: block; width: 1px; height: 1px; opacity: 0; outline: none; }
+.elastic-slider__value-anchor { position: absolute; top: 50%; width: 1px; height: 1px; line-height: 0; pointer-events: none; }
+.elastic-slider__value-point { display: inline-block; width: 1px; height: 1px; }
+.elastic-slider__root:has(.elastic-slider__thumb:focus-visible) .elastic-slider__track { outline: 2px solid color-mix(in srgb, var(--accent) 65%, transparent); outline-offset: 3px; }

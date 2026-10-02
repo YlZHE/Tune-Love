@@ -1,0 +1,4 @@
+/* React Bits' TypeScript component drives background-position through Motion.
+   Keep only layout here: the upstream legacy CSS animation would override its
+   configured speed/direction with a second, independent five-second clock. */
+.shiny-text { display: inline-block; }

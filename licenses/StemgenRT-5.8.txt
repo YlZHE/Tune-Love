@@ -1,0 +1,43 @@
+StemgenRT-5.8 (real-time vocal separation model)
+================================================
+
+Project:  https://github.com/sweetspotsoundsystem/StemgenRT-5.8
+Model:    model/model.onnx at commit 61df8f4aa1555ef110308d01ea92b54ace770979
+          https://media.githubusercontent.com/media/sweetspotsoundsystem/stemgen-rt/61df8f4aa1555ef110308d01ea92b54ace770979/model/model.onnx
+          37,529,132 bytes, SHA-256 77164d6a581fafb2a31f53fd8ffde44c07cf618472952a4cdba14e68dda3b8b9
+
+The model weights are NOT included in this repository. scripts/fetch-stemgenrt.mjs
+downloads them, unmodified, from the fixed address above and verifies size and SHA-256.
+
+Weights licence: the upstream repository is MIT-licensed (text below), but its README,
+docs/training.md and docs/provenance.md do not state a separate licence for the weights.
+Treat the weights licence as pending confirmation by the authors.
+
+Training data (per upstream docs/training.md): MUSDB18-HQ ("educational purposes only",
+not for commercial use) and MoisesDB (CC BY-NC-SA 4.0), distilled from a Demucs teacher.
+This application is free and non-commercial.
+
+Upstream LICENSE (retrieved 2026-10-02 from the main branch, blob ecfd6f9ff97881f454f7e46b66a54c1280dbd1cd):
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2025 Phil Wang
+Copyright (c) 2026 Axel Delafosse
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

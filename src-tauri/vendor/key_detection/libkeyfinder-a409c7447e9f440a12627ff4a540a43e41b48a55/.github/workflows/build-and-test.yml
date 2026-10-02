@@ -1,0 +1,88 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - name: Ubuntu 20.04
+            os: ubuntu-20.04
+            install_dir: ~/libKeyFinder
+            cmake_extras: -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          - name: macOS 10.15
+            os: macos-10.15
+            install_dir: ~/libKeyFinder
+            cmake_extras: -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          - name: Windows 2019
+            os: windows-2019
+            install_dir: C:\libKeyFinder
+            cmake_extras: >-
+              -DVCPKG_TARGET_TRIPLET=x64-windows-static
+              -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+            cmake_config: --config RelWithDebInfo
+            ctest_config: --build-config RelWithDebInfo
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Check out Git repository
+      uses: actions/checkout@v2
+    - name: "[Ubuntu] Install dependencies"
+      if: startsWith(matrix.os, 'ubuntu')
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends fftw3-dev
+    - name: "[macOS] Install dependencies"
+      if: startsWith(matrix.os, 'macos')
+      run: brew install fftw catch2
+    - name: "[Windows] Set up vcpkg cache"
+      uses: actions/cache@v2
+      if: runner.os == 'Windows'
+      with:
+        path: C:\Users\runneradmin\AppData\Local\vcpkg\archives
+        key: vcpkg-${{ github.head_ref }}-${{ github.run_number }}
+        restore-keys: |
+          vcpkg-${{ github.head_ref }}
+          vcpkg
+    - name: "[Windows] Install dependencies"
+      if: startsWith(matrix.os, 'windows')
+      run: vcpkg install fftw3 catch2
+      env:
+        VCPKG_DEFAULT_TRIPLET: x64-windows-static
+    - name: Set up build directory
+      run: mkdir build
+    - name: Configure
+      run: cmake -DCMAKE_INSTALL_PREFIX=${{ matrix.install_dir }} ${{ matrix.cmake_extras }} ..
+      working-directory: build
+    - name: Build
+      run: cmake --build . ${{ matrix.cmake_config }}
+      working-directory: build
+      env:
+        CMAKE_BUILD_PARALLEL_LEVEL: 2
+    - name: Install
+      run: cmake --install . ${{ matrix.cmake_config }}
+      working-directory: build
+    - name: Run Tests
+      if: runner.os != 'Windows'
+      run: ctest ${{ matrix.ctest_config }} --output-on-failure
+      working-directory: build
+      env:
+        CTEST_PARALLEL_LEVEL: 2
+    - name: Build example application
+      run: |
+        mkdir build
+        cd build
+        cmake ${{ matrix.cmake_extras }} ..
+        cmake --build .
+      working-directory: examples
+      env:
+        CMAKE_PREFIX_PATH: ${{ matrix.install_dir }}
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: ${{ matrix.name }} libKeyFinder build
+        path: ${{ matrix.install_dir }}

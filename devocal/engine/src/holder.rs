@@ -49,6 +49,21 @@
 //! amplified) from the change until a `follow` pass completes without errors (so every tree
 //! session is held or the user's own near-zero) and with a tree session on the new default
 //! endpoint, or for at most [`DEVICE_MUTE_US`]; then the normal rules apply again.
+//!
+//! Parking (only the sessions that can play are held): while held, `follow` reads the default
+//! render endpoint(s) ([`SessionVolumes::default_render_endpoints`]). A held tree session that
+//! is inactive and on an endpoint that is known not to be a default one plays nothing; it is
+//! "parked": set back to its recorded original (inaudible) and then dropped from the restore
+//! file, so a crash, a player exit or Windows' per-app-per-device volume memory never leaves it
+//! at the held volume. A new tree session in that state is owned parked without being lowered.
+//! Never parked: an active session, a session on a default endpoint, anything while the default
+//! is unknown (an `Err` or no default). A parked session is held again (written to the restore
+//! file, its observed volume recorded in the gain history, then lowered) as soon as a pass
+//! finds it active or on a default endpoint: after a default device change that is the
+//! event-driven pass right after the change, before the player starts its stream there; for a
+//! player pinned to a non-default device the engine subscribes to the parked sessions' state
+//! changes ([`Holder::parked_sessions`]) and follows within one loop pass. Parking never
+//! raises `original` (it only ever decreases while held), so the capture stays conservative.
 
 use crate::dsp::GainHistory;
 use devocal_core::restore::{self, RestoreEntry, RestoreRecord, RESTORE_VERSION};
@@ -133,11 +148,14 @@ enum Release {
     Failed,
 }
 
-/// A session the holder lowered (or is about to lower); its entry is in the restore file.
+/// A session the holder lowered (or is about to lower); its entry is in the restore file
+/// unless it is parked.
 struct Owned {
     entry: RestoreEntry,
-    /// The volume we last set; `None` = never lowered (e.g. `set_volume` failed).
+    /// The volume we last set; `None` = never lowered (e.g. `set_volume` failed) or parked.
     last_set: Option<f32>,
+    /// Parked (see the module docs): at its original, not in the restore file, not held.
+    parked: bool,
     /// Lowered by the attach ramp (false for a session adopted at attach, already held).
     ramp: bool,
     release_from: f32,
@@ -149,6 +167,7 @@ impl Owned {
         Self {
             entry,
             last_set: None,
+            parked: false,
             ramp: true,
             release_from: 0.0,
             release: Release::Pending,
@@ -176,6 +195,9 @@ enum Candidate {
     /// (the player recreated it and Windows applied the persisted volume): record it with
     /// that session's original so the release restores it.
     Adopt { session: SessionInfo, original: f32 },
+    /// A parked session that must be held again but is already at the held volume (someone
+    /// set it there): list it again with its recorded original, without lowering.
+    Unpark { owned: usize },
 }
 
 /// Capture silenced after a default render device change (see the module docs).
@@ -220,6 +242,8 @@ pub struct Holder<S: SessionVolumes> {
     absorbed: HashSet<String>,
     /// Capture silenced after a default render device change.
     device_mute: Option<DeviceMute>,
+    /// Incremented whenever the set of parked sessions changes.
+    parked_epoch: u64,
 }
 
 /// True for a volume the holder lowers: finite, above `HELD_VOLUME` and not already held.
@@ -310,6 +334,7 @@ impl<S: SessionVolumes> Holder<S> {
             attach_unread: false,
             absorbed: HashSet::new(),
             device_mute: None,
+            parked_epoch: 0,
         }
     }
 
@@ -452,6 +477,7 @@ impl<S: SessionVolumes> Holder<S> {
         self.attach_failure = None;
         self.gain_from = self.effective;
         self.output_from = self.output_gain;
+        let mut unparked = false;
         for o in &mut self.owned {
             o.release_from = o.last_set.unwrap_or(o.entry.original_volume);
             o.release = if o.last_set.is_some() {
@@ -459,6 +485,11 @@ impl<S: SessionVolumes> Holder<S> {
             } else {
                 Release::NotLowered
             };
+            // Already at its original: nothing to restore, and no longer watched.
+            unparked |= std::mem::take(&mut o.parked);
+        }
+        if unparked {
+            self.parked_epoch += 1;
         }
         self.set_attenuation(1.0);
     }
@@ -508,6 +539,23 @@ impl<S: SessionVolumes> Holder<S> {
         let mut unlowered = self.original;
         let mut spiked = false;
         let mut candidates = Vec::new();
+        // Default render endpoint(s); `None` = unknown (nothing is parked then).
+        let defaults = self
+            .sessions
+            .default_render_endpoints()
+            .ok()
+            .filter(|d| !d.is_empty());
+        let on_default = |s: &SessionInfo| {
+            defaults
+                .as_ref()
+                .is_some_and(|d| d.contains(&s.endpoint_id))
+        };
+        // Plays nothing and cannot start playing unnoticed: inactive, default known, not on it.
+        let parkable = |s: &SessionInfo| !s.active && defaults.is_some() && !on_default(s);
+        let mut parked_any = false;
+        let mut new_parked: Vec<(SessionInfo, f32)> = Vec::new();
+        // Sessions held by this pass (lowered or listed again), for the device-mute check.
+        let mut held_now: Vec<String> = Vec::new();
         for s in &tree {
             let v = match self.sessions.volume(&s.instance_id) {
                 Ok(v) => v,
@@ -522,8 +570,39 @@ impl<S: SessionVolumes> Holder<S> {
                 .iter()
                 .position(|o| o.entry.instance_id == s.instance_id);
             match idx {
+                Some(i) if self.owned[i].parked => {
+                    if !(s.active || on_default(s)) {
+                        continue; // still cannot play
+                    }
+                    if should_lower(v) {
+                        candidates.push(Candidate::Lower {
+                            owned: Some(i),
+                            session: s.clone(),
+                            volume: v,
+                        });
+                    } else if is_held(v) {
+                        candidates.push(Candidate::Unpark { owned: i });
+                    }
+                    // Otherwise the user's own near-zero: it stays parked.
+                }
                 Some(i) if self.owned[i].last_set.is_some() => {
                     if is_held(v) {
+                        if parkable(s) {
+                            // Back to its original first, then out of the restore file (below):
+                            // a crash in between leaves an entry for a session that is no
+                            // longer held, which a restore leaves alone.
+                            let id = self.owned[i].entry.instance_id.clone();
+                            let original = self.owned[i].entry.original_volume;
+                            match self.sessions.set_volume(&id, original) {
+                                Ok(()) => {
+                                    let o = &mut self.owned[i];
+                                    o.parked = true;
+                                    o.last_set = None;
+                                    parked_any = true;
+                                }
+                                Err(e) => r.fail(format!("parking session {id} failed: {e}")),
+                            }
+                        }
                         continue;
                     }
                     r.overridden += 1;
@@ -549,7 +628,10 @@ impl<S: SessionVolumes> Holder<S> {
                     self.owned[i].last_set = Some(HELD_VOLUME);
                 }
                 owned => {
-                    if should_lower(v) {
+                    if should_lower(v) && owned.is_none() && parkable(s) {
+                        // A new session that cannot play: owned parked, never lowered.
+                        new_parked.push((s.clone(), v));
+                    } else if should_lower(v) {
                         candidates.push(Candidate::Lower {
                             owned,
                             session: s.clone(),
@@ -567,6 +649,18 @@ impl<S: SessionVolumes> Holder<S> {
             }
         }
 
+        for (session, v) in new_parked {
+            let entry = self.entry_for(&session, v, self.pid, self.created_at);
+            let mut o = Owned::new(entry);
+            o.parked = true;
+            o.ramp = false;
+            self.owned.push(o);
+            parked_any = true;
+        }
+        if parked_any {
+            self.parked_epoch += 1;
+        }
+        let mut file_written = false;
         if !candidates.is_empty() {
             match self.record_candidates(&candidates) {
                 Err(e) => {
@@ -579,10 +673,13 @@ impl<S: SessionVolumes> Holder<S> {
                     }
                 }
                 Ok(targets) => {
+                    file_written = true;
                     let mut lowered_min: Option<f32> = None;
                     for (i, lower) in targets {
                         let Some(v) = lower else {
-                            self.owned[i].last_set = Some(HELD_VOLUME); // adopted, already held
+                            // Adopted or listed again, already held.
+                            self.owned[i].last_set = Some(HELD_VOLUME);
+                            held_now.push(self.owned[i].entry.instance_id.clone());
                             continue;
                         };
                         // It played at `v` until now (a new session starts at whatever volume
@@ -595,6 +692,7 @@ impl<S: SessionVolumes> Holder<S> {
                         match self.sessions.set_volume(&id, HELD_VOLUME) {
                             Ok(()) => {
                                 self.owned[i].last_set = Some(HELD_VOLUME);
+                                held_now.push(id.clone());
                                 r.newly_lowered += 1;
                                 let o = self.owned[i].entry.original_volume;
                                 lowered_min = Some(lowered_min.map_or(o, |m| m.min(o)));
@@ -621,12 +719,25 @@ impl<S: SessionVolumes> Holder<S> {
                 }
             }
         }
+        if parked_any && !file_written {
+            // Drop the parked sessions' entries (they are back at their originals).
+            if let Err(e) = self.write_owned() {
+                r.fail(format!(
+                    "updating the restore file after parking failed: {e}"
+                ));
+            }
+        }
         self.settle_gain(now_us, degraded.then_some(unlowered), spiked);
         if let Some(m) = &self.device_mute {
-            let on_new_endpoint = m
-                .endpoint
-                .as_ref()
-                .is_none_or(|ep| tree.iter().any(|s| &s.endpoint_id == ep));
+            // The player is held on the new endpoint: a held session there that plays, or that
+            // this pass lowered before it could start (a stale inactive session does not count).
+            let on_new_endpoint = m.endpoint.as_ref().is_none_or(|ep| {
+                tree.iter().any(|s| {
+                    &s.endpoint_id == ep
+                        && self.holds(&s.instance_id)
+                        && (s.active || held_now.contains(&s.instance_id))
+                })
+            });
             if now_us >= m.until_us || (r.failed == 0 && !degraded && on_new_endpoint) {
                 self.device_mute = None;
             }
@@ -644,6 +755,43 @@ impl<S: SessionVolumes> Holder<S> {
                 endpoint,
             });
         }
+    }
+
+    /// Instance ids of the parked sessions (the engine watches their state changes).
+    pub fn parked_sessions(&self) -> Vec<String> {
+        self.owned
+            .iter()
+            .filter(|o| o.parked)
+            .map(|o| o.entry.instance_id.clone())
+            .collect()
+    }
+
+    /// Incremented whenever the set returned by [`Holder::parked_sessions`] changes.
+    pub fn parked_epoch(&self) -> u64 {
+        self.parked_epoch
+    }
+
+    /// The session is ours and held (not parked, last set to the held volume).
+    fn holds(&self, instance_id: &str) -> bool {
+        self.owned.iter().any(|o| {
+            o.entry.instance_id == instance_id && !o.parked && o.last_set.is_some_and(is_held)
+        })
+    }
+
+    /// Rewrites the restore file with the owned entries that are not parked.
+    fn write_owned(&self) -> io::Result<()> {
+        let ours: Vec<RestoreEntry> = self
+            .owned
+            .iter()
+            .filter(|o| !o.parked)
+            .map(|o| o.entry.clone())
+            .collect();
+        let ids = self
+            .owned
+            .iter()
+            .map(|o| o.entry.instance_id.clone())
+            .collect();
+        update_file(&self.restore_path, &ours, &ids, &self.absorbed)
     }
 
     /// Gain for the captured audio: `original / max(effective volume in the last 100 ms)`,
@@ -801,7 +949,7 @@ impl<S: SessionVolumes> Holder<S> {
                     .get_or_insert(format!("updating the restore file failed: {e}"));
             }
         }
-        self.owned.clear();
+        self.clear_owned();
         self.stage = Stage::Idle;
         self.output_gain = 0.0;
         self.lowered_any = false;
@@ -821,7 +969,7 @@ impl<S: SessionVolumes> Holder<S> {
                 out.failed, out.corrupt
             ));
         }
-        self.owned.clear();
+        self.clear_owned();
         self.stage = Stage::Idle;
         self.output_gain = 0.0;
         self.lowered_any = false;
@@ -832,14 +980,17 @@ impl<S: SessionVolumes> Holder<S> {
         self.set_attenuation(1.0);
     }
 
-    /// Writes the restore file with the candidates added (or their original updated) and,
-    /// on success, records them as owned. Returns `(owned index, Some(volume) to lower or
-    /// None when adopted)` per candidate.
+    /// Writes the restore file with the candidates added (or their original updated, or
+    /// listed again when parked) and, on success, records them as owned (no longer parked).
+    /// Returns `(owned index, Some(volume) to lower, or None when adopted / listed again
+    /// already held)` per candidate.
     fn record_candidates(
         &mut self,
         candidates: &[Candidate],
     ) -> io::Result<Vec<(usize, Option<f32>)>> {
-        let mut ours: Vec<RestoreEntry> = self.owned.iter().map(|o| o.entry.clone()).collect();
+        let mut entries: Vec<RestoreEntry> = self.owned.iter().map(|o| o.entry.clone()).collect();
+        // Which entries the file lists: every owned one that is not parked, plus candidates.
+        let mut listed: Vec<bool> = self.owned.iter().map(|o| !o.parked).collect();
         let mut targets = Vec::with_capacity(candidates.len());
         for c in candidates {
             match c {
@@ -848,7 +999,8 @@ impl<S: SessionVolumes> Holder<S> {
                     volume,
                     ..
                 } => {
-                    ours[*i].original_volume = *volume;
+                    entries[*i].original_volume = *volume;
+                    listed[*i] = true;
                     targets.push((*i, Some(*volume)));
                 }
                 Candidate::Lower {
@@ -856,24 +1008,52 @@ impl<S: SessionVolumes> Holder<S> {
                     session,
                     volume,
                 } => {
-                    targets.push((ours.len(), Some(*volume)));
-                    ours.push(self.entry_for(session, *volume, self.pid, self.created_at));
+                    targets.push((entries.len(), Some(*volume)));
+                    entries.push(self.entry_for(session, *volume, self.pid, self.created_at));
+                    listed.push(true);
                 }
                 Candidate::Adopt { session, original } => {
-                    targets.push((ours.len(), None));
-                    ours.push(self.entry_for(session, *original, self.pid, self.created_at));
+                    targets.push((entries.len(), None));
+                    entries.push(self.entry_for(session, *original, self.pid, self.created_at));
+                    listed.push(true);
+                }
+                Candidate::Unpark { owned } => {
+                    listed[*owned] = true;
+                    targets.push((*owned, None));
                 }
             }
         }
-        let ids = ours.iter().map(|e| e.instance_id.clone()).collect();
+        let ours: Vec<RestoreEntry> = entries
+            .iter()
+            .zip(&listed)
+            .filter(|(_, l)| **l)
+            .map(|(e, _)| e.clone())
+            .collect();
+        let ids = entries.iter().map(|e| e.instance_id.clone()).collect();
         update_file(&self.restore_path, &ours, &ids, &self.absorbed)?;
         let known = self.owned.len();
-        for (o, e) in self.owned.iter_mut().zip(&ours) {
+        let mut unparked = false;
+        for ((o, e), l) in self.owned.iter_mut().zip(&entries).zip(&listed) {
             o.entry = e.clone();
+            if *l && o.parked {
+                o.parked = false;
+                unparked = true;
+            }
+        }
+        if unparked {
+            self.parked_epoch += 1;
         }
         self.owned
-            .extend(ours.into_iter().skip(known).map(Owned::new));
+            .extend(entries.into_iter().skip(known).map(Owned::new));
         Ok(targets)
+    }
+
+    /// Forgets every owned session (bumping the parked epoch if any was parked).
+    fn clear_owned(&mut self) {
+        if self.owned.iter().any(|o| o.parked) {
+            self.parked_epoch += 1;
+        }
+        self.owned.clear();
     }
 
     /// Original volume of a held session with this (non-empty) session identifier.
@@ -1954,6 +2134,295 @@ mod tests {
         h.sessions().set_process_created(PID, None);
         assert!(h.follow(T0 + 201 * MS).player_exited);
         assert_eq!(h.capture_gain(T0 + 202 * MS), 1.0);
+    }
+
+    /// Player session `id` on endpoint `ep`, active or not, with its own identifier.
+    fn sess(id: &str, ep: &str, active: bool) -> SessionInfo {
+        SessionInfo {
+            instance_id: id.into(),
+            session_identifier: format!("{ep}|ident:{id}"),
+            pid: PID,
+            endpoint_id: ep.into(),
+            active,
+        }
+    }
+
+    /// A holder whose player has `sessions` as (id, endpoint, active, volume); the default
+    /// render endpoint is `ep1`.
+    fn parking_holder(dir: &TempDir, sessions: &[(&str, &str, bool, f32)]) -> Holder<FakeSessions> {
+        let f = FakeSessions::new();
+        f.set_process_created(PID, Some(CREATED));
+        f.set_default_endpoints(&["ep1"]);
+        for &(id, ep, active, v) in sessions {
+            f.add_session(sess(id, ep, active), v, false);
+        }
+        Holder::new(f, dir.file())
+    }
+
+    #[test]
+    fn parks_only_inactive_sessions_off_the_default_endpoint() {
+        let dir = TempDir::new("park");
+        let mut h = parking_holder(
+            &dir,
+            &[
+                ("play", "ep1", true, 0.5),
+                ("paused", "ep1", false, 0.6), // default endpoint: never parked
+                ("idle", "ep2", false, 0.4),   // parked
+                ("pinned", "ep3", true, 0.7),  // active: never parked
+            ],
+        );
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let g = h.capture_gain(T0 + 200 * MS);
+        let e0 = (h.parked_epoch(), h.attenuation_epoch(), h.attenuation());
+        let n = h.sessions().writes().len();
+
+        let t = T0 + 500 * MS;
+        let r = h.follow(t);
+        assert_eq!(r, FollowReport::default());
+        assert_eq!(vol(&h, "idle"), 0.4, "back at its original");
+        for id in ["play", "paused", "pinned"] {
+            assert_eq!(vol(&h, id), HELD_VOLUME, "{id}");
+        }
+        assert_eq!(h.sessions().writes()[n..], [("idle".to_string(), 0.4)]);
+        assert_eq!(entry_ids(&dir), vec!["play", "paused", "pinned"]);
+        assert_eq!(h.parked_sessions(), vec!["idle"]);
+        assert_eq!(h.parked_epoch(), e0.0 + 1);
+        // The capture reference is not raised by parking (still the 0.4 of `idle`).
+        assert_eq!((h.attenuation_epoch(), h.attenuation()), (e0.1, e0.2));
+        assert_eq!(h.capture_gain(t + 200 * MS), g);
+        // A second pass changes nothing.
+        let n = h.sessions().writes().len();
+        assert_eq!(h.follow(t + 500 * MS), FollowReport::default());
+        assert_eq!(h.sessions().writes().len(), n);
+        assert_eq!(h.parked_epoch(), e0.0 + 1);
+    }
+
+    #[test]
+    fn nothing_is_parked_while_the_default_endpoint_is_unknown() {
+        for unknown in ["none", "error"] {
+            let dir = TempDir::new("park-unknown");
+            let mut h = parking_holder(
+                &dir,
+                &[("play", "ep1", true, 0.5), ("idle", "ep2", false, 0.4)],
+            );
+            match unknown {
+                "none" => h.sessions().set_default_endpoints(&[]),
+                _ => h.sessions().fail_default_endpoints(),
+            }
+            assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+            assert_eq!(
+                h.follow(T0 + 500 * MS),
+                FollowReport::default(),
+                "{unknown}"
+            );
+            assert_eq!(vol(&h, "idle"), HELD_VOLUME, "{unknown}");
+            assert!(h.parked_sessions().is_empty());
+            assert_eq!(entry_ids(&dir), vec!["play", "idle"]);
+        }
+    }
+
+    #[test]
+    fn a_parked_session_stays_parked_while_the_default_is_unknown() {
+        let dir = TempDir::new("park-then-unknown");
+        let mut h = parking_holder(
+            &dir,
+            &[("play", "ep1", true, 0.5), ("idle", "ep2", false, 0.4)],
+        );
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        h.follow(T0 + 500 * MS);
+        assert_eq!(h.parked_sessions(), vec!["idle"]);
+        h.sessions().fail_default_endpoints();
+        assert_eq!(h.follow(T0 + 1000 * MS), FollowReport::default());
+        assert_eq!(vol(&h, "idle"), 0.4);
+        // ...but turning active holds it again, default known or not.
+        h.sessions().set_active("idle", true);
+        assert_eq!(h.follow(T0 + 1500 * MS).newly_lowered, 1);
+        assert_eq!(vol(&h, "idle"), HELD_VOLUME);
+    }
+
+    #[test]
+    fn default_change_lowers_the_parked_session_on_the_new_default_before_it_plays() {
+        let dir = TempDir::new("park-default-change");
+        let mut h = parking_holder(&dir, &[("a", "ep1", true, 0.3), ("b", "ep2", false, 0.3)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let t = T0 + 500 * MS;
+        h.follow(t);
+        assert_eq!(
+            (vol(&h, "b"), h.parked_sessions()),
+            (0.3, vec!["b".to_string()])
+        );
+        let e = h.parked_epoch();
+
+        // The default moves to ep2; the event-driven pass runs before the player starts there.
+        let tc = t + 500 * MS;
+        h.sessions().set_default_endpoints(&["ep2"]);
+        h.default_device_changed(tc, Some("ep2".into()));
+        let seen = track_file_before_write(&h, dir.file());
+        let r = h.follow(tc);
+        assert_eq!(r.newly_lowered, 1);
+        assert_eq!(vol(&h, "b"), HELD_VOLUME, "lowered while still inactive");
+        assert_eq!(
+            *seen.borrow(),
+            vec![true],
+            "listed in the restore file first"
+        );
+        assert!(h.parked_sessions().is_empty());
+        assert_eq!(h.parked_epoch(), e + 1);
+        let entry = entries(&dir)
+            .into_iter()
+            .find(|e| e.instance_id == "b")
+            .unwrap();
+        assert_eq!(entry.original_volume, 0.3);
+        // Held on the new default before it could start: the mute ends, and the gain is the
+        // conservative one (it was at 0.3 until now): never above original / 0.3.
+        for ms in 0..=100 {
+            let g = h.capture_gain(tc + ms * MS);
+            assert!(g > 0.0 && g <= 0.3 / 0.3 + 1e-6, "+{ms} ms: {g}");
+        }
+        assert!((h.capture_gain(tc + 101 * MS) - 3000.0).abs() < 0.05);
+
+        // The player's stream moves: a stops (and is parked), b plays.
+        h.sessions().set_active("a", false);
+        h.sessions().set_active("b", true);
+        let r = h.follow(tc + 500 * MS);
+        assert_eq!((r.newly_lowered, r.failed), (0, 0));
+        assert_eq!((vol(&h, "a"), vol(&h, "b")), (0.3, HELD_VOLUME));
+        assert_eq!(h.parked_sessions(), vec!["a"]);
+        assert_eq!(entry_ids(&dir), vec!["b"]);
+    }
+
+    #[test]
+    fn a_parked_session_turning_active_is_lowered_again() {
+        let dir = TempDir::new("park-state");
+        let mut h = parking_holder(&dir, &[("a", "ep1", true, 0.3), ("b", "ep2", false, 0.6)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        h.follow(T0 + 500 * MS);
+        assert_eq!(vol(&h, "b"), 0.6);
+        // The player (pinned to ep2) starts playing there.
+        h.sessions().set_active("b", true);
+        let t = T0 + 700 * MS;
+        let r = h.follow(t);
+        assert_eq!(r.newly_lowered, 1);
+        assert_eq!(vol(&h, "b"), HELD_VOLUME);
+        assert_eq!(entry_ids(&dir), vec!["a", "b"]);
+        assert!(h.parked_sessions().is_empty());
+        // It played at 0.6 until now: no more than 0.3 / 0.6 for the window.
+        assert!(h.capture_gain(t) <= 0.3 / 0.6 + 1e-6);
+        assert!(h.capture_gain(t + 100 * MS) <= 0.3 / 0.6 + 1e-6);
+        assert!((h.capture_gain(t + 101 * MS) - 3000.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn a_parked_session_the_user_turned_up_keeps_that_as_its_original() {
+        let dir = TempDir::new("park-user");
+        let mut h = parking_holder(&dir, &[("a", "ep1", true, 0.3), ("b", "ep2", false, 0.6)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        h.follow(T0 + 500 * MS);
+        h.sessions().set_volume("b", 0.9).unwrap();
+        h.sessions().set_active("b", true);
+        assert_eq!(h.follow(T0 + 1000 * MS).newly_lowered, 1);
+        let entry = entries(&dir)
+            .into_iter()
+            .find(|e| e.instance_id == "b")
+            .unwrap();
+        assert_eq!(entry.original_volume, 0.9);
+        assert_eq!(release(&mut h, T0 + 1500 * MS), HolderPhase::Idle);
+        assert_eq!(vol(&h, "b"), 0.9);
+    }
+
+    #[test]
+    fn a_new_idle_session_off_the_default_is_owned_parked_without_lowering() {
+        let dir = TempDir::new("park-new");
+        let mut h = parking_holder(&dir, &[("a", "ep1", true, 0.3)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        h.sessions()
+            .add_session(sess("n", "ep2", false), 1.0, false);
+        let n = h.sessions().writes().len();
+        let t = T0 + 500 * MS;
+        assert_eq!(h.follow(t), FollowReport::default());
+        assert_eq!(h.sessions().writes().len(), n, "never touched");
+        assert_eq!(h.parked_sessions(), vec!["n"]);
+        assert_eq!(entry_ids(&dir), vec!["a"]);
+        assert!((h.capture_gain(t) - 3000.0).abs() < 0.05, "no gain dip");
+        // It starts playing: lowered at once, never amplified.
+        h.sessions().set_active("n", true);
+        let t = t + 200 * MS;
+        assert_eq!(h.follow(t).newly_lowered, 1);
+        assert_eq!(vol(&h, "n"), HELD_VOLUME);
+        assert!(h.capture_gain(t) <= 0.3 / 1.0 + 1e-6);
+        assert_eq!(entry_ids(&dir), vec!["a", "n"]);
+    }
+
+    #[test]
+    fn release_and_player_exit_leave_every_session_at_its_original() {
+        for exit in [false, true] {
+            let dir = TempDir::new("park-release");
+            let mut h = parking_holder(
+                &dir,
+                &[
+                    ("a", "ep1", true, 0.3),
+                    ("b", "ep2", false, 0.6),
+                    ("c", "ep3", false, 0.8),
+                ],
+            );
+            assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+            h.follow(T0 + 500 * MS);
+            assert_eq!(h.parked_sessions(), vec!["b", "c"]);
+            let e = h.parked_epoch();
+            // c is held again before the end.
+            h.sessions().set_active("c", true);
+            h.follow(T0 + 1000 * MS);
+            assert_eq!(h.parked_sessions(), vec!["b"]);
+            if exit {
+                h.sessions().set_process_created(PID, None);
+                assert!(h.follow(T0 + 1500 * MS).player_exited);
+            } else {
+                assert_eq!(release(&mut h, T0 + 1500 * MS), HolderPhase::Idle);
+            }
+            assert_eq!(
+                (vol(&h, "a"), vol(&h, "b"), vol(&h, "c")),
+                (0.3, 0.6, 0.8),
+                "exit: {exit}"
+            );
+            assert!(!dir.file().exists());
+            assert!(h.parked_sessions().is_empty());
+            assert!(h.parked_epoch() > e + 1, "the watches are dropped");
+        }
+    }
+
+    #[test]
+    fn a_crash_after_parking_leaves_nothing_to_restore_for_the_parked_session() {
+        let dir = TempDir::new("park-crash");
+        let mut h = parking_holder(&dir, &[("a", "ep1", true, 0.3), ("b", "ep2", false, 0.6)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        h.follow(T0 + 500 * MS);
+        // The engine dies here: the app's restore only sees `a`.
+        let out = restore::restore(&dir.file(), h.sessions());
+        assert_eq!((out.restored, out.awaiting_player, out.failed), (1, 0, 0));
+        assert_eq!((vol(&h, "a"), vol(&h, "b")), (0.3, 0.6));
+    }
+
+    #[test]
+    fn a_stale_inactive_session_on_the_new_endpoint_does_not_end_the_mute() {
+        let dir = TempDir::new("mute-stale");
+        // Default unknown, so nothing is parked: `b` stays held but idle on ep2.
+        let mut h = holder(&dir, &[]);
+        h.sessions().add_session(sess("a", "ep1", true), 0.3, false);
+        h.sessions()
+            .add_session(sess("b", "ep2", false), 0.3, false);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let t = T0 + 500 * MS;
+        h.default_device_changed(t, Some("ep2".into()));
+        assert_eq!(h.follow(t + MS), FollowReport::default());
+        assert_eq!(
+            h.capture_gain(t + MS),
+            0.0,
+            "held but idle there: still silent"
+        );
+        // The player starts on ep2 (joining the held session): the mute ends.
+        h.sessions().set_active("b", true);
+        assert_eq!(h.follow(t + 20 * MS), FollowReport::default());
+        assert!((h.capture_gain(t + 20 * MS) - 3000.0).abs() < 0.05);
     }
 
     #[test]

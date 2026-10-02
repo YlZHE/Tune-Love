@@ -12,11 +12,12 @@ use crate::sessions::{endpoint_of_instance, SessionInfo, SessionVolumes};
 use std::collections::{HashMap, HashSet};
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, STILL_ACTIVE,
+    CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, FILETIME, HANDLE, STILL_ACTIVE,
 };
 use windows::Win32::Media::Audio::{
-    eRender, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2,
-    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eConsole, eMultimedia, eRender, AudioSessionStateActive, IAudioSessionControl2,
+    IAudioSessionManager2, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
+    DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -309,6 +310,12 @@ fn find(wanted: &str) -> Result<Option<(SessionInfo, RawSession)>, String> {
     }
 }
 
+/// The session control of the session with this instance identifier (see [`find`] for when
+/// it is `Ok(None)`), e.g. to subscribe to its events. COM (MTA) must be initialised.
+pub fn session_control(instance_id: &str) -> Result<Option<IAudioSessionControl2>, String> {
+    Ok(find(instance_id)?.map(|(_, s)| s.control))
+}
+
 fn volume_control(instance_id: &str) -> Result<ISimpleAudioVolume, String> {
     let (_, s) = find(instance_id)?.ok_or_else(|| format!("no such session: {instance_id}"))?;
     s.control
@@ -385,6 +392,29 @@ impl SessionVolumes for WinSessions {
 
     fn process_created(&self, pid: u32) -> Result<Option<u64>, String> {
         query_created(pid)
+    }
+
+    fn default_render_endpoints(&self) -> Result<Vec<String>, String> {
+        let en: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .map_err(|e| format!("MMDeviceEnumerator: {e}"))?;
+        let mut out = Vec::new();
+        for role in [eConsole, eMultimedia] {
+            match unsafe { en.GetDefaultAudioEndpoint(eRender, role) } {
+                Ok(dev) => {
+                    let id = unsafe { dev.GetId() }
+                        .map_err(|e| format!("default render endpoint id: {e}"))?;
+                    let id = take_pwstr(id)?;
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+                // No render endpoint at all.
+                Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult() => {}
+                Err(e) => return Err(format!("default render endpoint: {e}")),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -504,6 +534,20 @@ mod tests {
         );
         let got = WinSessions.process_created(child.0.id());
         assert!(matches!(got, Ok(Some(t)) if t > 0), "{got:?}");
+    }
+
+    #[test]
+    fn default_render_endpoints_are_active_render_endpoints() {
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        assert!(hr.is_ok(), "{hr:?}");
+        let defaults = WinSessions.default_render_endpoints().expect("query");
+        let active = enumerate().expect("enumerate").active_endpoints;
+        assert!(defaults.len() <= 2);
+        for d in &defaults {
+            assert!(active.contains(d), "{d} not among {active:?}");
+        }
+        unsafe { CoUninitialize() };
     }
 
     #[test]

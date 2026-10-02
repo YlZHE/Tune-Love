@@ -49,6 +49,10 @@ pub trait SessionVolumes {
     /// somewhere and still reports a creation time). `Err`: the query failed for another
     /// reason (e.g. access denied); callers must not treat that as "gone".
     fn process_created(&self, pid: u32) -> Result<Option<u64>, String>;
+    /// Ids of the current default render endpoint for the console and multimedia roles
+    /// (usually one id; two when the roles differ). Empty when there is no default render
+    /// endpoint. Callers treat an empty list or an `Err` as "unknown".
+    fn default_render_endpoints(&self) -> Result<Vec<String>, String>;
 }
 
 #[cfg(any(test, feature = "fake"))]
@@ -81,6 +85,9 @@ mod fake {
         fail_sessions_with_identifier: HashSet<String>,
         /// Endpoints marked unplugged/disabled: their sessions are not enumerated.
         inactive_endpoints: HashSet<String>,
+        /// `default_render_endpoints`; empty (unknown) unless a test sets it.
+        default_endpoints: Vec<String>,
+        fail_default_endpoints: bool,
     }
 
     impl State {
@@ -236,9 +243,20 @@ mod fake {
             }
         }
 
+        /// Sets the default render endpoint(s) (`&[]`: none, i.e. unknown).
+        pub fn set_default_endpoints(&self, ids: &[&str]) {
+            self.state.borrow_mut().default_endpoints = ids.iter().map(|s| s.to_string()).collect();
+        }
+
+        /// Makes `default_render_endpoints` return an error until `clear_failures`.
+        pub fn fail_default_endpoints(&self) {
+            self.state.borrow_mut().fail_default_endpoints = true;
+        }
+
         /// Clears all injected failures (not endpoint states).
         pub fn clear_failures(&self) {
             let mut st = self.state.borrow_mut();
+            st.fail_default_endpoints = false;
             st.fail_session.clear();
             st.fail_volume.clear();
             st.fail_set_volume.clear();
@@ -360,6 +378,14 @@ mod fake {
                 return Err(format!("injected process_created failure: {pid}"));
             }
             Ok(st.created.get(&pid).copied())
+        }
+
+        fn default_render_endpoints(&self) -> Result<Vec<String>, String> {
+            let st = self.state.borrow();
+            if st.fail_default_endpoints {
+                return Err("injected default_render_endpoints failure".into());
+            }
+            Ok(st.default_endpoints.clone())
         }
     }
 }
@@ -492,6 +518,18 @@ mod tests {
         );
         assert_eq!(f.set_volume_calls(), 2);
         assert_eq!(*seen.borrow(), f.writes());
+    }
+
+    #[test]
+    fn fake_default_endpoints_are_settable_and_fail_on_request() {
+        let f = FakeSessions::new();
+        assert_eq!(f.default_render_endpoints(), Ok(vec![]));
+        f.set_default_endpoints(&["ep"]);
+        assert_eq!(f.default_render_endpoints(), Ok(vec!["ep".to_string()]));
+        f.fail_default_endpoints();
+        assert!(f.default_render_endpoints().is_err());
+        f.clear_failures();
+        assert_eq!(f.default_render_endpoints(), Ok(vec!["ep".to_string()]));
     }
 
     #[test]

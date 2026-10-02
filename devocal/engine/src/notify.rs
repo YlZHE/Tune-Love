@@ -12,7 +12,10 @@
 //!   (`Holder::default_device_changed`) and a follow runs at once;
 //! - endpoints added, removed or changing state: [`SessionWatcher::maintain`] (re)registers
 //!   on the active endpoints, then asks for a follow (a session may have been created before
-//!   the registration).
+//!   the registration);
+//! - a parked session (see `holder`) turning active: [`SessionWatcher::watch_states`] keeps an
+//!   `IAudioSessionEvents` registration on exactly the parked sessions; `OnStateChanged` to
+//!   active asks for a follow, which holds the session again within one loop pass.
 //!
 //! Documented quirk: `IAudioSessionManager2` delivers `OnSessionCreated` only after
 //! `GetSessionEnumerator` has been called once on that manager, so registration calls it
@@ -23,9 +26,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::{implement, Ref, Result as WinResult, PCWSTR};
+use windows::core::{BOOL, GUID};
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
-    eConsole, eMultimedia, eRender, EDataFlow, ERole, IAudioSessionControl, IAudioSessionManager2,
+    eConsole, eMultimedia, eRender, AudioSessionDisconnectReason, AudioSessionState,
+    AudioSessionStateActive, EDataFlow, ERole, IAudioSessionControl, IAudioSessionControl2,
+    IAudioSessionEvents, IAudioSessionEvents_Impl, IAudioSessionManager2,
     IAudioSessionNotification, IAudioSessionNotification_Impl, IMMDeviceEnumerator,
     IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator, DEVICE_STATE,
     DEVICE_STATE_ACTIVE,
@@ -36,6 +42,8 @@ use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
 #[derive(Debug, Default)]
 pub struct SessionSignals {
     session_created: AtomicBool,
+    /// A watched (parked) session became active.
+    state_changed: AtomicBool,
     endpoints_changed: AtomicBool,
     /// The latest default render device change: `Some(new endpoint id)`; the inner `None`
     /// means there is no default render device any more (or its id was unreadable).
@@ -46,6 +54,11 @@ impl SessionSignals {
     /// A session was created on some render endpoint.
     pub fn notify_session_created(&self) {
         self.session_created.store(true, Ordering::Release);
+    }
+
+    /// A watched (parked) session became active.
+    pub fn notify_state_changed(&self) {
+        self.state_changed.store(true, Ordering::Release);
     }
 
     /// Render endpoints were added or removed, or changed state.
@@ -63,6 +76,10 @@ impl SessionSignals {
 
     pub fn take_session_created(&self) -> bool {
         self.session_created.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn take_state_changed(&self) -> bool {
+        self.state_changed.swap(false, Ordering::AcqRel)
     }
 
     pub fn take_endpoints_changed(&self) -> bool {
@@ -86,6 +103,50 @@ struct SessionCallback {
 impl IAudioSessionNotification_Impl for SessionCallback_Impl {
     fn OnSessionCreated(&self, _new_session: Ref<IAudioSessionControl>) -> WinResult<()> {
         self.signals.notify_session_created();
+        Ok(())
+    }
+}
+
+#[implement(IAudioSessionEvents)]
+struct StateCallback {
+    signals: Arc<SessionSignals>,
+}
+
+impl IAudioSessionEvents_Impl for StateCallback_Impl {
+    fn OnDisplayNameChanged(&self, _name: &PCWSTR, _context: *const GUID) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn OnIconPathChanged(&self, _path: &PCWSTR, _context: *const GUID) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn OnSimpleVolumeChanged(&self, _volume: f32, _mute: BOOL, _ctx: *const GUID) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn OnChannelVolumeChanged(
+        &self,
+        _count: u32,
+        _volumes: *const f32,
+        _changed: u32,
+        _context: *const GUID,
+    ) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn OnGroupingParamChanged(&self, _param: *const GUID, _context: *const GUID) -> WinResult<()> {
+        Ok(())
+    }
+
+    fn OnStateChanged(&self, state: AudioSessionState) -> WinResult<()> {
+        if state == AudioSessionStateActive {
+            self.signals.notify_state_changed();
+        }
+        Ok(())
+    }
+
+    fn OnSessionDisconnected(&self, _reason: AudioSessionDisconnectReason) -> WinResult<()> {
         Ok(())
     }
 }
@@ -138,6 +199,9 @@ pub struct SessionWatcher {
     session_cb: IAudioSessionNotification,
     /// Session managers registered with `session_cb`, by endpoint id.
     managers: Vec<(String, IAudioSessionManager2)>,
+    state_cb: IAudioSessionEvents,
+    /// Sessions registered with `state_cb`, by instance id (the parked sessions).
+    state_watches: Vec<(String, IAudioSessionControl2)>,
     signals: Arc<SessionSignals>,
 }
 
@@ -160,11 +224,17 @@ impl SessionWatcher {
             signals: signals.clone(),
         }
         .into();
+        let state_cb: IAudioSessionEvents = StateCallback {
+            signals: signals.clone(),
+        }
+        .into();
         let mut watcher = Self {
             enumerator,
             endpoint_cb,
             session_cb,
             managers: Vec::new(),
+            state_cb,
+            state_watches: Vec::new(),
             signals,
         };
         if let Err(e) = watcher.refresh() {
@@ -183,6 +253,50 @@ impl SessionWatcher {
             eprintln!("devocal engine: session notifications: {e}");
         }
         self.signals.notify_session_created();
+    }
+
+    /// Watches exactly the sessions in `instance_ids` for state changes (call it whenever the
+    /// holder's parked set changes): unregisters the others, registers the new ones. A
+    /// session that cannot be found or registered is logged; the 0.5 s follow covers it. After
+    /// a new registration a follow is requested, in case the session turned active before.
+    pub fn watch_states(&mut self, instance_ids: &[String]) {
+        let cb = &self.state_cb;
+        self.state_watches.retain(|(id, ctl)| {
+            let keep = instance_ids.contains(id);
+            if !keep {
+                let _ = unsafe { ctl.UnregisterAudioSessionNotification(cb) };
+            }
+            keep
+        });
+        let mut added = false;
+        for id in instance_ids {
+            if self.state_watches.iter().any(|(w, _)| w == id) {
+                continue;
+            }
+            match devocal_core::sessions_win::session_control(id) {
+                Ok(Some(ctl)) => match unsafe { ctl.RegisterAudioSessionNotification(cb) } {
+                    Ok(()) => {
+                        self.state_watches.push((id.clone(), ctl));
+                        added = true;
+                    }
+                    Err(e) => eprintln!("devocal engine: watching session {id}: {e}"),
+                },
+                Ok(None) => {} // gone; the next follow forgets or re-finds it
+                Err(e) => eprintln!("devocal engine: watching session {id}: {e}"),
+            }
+        }
+        if added {
+            self.signals.notify_state_changed();
+        }
+    }
+
+    /// Instance ids currently watched for state changes.
+    #[cfg(test)]
+    pub fn watched(&self) -> Vec<String> {
+        self.state_watches
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Endpoint ids currently registered for session notifications.
@@ -257,6 +371,9 @@ impl SessionWatcher {
 
 impl Drop for SessionWatcher {
     fn drop(&mut self) {
+        for (_, ctl) in self.state_watches.drain(..) {
+            let _ = unsafe { ctl.UnregisterAudioSessionNotification(&self.state_cb) };
+        }
         for (_, mgr) in self.managers.drain(..) {
             let _ = unsafe { mgr.UnregisterSessionNotification(&self.session_cb) };
         }
@@ -279,6 +396,10 @@ mod tests {
         assert!(!s.take_session_created());
         assert!(!s.take_endpoints_changed());
         assert_eq!(s.take_default_changed(), None);
+        assert!(!s.take_state_changed());
+        s.notify_state_changed();
+        assert!(s.take_state_changed());
+        assert!(!s.take_state_changed());
         s.notify_session_created();
         s.notify_endpoints_changed();
         s.notify_default_changed(Some("ep-a".into()));
@@ -348,6 +469,28 @@ mod tests {
             session.OnSessionCreated(None).unwrap();
         }
         assert!(signals.take_session_created());
+
+        let events: IAudioSessionEvents = StateCallback {
+            signals: signals.clone(),
+        }
+        .into();
+        unsafe {
+            events
+                .OnStateChanged(windows::Win32::Media::Audio::AudioSessionStateInactive)
+                .unwrap();
+            events
+                .OnSimpleVolumeChanged(0.5, false, std::ptr::null())
+                .unwrap();
+        }
+        assert!(
+            !signals.take_state_changed(),
+            "only a change to active counts"
+        );
+        unsafe {
+            events.OnStateChanged(AudioSessionStateActive).unwrap();
+        }
+        assert!(signals.take_state_changed());
+        assert!(!signals.take_session_created());
     }
 
     /// Registers on the real endpoints and unregisters again. Read-only: no session is
@@ -363,6 +506,11 @@ mod tests {
         w.maintain();
         assert_eq!(w.registered().len(), n);
         assert!(signals.take_session_created());
+        // An instance id that matches no session: nothing is watched, nothing requested.
+        w.watch_states(&["{no-such-endpoint}|nothing".to_string()]);
+        assert!(w.watched().is_empty());
+        assert!(!signals.take_state_changed());
+        w.watch_states(&[]);
         drop(w);
     }
 
@@ -395,6 +543,21 @@ mod tests {
         }
         eprintln!("session notification after {:?}", started.elapsed());
         assert!(seen, "no OnSessionCreated within 2 s");
+        // Watch that session's state changes (as for a parked session), then stop again.
+        use devocal_core::sessions::SessionVolumes;
+        let ours = devocal_core::sessions_win::WinSessions
+            .sessions_for_tree(std::process::id())
+            .unwrap();
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        let mut w = w;
+        w.watch_states(&[ours[0].instance_id.clone()]);
+        assert_eq!(w.watched(), vec![ours[0].instance_id.clone()]);
+        assert!(
+            signals.take_state_changed(),
+            "a new watch asks for a follow"
+        );
+        w.watch_states(&[]);
+        assert!(w.watched().is_empty());
         drop(client);
         drop(w);
     }

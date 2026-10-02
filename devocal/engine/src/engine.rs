@@ -38,7 +38,9 @@
 //!    notification arrived ([`SessionSignals`]: a new session, a default render device
 //!    change): `Holder::follow` while active; every 0.5 s and after a notification also the
 //!    output endpoint check. A default render device change while attaching or active first
-//!    silences the capture (`Holder::default_device_changed`);
+//!    silences the capture (`Holder::default_device_changed`). A watched parked session that
+//!    turned active counts as a notification; [`run`] keeps the watches on exactly the
+//!    Holder's parked sessions;
 //! 6. `SharedGains` from the Holder (after the tick and follow, so the audio threads see the
 //!    gain that matches the volumes just set);
 //! 7. `Metrics` once per second;
@@ -299,6 +301,16 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
     /// The flags the notification callbacks set ([`SessionWatcher`] in [`run`]).
     pub fn signals(&self) -> Arc<SessionSignals> {
         self.signals.clone()
+    }
+
+    /// Incremented whenever the Holder's parked sessions change ([`Self::parked_sessions`]).
+    pub fn parked_epoch(&self) -> u64 {
+        self.holder.parked_epoch()
+    }
+
+    /// The parked sessions, whose state changes [`run`] watches.
+    pub fn parked_sessions(&self) -> Vec<String> {
+        self.holder.parked_sessions()
     }
 
     #[cfg(test)]
@@ -743,7 +755,8 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             self.next_check_us = Some(now_us + CHECK_INTERVAL_US);
         }
         // Notifications are taken every pass; they matter only while holding.
-        let created = self.signals.take_session_created();
+        // A new session, or a watched (parked) session turned active.
+        let created = self.signals.take_session_created() | self.signals.take_state_changed();
         let default_changed = self.signals.take_default_changed();
         let holding = matches!(self.phase, Phase::Attaching | Phase::Active);
         if holding {
@@ -1224,6 +1237,7 @@ pub fn run(args: Args) -> i32 {
     let mut st = LoopState::default();
     let mut clock = now_us;
     let mut reader_done = false;
+    let mut watched_epoch = core.parked_epoch();
     loop {
         let mut input = LoopInput::default();
         while !reader_done {
@@ -1240,6 +1254,13 @@ pub fn run(args: Args) -> i32 {
         }
         let mut events = Vec::new();
         let exit = loop_once(&mut core, &mut st, input, &mut clock, &mut events);
+        // Watch exactly the parked sessions' state changes (none once released or exited).
+        if core.parked_epoch() != watched_epoch {
+            watched_epoch = core.parked_epoch();
+            if let Some(w) = watcher.as_mut() {
+                w.watch_states(&core.parked_sessions());
+            }
+        }
         for e in &events {
             match encode(e) {
                 Ok(line) => {
@@ -2242,6 +2263,77 @@ mod tests {
             (published_capture_gain(&r) - 8000.0).abs() < 0.5,
             "a stale device change does not mute a new hold"
         );
+    }
+
+    /// Attached with ep1 as the default and an idle player session on ep2 that the first
+    /// follow parks (owned, never lowered). Returns the rig after that follow.
+    fn attached_with_parked(tag: &str) -> Rig {
+        let (mut r, _) = Rig::attached(tag);
+        r.core.sessions().set_default_endpoints(&["ep1"]);
+        let mut idle = session(SESSION2, "ep2");
+        idle.active = false;
+        r.core.sessions().add_session(idle, 0.8, false);
+        r.run(600);
+        assert_eq!(r.core.parked_sessions(), vec![SESSION2.to_string()]);
+        assert_eq!(r.volume(SESSION2), 0.8);
+        r
+    }
+
+    #[test]
+    fn a_parked_session_turning_active_is_held_within_one_pass() {
+        let mut r = attached_with_parked("parked-state");
+        let epoch = r.core.parked_epoch();
+        // The player (pinned to ep2) starts there; the watched session reports it.
+        r.core.sessions().set_active(SESSION2, true);
+        r.core.signals().notify_state_changed();
+        r.run(1);
+        assert_eq!(r.volume(SESSION2), HELD_VOLUME);
+        assert!(r.core.parked_sessions().is_empty());
+        assert_ne!(r.core.parked_epoch(), epoch, "the watch is dropped");
+        let g = published_capture_gain(&r);
+        assert!(g > 0.0 && g <= 0.8 / 0.8 + 1e-6, "{g}");
+        r.run(101);
+        assert!((published_capture_gain(&r) - 8000.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn default_change_holds_the_parked_session_on_the_new_default_in_the_same_pass() {
+        let mut r = attached_with_parked("parked-default");
+        assert!((published_capture_gain(&r) - 8000.0).abs() < 0.5);
+        r.core.sessions().set_default_endpoints(&["ep2"]);
+        r.core.signals().notify_default_changed(Some("ep2".into()));
+        r.run(1);
+        // Lowered while still idle, so the mute ended in that same pass with the
+        // conservative gain (it was at 0.8 until then), never amplified.
+        assert_eq!(r.volume(SESSION2), HELD_VOLUME);
+        let g = published_capture_gain(&r);
+        assert!(g > 0.0 && g <= 0.8 / 0.8 + 1e-6, "{g}");
+        r.run(100);
+        assert!(published_capture_gain(&r) <= 1.0 + 1e-6);
+        r.run(1);
+        assert!((published_capture_gain(&r) - 8000.0).abs() < 0.5);
+        // The player's stream moves: the old session goes idle and is parked, the output
+        // follows the player.
+        r.core.sessions().set_active(SESSION, false);
+        r.core.sessions().set_active(SESSION2, true);
+        r.run(600);
+        assert_eq!(r.core.parked_sessions(), vec![SESSION.to_string()]);
+        assert_eq!(r.volume(SESSION), 0.8);
+        assert_eq!(
+            r.audio().st().rebinds.last(),
+            Some(&Some("ep2".to_string()))
+        );
+    }
+
+    #[test]
+    fn release_leaves_parked_and_held_sessions_at_their_originals() {
+        let mut r = attached_with_parked("parked-release");
+        let mut ev = r.send(Command::Release);
+        ev.extend(r.run(100));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        assert_eq!((r.volume(SESSION), r.volume(SESSION2)), (0.8, 0.8));
+        assert!(!r.restore.exists());
+        assert!(r.core.parked_sessions().is_empty());
     }
 
     #[test]

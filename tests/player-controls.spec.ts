@@ -514,7 +514,7 @@ test("vocal removal toggle communicates both states without enabling Auto-Tune e
   await button.click();
   await expect(button).toHaveAccessibleName("关闭去人声");
   await expect(button).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByText("去人声中 · 延迟 45 ms", { exact: true })).toBeVisible();
+  await expect(page.getByText("去人声中 · 延迟约 45 ms", { exact: true })).toBeVisible();
   await reveal(page);
   await expect(button).toHaveCSS("color", "rgb(85, 170, 255)");
   expect(await button.locator("svg").innerHTML()).not.toBe(regularIcon);

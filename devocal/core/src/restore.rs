@@ -31,6 +31,10 @@ pub struct RestoreOutcome {
     pub restored: usize,
     pub left_changed: usize,
     pub gone: usize,
+    /// Entries that could not be evaluated or restored because of an error (session or volume
+    /// lookup, `set_volume`). They stay in the restore file for a later retry. An unreadable
+    /// restore file (I/O error other than corruption) counts as 1 here and is left untouched.
+    pub failed: usize,
     pub corrupt: bool,
 }
 
@@ -74,26 +78,33 @@ pub fn read(path: &Path) -> io::Result<Option<RestoreRecord>> {
 }
 
 /// Restores every entry whose process (pid + creation time) and session still exist and whose
-/// volume is still the held value; anything else is left as the user has it. Deletes the file
-/// afterwards. A corrupt file is renamed to `<path>.corrupt` and no volume is touched.
+/// volume is still the held value; anything else is left as the user has it.
+///
+/// Entries that hit an error (session/volume lookup, `set_volume`) are counted in `failed` and
+/// kept: the file is rewritten atomically with only those entries, and deleted only when none
+/// remain. A file that does not parse (or has an unknown version) is renamed to
+/// `<path>.corrupt` (left in place if the rename fails) and no volume is touched. Any other
+/// I/O error reading the file leaves it untouched and is reported as `failed = 1`.
 pub fn restore(path: &Path, sessions: &dyn SessionVolumes) -> RestoreOutcome {
     let mut out = RestoreOutcome::default();
     let record = match read(path) {
         Ok(None) => return out,
         Ok(Some(r)) => r,
-        Err(_) => {
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
             out.corrupt = true;
             let mut name = path.as_os_str().to_owned();
             name.push(".corrupt");
-            let quarantine = PathBuf::from(name);
-            if std::fs::rename(path, &quarantine).is_err() {
-                // Do not leave a poisoned file that every start would trip over.
-                let _ = std::fs::remove_file(path);
-            }
+            // If this fails the file stays where it is; it is never deleted unprocessed.
+            let _ = std::fs::rename(path, PathBuf::from(name));
+            return out;
+        }
+        Err(_) => {
+            out.failed = 1;
             return out;
         }
     };
 
+    let mut retry: Vec<RestoreEntry> = Vec::new();
     for e in &record.entries {
         if sessions.process_created(e.pid) != Some(e.created_at) {
             out.gone += 1;
@@ -106,26 +117,38 @@ pub fn restore(path: &Path, sessions: &dyn SessionVolumes) -> RestoreOutcome {
                 continue;
             }
             Err(_) => {
-                out.left_changed += 1;
+                out.failed += 1;
+                retry.push(e.clone());
                 continue;
             }
         }
         match sessions.volume(&e.instance_id) {
-            Ok(v) if is_held(v) => {
-                if sessions
-                    .set_volume(&e.instance_id, e.original_volume)
-                    .is_ok()
-                {
-                    out.restored += 1;
-                } else {
-                    out.left_changed += 1;
+            Ok(v) if is_held(v) => match sessions.set_volume(&e.instance_id, e.original_volume) {
+                Ok(()) => out.restored += 1,
+                Err(_) => {
+                    out.failed += 1;
+                    retry.push(e.clone());
                 }
+            },
+            Ok(_) => out.left_changed += 1,
+            Err(_) => {
+                out.failed += 1;
+                retry.push(e.clone());
             }
-            _ => out.left_changed += 1,
         }
     }
 
-    let _ = std::fs::remove_file(path);
+    if retry.is_empty() {
+        let _ = std::fs::remove_file(path);
+    } else {
+        let remaining = RestoreRecord {
+            version: RESTORE_VERSION,
+            entries: retry,
+        };
+        // If the rewrite fails the original (complete) file stays; entries already restored
+        // are then seen as "not held" next time and counted as left_changed.
+        let _ = write_atomic(path, &remaining);
+    }
     out
 }
 
@@ -280,5 +303,105 @@ mod tests {
         assert!(dir.0.join("devocal-restore.json.corrupt").exists());
         assert_eq!(f.set_volume_calls(), 0);
         assert_eq!(f.volume("a").unwrap(), 1.0e-4);
+    }
+
+    fn two_held(dir: &TempDir) -> FakeSessions {
+        let f = FakeSessions::new();
+        add(&f, "a", 10, 111, 1.0e-4);
+        add(&f, "b", 11, 222, 1.0e-4);
+        let rec = RestoreRecord {
+            version: 1,
+            entries: vec![entry(10, 111, "a", 0.8), entry(11, 222, "b", 0.6)],
+        };
+        write_atomic(&dir.file(), &rec).unwrap();
+        f
+    }
+
+    #[test]
+    fn volume_lookup_error_keeps_the_entry_for_retry() {
+        let dir = TempDir::new("volerr");
+        let f = two_held(&dir);
+        f.fail_volume("a");
+
+        let out = restore(&dir.file(), &f);
+        assert_eq!((out.restored, out.failed, out.left_changed), (1, 1, 0));
+        assert_eq!(f.set_volume_calls(), 1); // only b was written
+        let kept = read(&dir.file()).unwrap().expect("file must still exist");
+        assert_eq!(kept.entries, vec![entry(10, 111, "a", 0.8)]);
+
+        f.clear_failures();
+        let out = restore(&dir.file(), &f);
+        assert_eq!((out.restored, out.failed), (1, 0));
+        assert_eq!(f.volume("a").unwrap(), 0.8);
+        assert_eq!(f.volume("b").unwrap(), 0.6);
+        assert!(!dir.file().exists());
+    }
+
+    #[test]
+    fn set_volume_error_keeps_the_entry_for_retry() {
+        let dir = TempDir::new("seterr");
+        let f = two_held(&dir);
+        f.fail_set_volume("b");
+
+        let out = restore(&dir.file(), &f);
+        assert_eq!((out.restored, out.failed), (1, 1));
+        assert_eq!(f.volume("a").unwrap(), 0.8);
+        assert_eq!(f.volume("b").unwrap(), 1.0e-4);
+        let kept = read(&dir.file()).unwrap().expect("file must still exist");
+        assert_eq!(kept.entries, vec![entry(11, 222, "b", 0.6)]);
+
+        f.clear_failures();
+        let out = restore(&dir.file(), &f);
+        assert_eq!((out.restored, out.failed), (1, 0));
+        assert_eq!(f.volume("b").unwrap(), 0.6);
+        assert!(!dir.file().exists());
+    }
+
+    #[test]
+    fn session_lookup_error_keeps_the_entry_for_retry() {
+        let dir = TempDir::new("sesserr");
+        let f = two_held(&dir);
+        f.fail_session("a");
+
+        let out = restore(&dir.file(), &f);
+        assert_eq!((out.restored, out.failed), (1, 1));
+        let kept = read(&dir.file()).unwrap().expect("file must still exist");
+        assert_eq!(kept.entries, vec![entry(10, 111, "a", 0.8)]);
+
+        f.clear_failures();
+        assert_eq!(restore(&dir.file(), &f).restored, 1);
+        assert!(!dir.file().exists());
+    }
+
+    #[test]
+    fn unreadable_file_is_left_untouched_and_not_quarantined() {
+        // A directory at the restore path makes fs::read fail with a non-InvalidData error.
+        let dir = TempDir::new("unreadable");
+        std::fs::create_dir(dir.file()).unwrap();
+        let f = FakeSessions::new();
+        add(&f, "a", 10, 111, 1.0e-4);
+
+        let out = restore(&dir.file(), &f);
+        assert!(!out.corrupt);
+        assert_eq!(out.failed, 1);
+        assert!(dir.file().is_dir());
+        assert!(!dir.0.join("devocal-restore.json.corrupt").exists());
+        assert_eq!(f.set_volume_calls(), 0);
+    }
+
+    #[test]
+    fn failed_quarantine_rename_never_deletes_the_file() {
+        let dir = TempDir::new("quarantine-fail");
+        std::fs::write(dir.file(), "{oops").unwrap();
+        // A non-empty directory at the quarantine path makes the rename fail.
+        let q = dir.0.join("devocal-restore.json.corrupt");
+        std::fs::create_dir(&q).unwrap();
+        std::fs::write(q.join("keep"), "x").unwrap();
+        let f = FakeSessions::new();
+
+        let out = restore(&dir.file(), &f);
+        assert!(out.corrupt);
+        assert!(dir.file().exists());
+        assert_eq!(f.set_volume_calls(), 0);
     }
 }

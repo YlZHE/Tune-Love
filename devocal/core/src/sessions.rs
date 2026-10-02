@@ -29,13 +29,13 @@ pub trait SessionVolumes {
 }
 
 #[cfg(any(test, feature = "fake"))]
-pub use fake::FakeSessions;
+pub use fake::{FakeSessions, SetVolumeHook};
 
 #[cfg(any(test, feature = "fake"))]
 mod fake {
     use super::{SessionInfo, SessionVolumes};
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     struct FakeSession {
         info: SessionInfo,
@@ -49,13 +49,21 @@ mod fake {
         created: HashMap<u32, u64>,
         /// child pid -> parent pid, used by `sessions_for_tree`.
         parents: HashMap<u32, u32>,
-        set_volume_calls: usize,
+        /// Ordered log of every `set_volume` attempt as (instance id, volume).
+        writes: Vec<(String, f32)>,
+        fail_session: HashSet<String>,
+        fail_volume: HashSet<String>,
+        fail_set_volume: HashSet<String>,
     }
+
+    /// Hook called as `(instance_id, volume)` at the start of every `set_volume`.
+    pub type SetVolumeHook = Box<dyn Fn(&str, f32)>;
 
     /// In-memory `SessionVolumes` for tests. Interior mutability keeps the trait `&self`.
     #[derive(Default)]
     pub struct FakeSessions {
         state: RefCell<State>,
+        hook: RefCell<Option<SetVolumeHook>>,
     }
 
     impl FakeSessions {
@@ -120,9 +128,54 @@ mod fake {
             self.state.borrow_mut().parents.insert(child, parent);
         }
 
-        /// Number of `set_volume` calls attempted so far.
+        /// Number of `set_volume` calls attempted so far (including injected failures).
         pub fn set_volume_calls(&self) -> usize {
-            self.state.borrow().set_volume_calls
+            self.state.borrow().writes.len()
+        }
+
+        /// Ordered log of every `set_volume` attempt as (instance id, volume),
+        /// including ones that failed through `fail_set_volume`.
+        pub fn writes(&self) -> Vec<(String, f32)> {
+            self.state.borrow().writes.clone()
+        }
+
+        /// Installs a hook called at the start of every `set_volume`, before the write is
+        /// applied and with no internal borrow held (the hook may call back into the fake or
+        /// inspect the file system, e.g. to assert that a restore file already exists).
+        pub fn on_set_volume(&self, hook: SetVolumeHook) {
+            *self.hook.borrow_mut() = Some(hook);
+        }
+
+        /// Makes `session(instance_id)` return an error until `clear_failures`.
+        pub fn fail_session(&self, instance_id: &str) {
+            self.state
+                .borrow_mut()
+                .fail_session
+                .insert(instance_id.into());
+        }
+
+        /// Makes `volume(instance_id)` return an error until `clear_failures`.
+        pub fn fail_volume(&self, instance_id: &str) {
+            self.state
+                .borrow_mut()
+                .fail_volume
+                .insert(instance_id.into());
+        }
+
+        /// Makes `set_volume(instance_id, ..)` return an error (still logged) until `clear_failures`.
+        pub fn fail_set_volume(&self, instance_id: &str) {
+            self.state
+                .borrow_mut()
+                .fail_set_volume
+                .insert(instance_id.into());
+        }
+
+        /// Clears all injected failures.
+        pub fn clear_failures(&self) {
+            let mut st = self.state.borrow_mut();
+            st.fail_session.clear();
+            st.fail_volume.clear();
+            st.fail_set_volume.clear();
         }
     }
 
@@ -151,6 +204,9 @@ mod fake {
         }
 
         fn session(&self, instance_id: &str) -> Result<Option<SessionInfo>, String> {
+            if self.state.borrow().fail_session.contains(instance_id) {
+                return Err(format!("injected session failure: {instance_id}"));
+            }
             Ok(self
                 .state
                 .borrow()
@@ -161,6 +217,9 @@ mod fake {
         }
 
         fn volume(&self, instance_id: &str) -> Result<f32, String> {
+            if self.state.borrow().fail_volume.contains(instance_id) {
+                return Err(format!("injected volume failure: {instance_id}"));
+            }
             self.state
                 .borrow()
                 .sessions
@@ -171,8 +230,14 @@ mod fake {
         }
 
         fn set_volume(&self, instance_id: &str, volume: f32) -> Result<(), String> {
+            if let Some(h) = self.hook.borrow().as_ref() {
+                h(instance_id, volume);
+            }
             let mut st = self.state.borrow_mut();
-            st.set_volume_calls += 1;
+            st.writes.push((instance_id.to_string(), volume));
+            if st.fail_set_volume.contains(instance_id) {
+                return Err(format!("injected set_volume failure: {instance_id}"));
+            }
             match st
                 .sessions
                 .iter_mut()
@@ -238,6 +303,37 @@ mod tests {
         assert!(!f.muted("a").unwrap());
         f.remove_session("a");
         assert!(f.volume("a").is_err());
+    }
+
+    #[test]
+    fn fake_injects_errors_logs_writes_and_calls_hook() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let f = FakeSessions::new();
+        f.add_session(info("a", 10), 0.8, false);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let s2 = seen.clone();
+        f.on_set_volume(Box::new(move |id, v| {
+            s2.borrow_mut().push((id.to_string(), v))
+        }));
+
+        f.fail_session("a");
+        f.fail_volume("a");
+        f.fail_set_volume("a");
+        assert!(f.session("a").is_err());
+        assert!(f.volume("a").is_err());
+        assert!(f.set_volume("a", 0.1).is_err());
+        f.clear_failures();
+        assert_eq!(f.volume("a").unwrap(), 0.8); // failed write did not apply
+
+        f.set_volume("a", 0.2).unwrap();
+        assert_eq!(f.volume("a").unwrap(), 0.2);
+        assert_eq!(
+            f.writes(),
+            vec![("a".to_string(), 0.1), ("a".to_string(), 0.2)]
+        );
+        assert_eq!(f.set_volume_calls(), 2);
+        assert_eq!(*seen.borrow(), f.writes());
     }
 
     #[test]

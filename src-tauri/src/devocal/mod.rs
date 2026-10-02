@@ -230,13 +230,18 @@ fn build_supervisor(
         ProcessLink::spawn(&engine_exe()?, restore, log)
     });
     let run_path = restore_path.clone();
-    let run_restore = Box::new(move || {
+    let run_restore = Box::new(move || -> Option<RestoreOutcome> {
         #[cfg(windows)]
-        if let Some(path) = &run_path {
-            restore_with(path, &devocal_core::sessions_win::WinSessions);
+        {
+            run_path
+                .as_deref()
+                .and_then(|path| restore_with(path, &devocal_core::sessions_win::WinSessions))
         }
         #[cfg(not(windows))]
-        let _ = &run_path;
+        {
+            let _ = &run_path;
+            None
+        }
     });
     let pending = Box::new(move || restore_path.as_deref().is_some_and(Path::exists));
     Supervisor::new(spawn, run_restore, gate).with_restore_pending(pending)
@@ -450,7 +455,7 @@ pub(crate) mod tests {
                 e.lock().unwrap().push(engine.clone());
                 Ok(engine.link())
             }),
-            Box::new(|| {}),
+            Box::new(|| None),
             Arc::new(AttenuationGate::new()),
         )
         .with_restore_pending(Box::new(|| false));

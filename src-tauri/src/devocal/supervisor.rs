@@ -24,8 +24,10 @@
 //!   then, if the hold is still wanted, a restart within the [`RestartBudget`] (phase
 //!   `restarting`), otherwise phase `failed` with `engine_crashed`.
 //! - While nothing is held (no engine, or last State `Idle` with no attach in flight) and the
-//!   restore file exists, `restore` runs every 2 s (a player relaunched at the persisted
-//!   held volume is fixed quickly).
+//!   restore file exists, `restore` runs every 2 s, or every 200 ms while the last restore
+//!   kept entries awaiting the player (a player relaunched at the persisted held volume is
+//!   fixed within about 200 ms instead of staying silent for up to 2 s). At most one restore
+//!   per tick.
 //! - Attenuation gate: drop while attaching/releasing and around an exit; `1/attenuation`
 //!   only from Metrics received while the last State is `Active` (a fresh Metrics after
 //!   entering Active, so a stale value from before the hold is never used), set again only
@@ -40,6 +42,7 @@ use std::time::{Duration, Instant};
 use devocal_core::protocol::{
     encode, Command, ErrorCode, Event, FallbackReason, Metrics, Mode, Phase, PROTOCOL,
 };
+use devocal_core::restore::RestoreOutcome;
 use serde::Serialize;
 
 use super::gate::AttenuationGate;
@@ -53,6 +56,9 @@ pub const MODEL_DEVICE: &str = "cpu";
 pub const MODEL_THREADS: u16 = 1;
 /// Restore retry interval while nothing is held (obligation 9).
 pub const RESTORE_RETRY_MS: u64 = 2_000;
+/// Restore retry interval while nothing is held and the restore file has entries awaiting the
+/// player (it may be relaunched at the persisted held volume any moment).
+pub const AWAITING_RESTORE_RETRY_MS: u64 = 200;
 /// Wait before re-attaching the same player after the engine went idle on its own.
 pub const ATTACH_RETRY_MS: u64 = 3_000;
 /// Attaches to one player (pid + creation time) before giving up (`failed`, `attach_failed`).
@@ -244,9 +250,12 @@ impl<L> Linked<L> {
     }
 }
 
+/// Runs the restore file; `None` when there was no file.
+pub type RestoreFn = Box<dyn FnMut() -> Option<RestoreOutcome> + Send>;
+
 pub struct Supervisor<L: EngineLink> {
     spawn: Box<dyn FnMut() -> Result<L, String> + Send>,
-    restore: Box<dyn FnMut() + Send>,
+    restore: RestoreFn,
     restore_pending: Box<dyn Fn() -> bool + Send>,
     gate: Arc<AttenuationGate>,
     gate_key: GateKey,
@@ -278,6 +287,8 @@ pub struct Supervisor<L: EngineLink> {
     attach_gave_up: bool,
 
     last_restore_ms: Option<u64>,
+    /// The last restore kept entries awaiting the player: retry every 200 ms.
+    restore_awaiting: bool,
     overridden_at: Option<u64>,
     now_ms: u64,
     media_playing: bool,
@@ -287,10 +298,10 @@ pub struct Supervisor<L: EngineLink> {
 
 impl<L: EngineLink> Supervisor<L> {
     /// `spawn` starts an engine and connects to it; `restore` runs the restore file (it must
-    /// not panic and is a no-op without a file).
+    /// not panic and is a no-op returning `None` without a file).
     pub fn new(
         spawn: Box<dyn FnMut() -> Result<L, String> + Send>,
-        restore: Box<dyn FnMut() + Send>,
+        restore: RestoreFn,
         gate: Arc<AttenuationGate>,
     ) -> Self {
         Self {
@@ -318,6 +329,7 @@ impl<L: EngineLink> Supervisor<L> {
             retry_after_ms: 0,
             attach_gave_up: false,
             last_restore_ms: None,
+            restore_awaiting: false,
             overridden_at: None,
             now_ms: 0,
             media_playing: false,
@@ -522,12 +534,12 @@ impl<L: EngineLink> Supervisor<L> {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 self.apply_gate(GateKey::Drop, None);
-                (self.restore)();
+                self.run_restore();
                 self.apply_gate(GateKey::Unity, Some(1.0));
             }
             None => {
                 if (self.restore_pending)() {
-                    (self.restore)();
+                    self.run_restore();
                 }
             }
         }
@@ -722,7 +734,7 @@ impl<L: EngineLink> Supervisor<L> {
         self.pump(now_ms);
         self.engine = None;
         self.apply_gate(GateKey::Drop, None);
-        (self.restore)();
+        self.run_restore();
         self.last_restore_ms = Some(now_ms);
         self.apply_gate(GateKey::Unity, Some(1.0));
         if self.failed || !self.want_hold {
@@ -828,9 +840,14 @@ impl<L: EngineLink> Supervisor<L> {
     }
 
     fn retry_restore(&mut self, now_ms: u64) {
+        let interval = if self.restore_awaiting {
+            AWAITING_RESTORE_RETRY_MS
+        } else {
+            RESTORE_RETRY_MS
+        };
         if self
             .last_restore_ms
-            .is_some_and(|t| now_ms.saturating_sub(t) < RESTORE_RETRY_MS)
+            .is_some_and(|t| now_ms.saturating_sub(t) < interval)
         {
             return;
         }
@@ -839,8 +856,16 @@ impl<L: EngineLink> Supervisor<L> {
         }
         self.last_restore_ms = Some(now_ms);
         if (self.restore_pending)() {
-            (self.restore)();
+            self.run_restore();
+        } else {
+            self.restore_awaiting = false;
         }
+    }
+
+    /// Runs the restore and remembers whether entries still await the player.
+    fn run_restore(&mut self) {
+        let out = (self.restore)();
+        self.restore_awaiting = out.is_some_and(|o| o.awaiting_player > 0);
     }
 
     // ---- helpers ----
@@ -945,6 +970,8 @@ mod tests {
         spawn_error: Arc<Mutex<Option<String>>>,
         /// "spawn" / "restore" in call order.
         order: Arc<Mutex<Vec<&'static str>>>,
+        /// What each restore call reports.
+        outcome: Arc<Mutex<Option<RestoreOutcome>>>,
     }
 
     fn rig() -> Rig {
@@ -960,6 +987,9 @@ mod tests {
         let (r, g) = (restores.clone(), gate.clone());
         let order: Arc<Mutex<Vec<&'static str>>> = Arc::default();
         let (o1, o2) = (order.clone(), order.clone());
+        let outcome: Arc<Mutex<Option<RestoreOutcome>>> =
+            Arc::new(Mutex::new(Some(RestoreOutcome::default())));
+        let out = outcome.clone();
         let sup = Supervisor::new(
             Box::new(move || {
                 if let Some(err) = s.lock().unwrap().clone() {
@@ -973,6 +1003,7 @@ mod tests {
             Box::new(move || {
                 r.lock().unwrap().push(g.read().1);
                 o2.lock().unwrap().push("restore");
+                out.lock().unwrap().clone()
             }),
             gate.clone(),
         )
@@ -985,6 +1016,7 @@ mod tests {
             gate,
             spawn_error,
             order,
+            outcome,
         }
     }
 
@@ -1592,6 +1624,63 @@ mod tests {
         r.last().push(state(Phase::Idle, None));
         r.sup.tick(16_600, Some(p), true);
         assert_eq!(r.restores(), 3);
+    }
+
+    fn awaiting(n: usize) -> Option<RestoreOutcome> {
+        Some(RestoreOutcome {
+            awaiting_player: n,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn restore_retries_every_200_ms_while_entries_await_the_player() {
+        let mut r = rig_with(true);
+        *r.outcome.lock().unwrap() = awaiting(2);
+        // Ticks every 100 ms, as the app does: one restore every other tick.
+        let mut counts = Vec::new();
+        for t in (0..=800u64).step_by(100) {
+            r.sup.tick(t, None, false);
+            counts.push(r.restores());
+        }
+        assert_eq!(counts, vec![1, 1, 2, 2, 3, 3, 4, 4, 5]);
+        // The player came back and everything was restored: back to every 2 s.
+        *r.outcome.lock().unwrap() = Some(RestoreOutcome {
+            restored: 2,
+            ..Default::default()
+        });
+        r.sup.tick(1_000, None, false);
+        assert_eq!(r.restores(), 6);
+        for t in (1_100..3_000u64).step_by(100) {
+            r.sup.tick(t, None, false);
+        }
+        assert_eq!(r.restores(), 6);
+        r.sup.tick(3_000, None, false);
+        assert_eq!(r.restores(), 7);
+    }
+
+    #[test]
+    fn fast_restore_retry_never_runs_while_holding() {
+        let mut r = rig_with(true);
+        *r.outcome.lock().unwrap() = awaiting(1);
+        r.sup.tick(0, None, false);
+        assert_eq!(r.restores(), 1);
+        let p = player(7);
+        r.hold(100, &p);
+        let held = r.restores();
+        for t in (300..3_000u64).step_by(100) {
+            r.sup.tick(t, Some(p.clone()), true);
+        }
+        assert_eq!(r.restores(), held, "held: no restore");
+        // Released: the fast cadence resumes at once.
+        r.sup.release();
+        r.last().push(state(Phase::Releasing, None));
+        r.last().push(state(Phase::Idle, None));
+        r.sup.tick(3_000, Some(p.clone()), true);
+        assert_eq!(r.restores(), held + 1);
+        r.sup.tick(3_100, Some(p.clone()), true);
+        r.sup.tick(3_200, Some(p), true);
+        assert_eq!(r.restores(), held + 2);
     }
 
     #[test]

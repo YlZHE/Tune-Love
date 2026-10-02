@@ -26,5 +26,10 @@
       "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self'"
     }
   },
-  "bundle": { "active": false }
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "windows": { "nsis": { "installMode": "currentUser" } },
+    "licenseFile": "../LICENSE"
+  }
 }

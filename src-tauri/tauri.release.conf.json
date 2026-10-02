@@ -1,0 +1,19 @@
+{
+  "bundle": {
+    "resources": {
+      "python/": "python/",
+      "../reference/app_bridge.py": "reference/app_bridge.py",
+      "../reference/client.py": "reference/client.py",
+      "../reference/sender.py": "reference/sender.py",
+      "../reference/profiles/": "reference/profiles/",
+      "../reference/build/x64/reference_agent.dll": "reference/build/x64/reference_agent.dll",
+      "../LICENSE": "licenses/Tune-Love-GPL-3.0.txt",
+      "../licenses/": "licenses/",
+      "../reference/LICENSE": "licenses/reference-MIT.txt",
+      "../reference/THIRD_PARTY_NOTICES.md": "licenses/reference-THIRD_PARTY_NOTICES.md",
+      "../reference/vendor/minhook/LICENSE.txt": "licenses/MinHook.txt",
+      "../reference/vendor/pluginterfaces/LICENSE.txt": "licenses/VST3-pluginterfaces.txt",
+      "../src-tauri/python/LICENSE.txt": "licenses/Python.txt"
+    }
+  }
+}

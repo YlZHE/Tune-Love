@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  version:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      # Fail closed: the script must exit 0 AND print exactly the tag without the leading "v".
+      - name: Check tag against app versions
+        id: check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $out = (& node scripts/release-version.mjs $env:TAG | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "release-version.mjs failed for ${env:TAG}: $out" }
+          $expected = $env:TAG.Substring(1)
+          if ($out -ne $expected) { throw "release-version.mjs printed '$out', expected '$expected'" }
+          "version=$out" >> $env:GITHUB_OUTPUT
+
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    needs: [version, ci]
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: reference-agent-x64
+          path: reference/build/x64
+
+      # Fetches the pinned dependencies so that their licence texts can be bundled.
+      - run: pwsh reference/bootstrap.ps1
+
+      - name: Cache pinned CMake
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src-tauri/vendor/tools
+          key: cmake-3.30.5-5ab6e1fa
+
+      - run: npm run fetch:cmake
+      - run: npm run fetch:python
+      - run: npm ci
+
+      - name: Build installer
+        run: npx tauri build --config src-tauri/tauri.release.conf.json
+
+      - name: Checksums
+        run: |
+          $installer = Join-Path 'src-tauri/target/release/bundle/nsis' "Tune Love_${env:VERSION}_x64-setup.exe"
+          if (-not (Test-Path -LiteralPath $installer)) { throw "installer not found: $installer" }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLowerInvariant()
+          $name = Split-Path -Leaf $installer
+          # sha256sum format, binary mode: "<hash> *<file name>"
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS.txt'), "$hash *$name`n")
+          Get-Content SHA256SUMS.txt
+          "INSTALLER=$installer" >> $env:GITHUB_ENV
+
+      - name: Create draft release
+        run: |
+          gh release create $env:TAG --draft --title "Tune Love $env:VERSION" --notes-file .github/release-notes.md $env:INSTALLER SHA256SUMS.txt
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }

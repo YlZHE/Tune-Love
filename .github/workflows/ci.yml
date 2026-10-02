@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# One run per ref; a newer push cancels the older run. Tag runs (releases) are never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  frontend:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      # --retries=1: known GPU-timing flake in the browser tests.
+      - run: npx playwright test --retries=1
+
+      - name: Upload browser test artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-tests
+          path: artifacts/browser-tests
+          if-no-files-found: ignore
+
+  backend:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Cache pinned CMake
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src-tauri/vendor/tools
+          key: cmake-3.30.5-5ab6e1fa
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+
+      - name: Cache cargo target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src-tauri/target
+          key: cargo-target-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-target-${{ runner.os }}-
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
+      - run: npm run fetch:cmake
+      - run: npm ci
+      # Tauri embeds dist/ at compile time.
+      - run: npm run build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  bridge:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The pinned commits of the two public dependencies live in bootstrap.ps1.
+      - name: Cache reference vendor checkouts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: reference/vendor
+          key: reference-vendor-${{ hashFiles('reference/bootstrap.ps1') }}
+
+      - run: pwsh reference/bootstrap.ps1
+      - run: pwsh reference/build.ps1 -Target all
+
+      # Runner-provided Python 3 (no setup-python).
+      - name: Python unit tests
+        run: |
+          foreach ($name in 'test_client', 'test_app_bridge', 'test_sender') {
+            python -m unittest discover -s reference/tests -p "$name.py" -v
+            if ($LASTEXITCODE -ne 0) { throw "$name failed" }
+          }
+
+      - name: Runtime test against the fixture host
+        run: python reference/tests/test_runtime.py --evidence "$env:RUNNER_TEMP/runtime.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reference-agent-x64
+          path: reference/build/x64/reference_agent.dll
+          if-no-files-found: error

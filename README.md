@@ -1,5 +1,7 @@
 # Tune Love
 
+[![CI](https://github.com/YlZHE/Tune-Love/actions/workflows/ci.yml/badge.svg)](https://github.com/YlZHE/Tune-Love/actions/workflows/ci.yml)
+
 第一阶段：独立的 Windows 音乐信息悬浮窗。Tauri 2 + React + TypeScript + Rust。
 
 2026-10-01 控制层续开发：已加入独立的 `autoTune.setRetuneSpeed(value)`，接受卡卡已核对页面的整数速度输入 0～400，按精确 profile 转换后进入现有四参数控制通道；401 项表值与生产函数一致。主窗仍调用原来的归一化百分比入口，尚未切换到新速度输入，不把新入口的数值称作毫秒。最新实现和边界见 [Retune 转换报告](../docs/2026-10-01_reverse-kaka-retune-table-report.md)；以下早期界面描述中的“全部前端预览”不代表当前已显式连接后的四参数调试能力，连接功能见 [应用桥接方案](../docs/plans/2026-10-01-app-control-bridge.md)。
@@ -90,6 +92,15 @@ PCM 为 48 kHz、双声道 f32，后台只保留最近最多 8 秒的内存缓�
 调式引擎固定使用原版 libkeyfinder v2.2.6 与 FFTW 3.3.10；构建来源、哈希、许可和 Windows MSVC 薄适配说明见 [`docs/keyfinder-dependencies.md`](docs/keyfinder-dependencies.md)。连续 3 个新候选才首次显示，替换结果需要连续 5 个新候选；这是稳定策略，不是校准置信度。合成 C 大调/A 小调样例只能验证原生链路和枚举映射，不能证明真实歌曲准确率。已记录的单音、宽带噪声和点击列会被原生引擎误判为具体调式，因此不能把这些输入或强鼓点的结果当成可信音乐学结论；真实歌曲仍需独立标签对照。
 
 采集复用固定版本 `wasapi 0.24.0`，窄范围本地补丁保护 SILENT / null 数据包，出处及改动见 `src-tauri/vendor/wasapi/PATCHES.md`。上游音频激活包含同步等待，因此放在独立线程，并在返回后重新验证来源；不承诺 Windows 激活本身有严格时间上限。
+
+## 下载与安装
+
+安装包发布在 [GitHub Releases](https://github.com/YlZHE/Tune-Love/releases)（仅 Windows x64），下载 `Tune Love_<版本>_x64-setup.exe` 运行即可，默认装到 `%LOCALAPPDATA%\Tune Love\`，无需管理员权限；同页的 `SHA256SUMS.txt` 可用来核对文件。
+
+- 安装包**未签名**：SmartScreen 提示时点“更多信息 → 仍要运行”。
+- Auto-Tune 控制会向宿主进程注入 agent 并挂钩插件，**可能被杀毒软件误报**；agent 源码在 `reference/`，可自行审阅编译。
+- 升级前请先关闭本程序和已连接的宿主，否则 agent 文件被占用，无法覆盖。
+- StemgenRT 权重不随包发布，开发阶段用 `npm run fetch:stemgenrt -- --accept` 下载到本机。
 
 ## 从源码构建
 

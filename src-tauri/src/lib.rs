@@ -2,6 +2,7 @@ pub mod audio;
 pub mod autotune;
 pub mod key_detection;
 pub mod media;
+mod migrate;
 mod settings;
 pub mod source;
 
@@ -22,6 +23,10 @@ pub fn run() {
             // Per-song Key/Scale memory (local only). Without a data dir the
             // feature is simply off; analysis is unaffected.
             if let Ok(dir) = app.path().app_local_data_dir() {
+                // The app was renamed; carry the old data folder's cache over.
+                if let migrate::Migration::Failed(e) = migrate::migrate_song_cache(&dir) {
+                    eprintln!("song cache migration failed: {e}");
+                }
                 app.state::<key_detection::KeyDetectionState>()
                     .use_song_cache(dir.join("song-keys-v1.json"));
             }

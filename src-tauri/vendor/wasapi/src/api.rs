@@ -1611,6 +1611,16 @@ impl AudioSessionControl {
         take_pwstr(name)
     }
 
+    /// Set the display name of this session; the volume mixer shows it instead of the name of
+    /// the executable. (Local patch, see PATCHES.md.)
+    pub fn set_display_name(&self, name: &str) -> WasapiRes<()> {
+        // Keep the HSTRING in a variable, to make sure it outlives the call.
+        let name = HSTRING::from(name);
+        let context = windows_core::GUID::zeroed();
+        unsafe { self.control.SetDisplayName(&name, &context)? };
+        Ok(())
+    }
+
     /// Get the path of the icon of this session.
     /// This is empty unless the client that owns the session has set an icon.
     pub fn get_icon_path(&self) -> WasapiRes<String> {

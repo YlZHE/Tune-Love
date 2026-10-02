@@ -15,7 +15,7 @@
 //! out, skip, fade in). Output gain is ramped across each write; every sample is clamped to
 //! [-1, 1] (non-finite -> 0) before it reaches the device.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,8 +24,10 @@ use rtrb::Consumer;
 use wasapi::{
     AudioClient, AudioRenderClient, Device, Direction, Handle, SampleType, StreamMode, WaveFormat,
 };
+use windows::core::{GUID, HSTRING};
 use windows::Win32::Media::Audio::{
-    IAudioClient3, IAudioRenderClient, IMMDevice, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    IAudioClient3, IAudioRenderClient, IAudioSessionControl, IMMDevice,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
 };
 use windows::Win32::System::Com::CLSCTX_ALL;
 
@@ -42,6 +44,23 @@ pub const TRIM_MARGIN_MS: f32 = 20.0;
 /// ...continuously for this long.
 pub const TRIM_HOLD_US: u64 = 1_000_000;
 const WAIT_MS: u32 = 20;
+/// The render session's name in the volume mixer (the UI tells the user to adjust this app's
+/// volume there; without a name the row shows "devocal-engine").
+pub const SESSION_DISPLAY_NAME: &str = "Tune Love 去人声";
+/// A failure to name the session is logged once per process, then ignored.
+static DISPLAY_NAME_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Logs a failed [`SESSION_DISPLAY_NAME`] update the first time `logged` is unset; never fatal.
+/// Returns whether it logged.
+fn note_display_name(result: Result<(), String>, logged: &AtomicBool) -> bool {
+    match result {
+        Err(e) if !logged.swap(true, Ordering::Relaxed) => {
+            eprintln!("devocal audio: could not name the render session (ignored): {e}");
+            true
+        }
+        _ => false,
+    }
+}
 const FAILED_POLL: Duration = Duration::from_millis(10);
 
 /// Decides when a persistently over-full queue is trimmed. Pure; times in microseconds.
@@ -329,6 +348,12 @@ impl LowLatencySink {
             let render: IAudioRenderClient = client
                 .GetService()
                 .map_err(|e| format!("render client: {e}"))?;
+            let name = HSTRING::from(SESSION_DISPLAY_NAME);
+            let named = client
+                .GetService::<IAudioSessionControl>()
+                .and_then(|c| c.SetDisplayName(&name, &GUID::zeroed()))
+                .map_err(|e| e.to_string());
+            note_display_name(named, &DISPLAY_NAME_FAILURE_LOGGED);
             client.Start().map_err(|e| format!("start render: {e}"))?;
             Ok(Some(Self {
                 render,
@@ -427,6 +452,11 @@ impl WasapiSink {
         let render = client
             .get_audiorenderclient()
             .map_err(|e| format!("render client: {e}"))?;
+        let named = client
+            .get_audiosessioncontrol()
+            .and_then(|c| c.set_display_name(SESSION_DISPLAY_NAME))
+            .map_err(|e| e.to_string());
+        note_display_name(named, &DISPLAY_NAME_FAILURE_LOGGED);
         let buffer = client
             .get_buffer_size()
             .map_err(|e| format!("buffer size: {e}"))? as usize;
@@ -1000,6 +1030,18 @@ mod tests {
             r.sink = Some(Box::new(s));
         }
         (r, shared)
+    }
+
+    #[test]
+    fn a_display_name_failure_is_logged_once_and_never_fatal() {
+        let logged = AtomicBool::new(false);
+        assert!(!note_display_name(Ok(()), &logged));
+        assert!(note_display_name(Err("E_FAIL".into()), &logged));
+        assert!(
+            !note_display_name(Err("E_FAIL".into()), &logged),
+            "logged once"
+        );
+        assert!(!note_display_name(Ok(()), &logged));
     }
 
     /// Ruling 23: the first "on" can be accepted (request set) between the render thread's

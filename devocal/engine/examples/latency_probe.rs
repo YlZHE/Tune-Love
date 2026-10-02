@@ -29,10 +29,13 @@
 //! Usage:
 //!   latency_probe --pid <player root pid> --seconds <s> [--endpoint <render endpoint id>]
 //!                 [--out probe.json] [--dump <prefix>]
+//!   latency_probe --analyze <prefix> [--out probe.json]
 //!
 //! `--dump` also writes the raw recordings (interleaved stereo f32 LE, 44.1 kHz) to
 //! `<prefix>-source.f32` and `<prefix>-output.f32`, and their first-packet QPC times to
 //! `<prefix>-times.json`, for offline analysis (the times are unreliable for alignment).
+//! `--analyze <prefix>` reads such a dump back and prints the same report without capturing
+//! (no `--pid`, no devices; the capture counters are not part of it).
 //!
 //! The analysis is pure functions over the two mono signals, unit-tested with synthetic
 //! signals (`cargo test --workspace` runs them: the example is declared with `test = true`).
@@ -67,15 +70,19 @@ const GAP_RATIO: f64 = 1e-3;
 const AUDIBLE_RELATIVE: f64 = 1e-3;
 
 struct Args {
-    pid: u32,
+    /// Capture mode: the player's root pid and the recording length.
+    pid: Option<u32>,
+    seconds: Option<f64>,
     endpoint: Option<String>,
-    seconds: f64,
     out: Option<String>,
     dump: Option<String>,
+    /// Offline mode: analyse `<prefix>-source.f32` / `<prefix>-output.f32` from `--dump`.
+    analyze: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let (mut pid, mut seconds, mut endpoint, mut out, mut dump) = (None, None, None, None, None);
+    let (mut pid, mut seconds, mut endpoint, mut out, mut dump, mut analyze) =
+        (None, None, None, None, None, None);
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -91,20 +98,30 @@ fn parse_args() -> Result<Args, String> {
             "--endpoint" => endpoint = Some(value()?),
             "--out" => out = Some(value()?),
             "--dump" => dump = Some(value()?),
+            "--analyze" => analyze = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    let pid = pid.ok_or("--pid <player root pid> is required")?;
-    let seconds = seconds.ok_or("--seconds is required")?;
-    if !(seconds > 0.0 && seconds <= 600.0) {
-        return Err("--seconds must be in (0, 600]".into());
+    if analyze.is_some() {
+        if pid.is_some() || seconds.is_some() || endpoint.is_some() || dump.is_some() {
+            return Err("--analyze takes only --out".into());
+        }
+    } else {
+        if pid.is_none() {
+            return Err("--pid <player root pid> is required".into());
+        }
+        let secs = seconds.ok_or("--seconds is required")?;
+        if !(secs > 0.0 && secs <= 600.0) {
+            return Err("--seconds must be in (0, 600]".into());
+        }
     }
     Ok(Args {
         pid,
-        endpoint,
         seconds,
+        endpoint,
         out,
         dump,
+        analyze,
     })
 }
 
@@ -396,7 +413,9 @@ fn close_run(run: &mut Vec<WindowLag>, segments: &mut Vec<Segment>) {
 }
 
 /// Runs of consecutive windows whose lag stays within +-2 frames of the previous window's,
-/// at least [`MIN_SEGMENT_WINDOWS`] long.
+/// at least [`MIN_SEGMENT_WINDOWS`] long. Neighbouring segments with the same lag (within
+/// the tolerance) are merged: real music repeats itself, so a stray window or two can match
+/// better at a wrong lag and cut a run (seen on real recordings); that is not a jump.
 fn segments(windows: &[WindowLag]) -> Vec<Segment> {
     let mut out = Vec::new();
     let mut run: Vec<WindowLag> = Vec::new();
@@ -410,7 +429,23 @@ fn segments(windows: &[WindowLag]) -> Vec<Segment> {
         run.push(w);
     }
     close_run(&mut run, &mut out);
-    out
+    let mut merged: Vec<Segment> = Vec::new();
+    for s in out {
+        match merged.last_mut() {
+            Some(m) if (s.lag_frames - m.lag_frames).abs() <= SEGMENT_TOLERANCE => {
+                let (a, b) = (m.windows as f64, s.windows as f64);
+                m.mean_corr = (m.mean_corr * a + s.mean_corr * b) / (a + b);
+                if s.windows > m.windows {
+                    m.lag_frames = s.lag_frames;
+                }
+                m.windows += s.windows;
+                m.end_s = s.end_s;
+                m.span.1 = s.span.1;
+            }
+            _ => merged.push(s),
+        }
+    }
+    merged
 }
 
 /// `next.lag - prev.lag` in ms for each pair of consecutive segments. Across a release the
@@ -533,28 +568,13 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), String> {
-    let args = parse_args()?;
-    let pid = args.pid;
-    let secs = args.seconds;
-    let endpoint = args.endpoint.clone();
-    let src = thread::spawn(move || record(Source::Process(pid), secs));
-    let out = thread::spawn(move || record(Source::Endpoint(endpoint), secs));
-    let src = src.join().map_err(|_| "source capture panicked")??;
-    let out = out.join().map_err(|_| "output capture panicked")??;
+/// Analysis part of the report (lag timeline, segments, jumps, dropouts, levels) for two
+/// mono recordings.
+fn analysis_report(out_m: &[f32], src_m: &[f32]) -> serde_json::Map<String, serde_json::Value> {
+    let analysis = analyse(out_m, src_m);
 
-    if let Some(prefix) = &args.dump {
-        dump(prefix, &src, &out)?;
-    }
-    let src_m = mono(&src.samples);
-    let out_m = mono(&out.samples);
-    if src_m.len() < RATE || out_m.len() < RATE {
-        return Err("less than 1 s recorded; is the player playing?".into());
-    }
-    let analysis = analyse(&out_m, &src_m);
-
-    let out_gaps = dropouts(&out_m);
-    let src_gaps = dropouts(&src_m);
+    let out_gaps = dropouts(out_m);
+    let src_gaps = dropouts(src_m);
     let ours: Vec<usize> = out_gaps
         .iter()
         .copied()
@@ -586,8 +606,6 @@ fn run() -> Result<(), String> {
     });
 
     let report = json!({
-        "pid": pid,
-        "seconds": secs,
         "windows": analysis.windows,
         "segments": analysis.segments.iter().map(segment_json).collect::<Vec<_>>(),
         "jumpsMs": analysis.jumps_ms,
@@ -599,24 +617,84 @@ fn run() -> Result<(), String> {
         "dropoutTimesMs": ours.iter().map(|&b| b * 10).collect::<Vec<_>>(),
         "outputGapsTotal": out_gaps.len(),
         "sourceGaps": src_gaps.len(),
-        "sourceRms": rms(&src_m),
-        "outputRms": rms(&out_m),
-        "sourceDiscontinuities": src.discontinuities,
-        "outputDiscontinuities": out.discontinuities,
-        "sourcePackets": src.packets,
-        "sourceTimestampErrors": src.timestamp_errors,
-        "sourceSilentPackets": src.silent_packets,
-        "outputPackets": out.packets,
-        "outputTimestampErrors": out.timestamp_errors,
-        "outputSilentPackets": out.silent_packets,
-        "endpoint": args.endpoint,
+        "sourceRms": rms(src_m),
+        "outputRms": rms(out_m),
     });
+    match report {
+        serde_json::Value::Object(m) => m,
+        _ => unreachable!("json! object"),
+    }
+}
+
+/// Reads interleaved stereo f32 LE as written by `--dump`.
+fn read_f32(path: &str) -> Result<Vec<f32>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect())
+}
+
+fn emit(report: serde_json::Value, out: &Option<String>) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
     println!("{text}");
-    if let Some(path) = &args.out {
+    if let Some(path) = out {
         std::fs::write(path, &text).map_err(|e| format!("write {path}: {e}"))?;
     }
     Ok(())
+}
+
+fn run() -> Result<(), String> {
+    let args = parse_args()?;
+    if let Some(prefix) = &args.analyze {
+        let src_m = mono(&read_f32(&format!("{prefix}-source.f32"))?);
+        let out_m = mono(&read_f32(&format!("{prefix}-output.f32"))?);
+        if src_m.len() < RATE || out_m.len() < RATE {
+            return Err("less than 1 s in the recordings".into());
+        }
+        let mut report = analysis_report(&out_m, &src_m);
+        report.insert("analyzed".into(), json!(prefix));
+        report.insert(
+            "sourceSeconds".into(),
+            json!(src_m.len() as f64 / RATE as f64),
+        );
+        report.insert(
+            "outputSeconds".into(),
+            json!(out_m.len() as f64 / RATE as f64),
+        );
+        return emit(report.into(), &args.out);
+    }
+    let pid = args.pid.ok_or("--pid is required")?;
+    let secs = args.seconds.ok_or("--seconds is required")?;
+    let endpoint = args.endpoint.clone();
+    let src = thread::spawn(move || record(Source::Process(pid), secs));
+    let out = thread::spawn(move || record(Source::Endpoint(endpoint), secs));
+    let src = src.join().map_err(|_| "source capture panicked")??;
+    let out = out.join().map_err(|_| "output capture panicked")??;
+
+    if let Some(prefix) = &args.dump {
+        dump(prefix, &src, &out)?;
+    }
+    let src_m = mono(&src.samples);
+    let out_m = mono(&out.samples);
+    if src_m.len() < RATE || out_m.len() < RATE {
+        return Err("less than 1 s recorded; is the player playing?".into());
+    }
+    let mut report = analysis_report(&out_m, &src_m);
+    report.insert("pid".into(), json!(pid));
+    report.insert("seconds".into(), json!(secs));
+    report.insert("sourceDiscontinuities".into(), json!(src.discontinuities));
+    report.insert("outputDiscontinuities".into(), json!(out.discontinuities));
+    report.insert("sourcePackets".into(), json!(src.packets));
+    report.insert("sourceTimestampErrors".into(), json!(src.timestamp_errors));
+    report.insert("sourceSilentPackets".into(), json!(src.silent_packets));
+    report.insert("outputPackets".into(), json!(out.packets));
+    report.insert("outputTimestampErrors".into(), json!(out.timestamp_errors));
+    report.insert("outputSilentPackets".into(), json!(out.silent_packets));
+    report.insert("endpoint".into(), json!(args.endpoint));
+    emit(report.into(), &args.out)
 }
 
 #[cfg(test)]
@@ -763,6 +841,26 @@ mod tests {
         assert_eq!(lag_at(&s, RATE * 3 + 10), -441);
         assert_eq!(lag_at(&s, RATE * 5), -441);
         assert_eq!(lag_at(&[], 5), 0);
+    }
+
+    #[test]
+    fn a_stray_window_does_not_split_a_segment() {
+        let w = |i: usize, lag: i64| WindowLag {
+            start: i * HOP,
+            lag,
+            corr: 0.9,
+        };
+        let mut ws: Vec<WindowLag> = (0..5).map(|i| w(i, 100)).collect();
+        ws.push(w(5, -10_000)); // matches better elsewhere
+        ws.extend((6..11).map(|i| w(i, 101)));
+        let s = segments(&ws);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(s[0].windows, 10);
+        assert_eq!(s[0].span, (0, 10 * HOP + WINDOW));
+        assert!(jumps_ms(&s).is_empty());
+        // A real change still splits, and the strays between do not hide it.
+        ws.extend((11..16).map(|i| w(i, -3_000)));
+        assert_eq!(segments(&ws).len(), 2);
     }
 
     #[test]

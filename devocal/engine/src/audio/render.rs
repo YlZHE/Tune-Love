@@ -632,6 +632,12 @@ impl Renderer {
     }
 
     /// Fresh stream: drop stale audio, start silent and fade in.
+    ///
+    /// `shared.preroll_request` is deliberately NOT cleared (ruling 23): the render thread
+    /// reports `ready` before `run` calls this, so the engine's first "on" can already have
+    /// been accepted and have set the request; wiping it here lost the pre-roll and led to
+    /// underruns and a forced fallback. A request that is stale for a new device only costs
+    /// one bounded, non-stacking pre-roll in `fill`.
     fn after_open(&mut self) {
         self.discard_all();
         if let Some(s) = &self.sink {
@@ -655,10 +661,6 @@ impl Renderer {
         self.preroll_left = 0;
         self.preroll_fade = false;
         self.last_frame = [0.0; 2];
-        self.ctx
-            .shared
-            .preroll_request
-            .store(false, Ordering::Release);
         self.last_gain = 0.0;
     }
 
@@ -932,6 +934,88 @@ fn latency_frames(
 mod tests {
     use super::*;
     use rtrb::RingBuffer;
+
+    struct FakeSink {
+        padding: usize,
+    }
+
+    impl Sink for FakeSink {
+        fn period_frames(&self) -> usize {
+            441
+        }
+        fn buffer_frames(&self) -> usize {
+            4_410
+        }
+        fn padding(&self) -> Result<usize, String> {
+            Ok(self.padding)
+        }
+        fn wait(&self, _timeout_ms: u32) {}
+        fn write(&mut self, stereo: &[f32]) -> Result<(), String> {
+            self.padding += stereo.len() / 2;
+            Ok(())
+        }
+        fn describe(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    /// A renderer on rings only (no devices); `sink` as given. Returns the shared state.
+    fn test_renderer(sink: Option<FakeSink>) -> (Renderer, Arc<Shared>) {
+        use crate::audio::{AudioStats, OwnedEvent, SharedGains};
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+        let (_in_tx, in_rx) = RingBuffer::<f32>::new(8_192);
+        let (_mk_tx, mk_rx) = RingBuffer::<u64>::new(8);
+        let (_ctl_tx, ctl_rx) = RingBuffer::<RenderCommand>::new(8);
+        let shared = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            start_us: now_us(),
+            last_input_us: AtomicU64::new(0),
+            capture_packet_frames: AtomicU32::new(0),
+            in_ring_frames: AtomicU32::new(0),
+            proc_latency_frames: AtomicU32::new(0),
+            proc_hop: AtomicU32::new(128),
+            output_failed: AtomicBool::new(false),
+            preroll_request: AtomicBool::new(false),
+            underrun_snapshot: AtomicU64::new(0),
+            wake: OwnedEvent::new().unwrap(),
+        });
+        let mut r = Renderer::new(RenderCtx {
+            endpoint: None,
+            input: in_rx,
+            markers: mk_rx,
+            control: ctl_rx,
+            shared: shared.clone(),
+            stats: Arc::new(AudioStats::default()),
+            gains: Arc::new(SharedGains::new(1.0, 1.0)),
+        });
+        if let Some(s) = sink {
+            r.sink = Some(Box::new(s));
+        }
+        (r, shared)
+    }
+
+    /// Ruling 23: the first "on" can be accepted (request set) between the render thread's
+    /// `ready` and its first `after_open`; opening must not wipe the request.
+    #[test]
+    fn after_open_keeps_a_pending_preroll_request() {
+        let (mut r, shared) = test_renderer(None);
+        shared.preroll_request.store(true, Ordering::Release);
+        r.after_open();
+        assert!(shared.preroll_request.load(Ordering::Acquire));
+        // Still resets the per-stream state.
+        assert_eq!((r.extra, r.preroll_left, r.preroll_fade), (0, 0, false));
+    }
+
+    #[test]
+    fn a_request_kept_through_after_open_is_consumed_by_the_next_fill() {
+        let (mut r, shared) = test_renderer(Some(FakeSink { padding: 0 }));
+        shared.preroll_request.store(true, Ordering::Release);
+        r.after_open();
+        assert!(r.fill().is_ok());
+        assert!(!shared.preroll_request.load(Ordering::Acquire), "consumed");
+        // A full capture packet of pre-roll, counted inside the headroom.
+        assert_eq!(r.extra, PREROLL_FRAMES);
+    }
 
     #[test]
     fn latency_frames_adds_three_render_periods() {

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AutoTune Helper",
+  "productName": "Tune Love",
   "version": "0.1.0",
-  "identifier": "dev.autotunehelper.nowplaying",
+  "identifier": "io.github.ylzhe.tunelove",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
@@ -11,12 +11,12 @@
   },
   "app": {
     "windows": [{
-      "label": "main", "title": "AutoTune Helper",
+      "label": "main", "title": "Tune Love",
       "width": 468, "height": 242, "resizable": false,
       "decorations": false, "transparent": true,
       "shadow": false, "alwaysOnTop": true, "center": true
     }, {
-      "label": "settings", "title": "AutoTune Helper · 设置", "url": "index.html?view=settings",
+      "label": "settings", "title": "Tune Love · 设置", "url": "index.html?view=settings",
       "create": false, "visible": false, "focus": false,
       "width": 760, "height": 540, "minWidth": 520, "minHeight": 380,
       "resizable": true, "decorations": false, "shadow": true,

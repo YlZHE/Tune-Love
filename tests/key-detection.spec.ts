@@ -135,7 +135,7 @@ function expectSafeTitleTimeline(frames: Awaited<ReturnType<typeof sampleTitleTr
 test("shows the brand first, then a validated A minor label without disturbing native titlebar layout", async ({ page }) => {
   await installNativeBoundary(page);
   const brand = page.locator(".brand");
-  await expect(brand).toContainText("AutoTune Helper");
+  await expect(brand).toContainText("Tune Love");
   await expect(brand).toHaveAttribute("data-tauri-drag-region", "true");
   await expect(page.getByRole("status")).toHaveCount(0);
 
@@ -164,7 +164,7 @@ test("rejects a late old-song result, accepts the new generation, and retains it
 
   await changeSong(page, "second", 5, "playing");
   await expect(page.getByRole("heading", { name: "夜航" })).toBeVisible({ timeout: 1800 });
-  await expect(page.locator(".brand")).toContainText("AutoTune Helper");
+  await expect(page.locator(".brand")).toContainText("Tune Love");
   await page.evaluate(() => {
     const state = (window as any).__keyFixture;
     state.deferreds.shift()();
@@ -244,7 +244,7 @@ test("a media identity commit synchronously hides the previous song key before e
     observer.observe(document.querySelector("#root")!, { childList: true, subtree: true, characterData: true });
   }));
   await changeSong(page, "second", 5);
-  expect(await observed).toContain("AutoTune Helper");
+  expect(await observed).toContain("Tune Love");
 });
 
 test("rapid identity changes keep one native key read in flight across hook lifecycles", async ({ page }) => {

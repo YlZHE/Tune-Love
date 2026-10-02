@@ -1,7 +1,7 @@
 //! Controlled low-volume playback in two owned sibling processes; never controls a user player.
 #[cfg(windows)]
 mod native {
-    use helper_now_playing::audio::capture::capture_process;
+    use tune_love::audio::capture::capture_process;
     use std::{
         io::{BufRead, BufReader, Write},
         os::windows::process::CommandExt,

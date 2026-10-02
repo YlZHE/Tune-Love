@@ -383,7 +383,7 @@ impl AutotuneState {
                     Some("scan" | "options") => {}
                     _ => return Err("No worker connection; scan and explicitly connect".into()),
                 }
-                let reference = std::env::var_os("AUTOTUNE_HELPER_REFERENCE")
+                let reference = std::env::var_os("TUNE_LOVE_REFERENCE")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
                         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../reference")
@@ -393,7 +393,7 @@ impl AutotuneState {
                     .canonicalize()
                     .map_err(|e| format!("Cannot locate reference/app_bridge.py: {e}"))?;
                 let mut command = Command::new(
-                    std::env::var_os("AUTOTUNE_HELPER_PYTHON").unwrap_or_else(|| "python".into()),
+                    std::env::var_os("TUNE_LOVE_PYTHON").unwrap_or_else(|| "python".into()),
                 );
                 command.arg("-u").arg(script);
                 let worker = Worker::spawn(command)?;
@@ -598,7 +598,7 @@ mod tests {
 
     fn python(script: &str) -> Command {
         let mut command = Command::new(
-            std::env::var_os("AUTOTUNE_HELPER_PYTHON").unwrap_or_else(|| "python".into()),
+            std::env::var_os("TUNE_LOVE_PYTHON").unwrap_or_else(|| "python".into()),
         );
         command.args(["-u", "-c", script]);
         command

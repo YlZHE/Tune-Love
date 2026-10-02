@@ -1,11 +1,11 @@
 [package]
-name = "autotune-helper-now-playing"
+name = "tune-love"
 version = "0.1.0"
 edition = "2021"
-default-run = "autotune-helper-now-playing"
+default-run = "tune-love"
 
 [lib]
-name = "helper_now_playing"
+name = "tune_love"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

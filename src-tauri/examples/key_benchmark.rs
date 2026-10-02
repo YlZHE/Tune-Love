@@ -1,8 +1,8 @@
 // Offline-only evaluator. No capture APIs, no audio persistence, no plugin writes.
-use helper_now_playing::audio::PcmWindow;
+use tune_love::audio::PcmWindow;
 #[cfg(test)]
-use helper_now_playing::key_detection;
-use helper_now_playing::key_detection::{detect, Mode, MusicalKey, RollingDetector};
+use tune_love::key_detection;
+use tune_love::key_detection::{detect, Mode, MusicalKey, RollingDetector};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{path::Path, process::Command, time::Instant};

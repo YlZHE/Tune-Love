@@ -1,7 +1,7 @@
 // Read-only integration probe. Does not control any player or host.
 #[tokio::main]
 async fn main() {
-    let state = helper_now_playing::media::MediaState::default();
+    let state = tune_love::media::MediaState::default();
     let probe = async {
         for _ in 0..12 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -21,5 +21,5 @@ async fn main() {
             }
         }
     };
-    tokio::select! { _ = helper_now_playing::media::watch(state.clone()) => {}, _ = probe => {} }
+    tokio::select! { _ = tune_love::media::watch(state.clone()) => {}, _ = probe => {} }
 }

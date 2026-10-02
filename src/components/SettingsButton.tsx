@@ -15,7 +15,7 @@ export function SettingsButton({ onError }: { onError: (message: string) => void
       if (isTauri()) await invoke("open_settings");
       else {
         if (!preview || preview.closed) {
-          preview = window.open("/?view=settings", "autotune-helper-settings", "popup,width=760,height=540");
+          preview = window.open("/?view=settings", "tune-love-settings", "popup,width=760,height=540");
         }
         if (!preview) throw new Error("Preview window was blocked");
         preview.focus();

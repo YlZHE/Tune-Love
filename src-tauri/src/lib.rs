@@ -63,7 +63,7 @@ pub fn run() {
             autotune::autotune_command
         ])
         .build(tauri::generate_context!())
-        .expect("Could not start AutoTune Helper")
+        .expect("Could not start Tune Love")
         .run(|app, event| {
             use tauri::Manager;
             if matches!(event, tauri::RunEvent::Exit) {

@@ -34,7 +34,7 @@
   - 恢复时必须同时满足两道保护：进程号与创建时间一致；当前音量仍为 1e-4。
 - 引擎重启上限：60 秒内最多 3 次；超过后停在原声并提示。
 - 管道：
-  - 名称为 `\\.\pipe\autotune-helper-devocal-<应用进程号>`；ACL 只允许当前用户；
+  - 名称为 `\\.\pipe\tune-love-devocal-<应用进程号>`；ACL 只允许当前用户；
   - 一行一条 JSON，每条都带 `"protocol": 1`。
 - StemgenRT 权重不打包、不分发。开发阶段的路径为 `artifacts/separation-bench/models/hop128.onnx`，SHA-256 为 `77164d6a581fafb2a31f53fd8ffde44c07cf618472952a4cdba14e68dda3b8b9`。
 - 界面文案一律中文，见任务 13 的固定文案表。
@@ -540,7 +540,7 @@ now-playing/
 - Consumes: `protocol::*`；`Holder`、`state::next`（任务 7）；`AudioHandle`（任务 8）；`StemgenRt::load`（任务 5）。
 - Produces:
   - 命令行：`devocal-engine.exe --app-pid <u32> --restore-file <path>`。
-  - `pub fn pipe_name(app_pid: u32) -> String`：返回 `\\.\pipe\autotune-helper-devocal-<pid>`。
+  - `pub fn pipe_name(app_pid: u32) -> String`：返回 `\\.\pipe\tune-love-devocal-<pid>`。
   - `pub struct PipeServer`：
     - `create(name)` 带三项设置：`FILE_FLAG_FIRST_PIPE_INSTANCE`、`PIPE_REJECT_REMOTE_CLIENTS`，以及 SDDL `D:P(A;;GA;;;<当前用户 SID>)`（SID 来自 `GetTokenInformation(TokenUser)` 和 `ConvertSidToStringSidW`）；
     - `accept(expected_client_pid)`：用 `GetNamedPipeClientProcessId` 校验，不符则断开并继续等待；
@@ -613,7 +613,7 @@ now-playing/
       pub session_overridden: bool, pub input_silent: bool, pub error: Option<String> }
   #[tauri::command] pub fn get_devocal_status(state: State<DevocalState>) -> DevocalStatus;
   #[tauri::command] pub fn devocal_command(request: DevocalRequest /* {action: "enable"|"disable"|"release"} */, ..) -> Result<DevocalStatus, String>;
-  pub fn model_path(data_dir: &Path) -> Option<PathBuf>; // 依次查 env AUTOTUNE_HELPER_STEMGENRT_ONNX、<data>/models/stemgenrt-hop128.onnx，取第一个存在的
+  pub fn model_path(data_dir: &Path) -> Option<PathBuf>; // 依次查 env TUNE_LOVE_STEMGENRT_ONNX、<data>/models/stemgenrt-hop128.onnx，取第一个存在的
   ```
 - 闸门规则：
   - 状态为 `attaching` 或 `releasing`，或者引擎被判定异常退出时：`gate.set(None)`；

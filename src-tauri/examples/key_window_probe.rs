@@ -1,5 +1,5 @@
 // Offline-only stdin probe. No file enumeration, capture, GUI or plugin APIs.
-use helper_now_playing::{
+use tune_love::{
     audio::PcmWindow,
     key_detection::{detect_with_diagnostics, RollingDetector},
 };

@@ -4,7 +4,7 @@
 //
 // Usage: node scripts/fetch-stemgenrt.mjs --accept [destination.onnx]
 // Default destination is where the app looks for it:
-//   %LOCALAPPDATA%\dev.autotunehelper.nowplaying\models\stemgenrt-hop128.onnx
+//   %LOCALAPPDATA%\io.github.ylzhe.tunelove\models\stemgenrt-hop128.onnx
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync } from "node:fs";
 import { mkdir, rename, rm, stat } from "node:fs/promises";
@@ -21,7 +21,7 @@ const MODEL = {
 const args = process.argv.slice(2);
 const accepted = args.includes("--accept");
 const target = args.find(a => !a.startsWith("--"))
-  ?? join(process.env.LOCALAPPDATA ?? ".", "dev.autotunehelper.nowplaying", "models", "stemgenrt-hop128.onnx");
+  ?? join(process.env.LOCALAPPDATA ?? ".", "io.github.ylzhe.tunelove", "models", "stemgenrt-hop128.onnx");
 
 async function sha256(path) {
   const hash = createHash("sha256");

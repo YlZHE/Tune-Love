@@ -139,7 +139,7 @@ trait Separator {
 | 播放器退出 | 无需恢复；引擎回到 `idle` 并报告；应用识别到新播放器后再发 `attach` |
 
 **管道：**
-- 名称为 `\\.\pipe\autotune-helper-devocal-<应用进程号>`，ACL 只允许当前用户。
+- 名称为 `\\.\pipe\tune-love-devocal-<应用进程号>`，ACL 只允许当前用户。
 - 引擎启动参数带上应用的进程号，引擎同时监视这个句柄。
 - 每行一条 JSON，带 `protocol: 1`。
 

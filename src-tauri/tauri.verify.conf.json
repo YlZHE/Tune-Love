@@ -1,13 +1,13 @@
 {
   "app": {
     "windows": [{
-      "label": "main", "title": "AutoTune Helper",
+      "label": "main", "title": "Tune Love",
       "width": 468, "height": 242, "resizable": false,
       "decorations": false, "transparent": true,
       "shadow": false, "alwaysOnTop": true, "center": true,
       "additionalBrowserArgs": "--remote-debugging-port=19224"
     }, {
-      "label": "settings", "title": "AutoTune Helper · 设置", "url": "index.html?view=settings",
+      "label": "settings", "title": "Tune Love · 设置", "url": "index.html?view=settings",
       "create": false, "visible": false, "focus": false,
       "width": 760, "height": 540, "minWidth": 520, "minHeight": 380,
       "resizable": true, "decorations": false, "shadow": true,

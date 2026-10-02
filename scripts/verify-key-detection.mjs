@@ -13,7 +13,7 @@ const pages = () => browser.contexts().flatMap(context => context.pages());
 await expect.poll(() => pages().some(page => page.url() === "http://tauri.localhost/"),
   { timeout: 15_000 }).toBe(true);
 const page = pages().find(page => page.url() === "http://tauri.localhost/");
-if (!page) throw new Error("AutoTune Helper main page was not found");
+if (!page) throw new Error("Tune Love main page was not found");
 
 const errors = [];
 page.on("pageerror", error => errors.push(error.message));

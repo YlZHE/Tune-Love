@@ -4,14 +4,15 @@
 //   npm run build:engine -- --release    release build
 //
 // Copies the built exe to:
-//   1. src-tauri/binaries/devocal-engine-x86_64-pc-windows-msvc.exe
-//      The installer build reads it from there: bundle.externalBin in
-//      src-tauri/tauri.release.conf.json (never in the base tauri.conf.json, so that
-//      daily builds and CI `cargo test` do not need the engine).
-//   2. src-tauri/target/<profile>/devocal-engine.exe
+//   1. src-tauri/target/<profile>/devocal-engine.exe   (always)
 //      The app starts current_exe().with_file_name("devocal-engine.exe"). The base config
 //      has no externalBin, so tauri-build does not copy anything for dev runs; this copy
 //      lets `npm run tauri dev` (debug) and a local release exe find the engine.
+//   2. src-tauri/binaries/devocal-engine-x86_64-pc-windows-msvc.exe   (--release only)
+//      The installer build reads it from there: bundle.externalBin in
+//      src-tauri/tauri.release.conf.json (never in the base tauri.conf.json, so that
+//      daily builds and CI `cargo test` do not need the engine). A debug build never
+//      writes here, so it can never become the packaging input.
 //
 // Both destinations are git-ignored (src-tauri/binaries/, src-tauri/target/).
 import { spawnSync } from "node:child_process";
@@ -70,10 +71,8 @@ if (!exe) {
   process.exit(1);
 }
 
-const destinations = [
-  join(root, "src-tauri", "binaries", `devocal-engine-${TRIPLE}.exe`),
-  join(root, "src-tauri", "target", profile, "devocal-engine.exe"),
-];
+const destinations = [join(root, "src-tauri", "target", profile, "devocal-engine.exe")];
+if (release) destinations.push(join(root, "src-tauri", "binaries", `devocal-engine-${TRIPLE}.exe`));
 for (const dest of destinations) {
   if (resolve(exe).toLowerCase() === dest.toLowerCase()) continue;
   mkdirSync(dirname(dest), { recursive: true });

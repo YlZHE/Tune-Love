@@ -115,7 +115,7 @@ PCM 为 48 kHz、双声道 f32，后台只保留最近最多 8 秒的内存缓�
 
 打包安装包还需要以下两步（日常开发和 `cargo test` 不需要）：
 
-- `npm run build:engine`（加 `-- --release` 构建发布版）：在 `devocal/` 中构建去人声引擎，复制到 `src-tauri/binaries/devocal-engine-x86_64-pc-windows-msvc.exe`（供 `tauri.release.conf.json` 的 `externalBin` 打包）和 `src-tauri/target/<debug|release>/devocal-engine.exe`（供本地运行时找到）。首次构建会由 `ort` 从 cdn.pyke.io 下载 ONNX Runtime 预编译库并静态链接。
+- `npm run build:engine`（加 `-- --release` 构建发布版）：在 `devocal/` 中构建去人声引擎，复制到 `src-tauri/target/<debug|release>/devocal-engine.exe`（供本地运行时找到）；只有 `--release` 才同时复制到 `src-tauri/binaries/devocal-engine-x86_64-pc-windows-msvc.exe`（供 `tauri.release.conf.json` 的 `externalBin` 打包），调试版不会成为打包输入。首次构建会由 `ort` 从 cdn.pyke.io 下载 ONNX Runtime 预编译库并静态链接。
 - `npm run fetch:vcrt`：从本机 Visual Studio（经 `vswhere` 找最新的 `VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT`）复制 4 个 VC++ 运行库 DLL 到 `src-tauri/vcrt/`，安装包把它们放在安装目录根部。
 
 ```powershell

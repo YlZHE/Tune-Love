@@ -13,7 +13,7 @@ defaults:
 
 jobs:
   version:
-    runs-on: windows-latest
+    runs-on: windows-2022  # VS 2022: build.rs pins the "Visual Studio 17 2022" CMake generator
     timeout-minutes: 10
     outputs:
       version: ${{ steps.check.outputs.version }}
@@ -42,7 +42,7 @@ jobs:
 
   package:
     needs: [version, ci]
-    runs-on: windows-latest
+    runs-on: windows-2022  # VS 2022: build.rs pins the "Visual Studio 17 2022" CMake generator
     timeout-minutes: 90
     # Build steps run third-party code (npm scripts, build.rs, downloads): no write token here.
     permissions:
@@ -108,7 +108,7 @@ jobs:
 
   publish:
     needs: [version, package]
-    runs-on: windows-latest
+    runs-on: windows-2022  # VS 2022: build.rs pins the "Visual Studio 17 2022" CMake generator
     timeout-minutes: 15
     permissions:
       contents: write

@@ -2,10 +2,14 @@
 //!
 //! Records, at the same time, the player's own audio (process loopback of its process tree)
 //! and the system output (loopback of a render endpoint, by default the default one), then:
-//! - finds the added latency by cross-correlation (search 0..300 ms; coarse search on 8x
-//!   decimated audio, refined at full rate) and reports the correlation coefficient;
+//! - builds a lag timeline: mono mix, windows of 4096 frames every 0.25 s; for each window the
+//!   lag `L` in [-300, +300] ms that maximises the normalised correlation of `out[i]` with
+//!   `src[i - L]` (coarse search on 8x decimated audio, refined at full rate). Windows where
+//!   either side is digital silence, or that match poorly (correlation < 0.5), are skipped;
+//! - groups the windows into segments (runs of at least 4 consecutive windows whose lags stay
+//!   within +-2 frames of each other) and reports the jump between consecutive segments;
 //! - counts dropouts in 10 ms blocks, separately on each stream and relative to that stream's
-//!   own level: a block more than 30 dB below the running median of its neighbours (±10
+//!   own level: a block more than 30 dB below the running median of its neighbours (+-10
 //!   blocks), where those neighbours are within 30 dB of the stream's median block energy.
 //!   This works for the player's process loopback even while it is held at -80 dB.
 //!   Output dropouts also present in the player's own audio are reported apart;
@@ -13,13 +17,25 @@
 //!
 //! It only captures: it talks to no engine and never changes any session volume.
 //!
+//! How to measure latency: the absolute lag between the two recordings is NOT a latency (the
+//! two capture paths have their own, different, unknown delays; the content offset between
+//! them is merely stable from run to run). What is exact is a lag JUMP inside one recording.
+//! Start the probe, keep at least 3 s of steady playback before and after a release (engine
+//! detaches: output content skips forward by the added delay, jump = minus the latency,
+//! reported in `releaseLatencyMs`) or an attach (jump = plus the latency, `attachLatencyMs`).
+//! Segments shorter than 4 windows (1 s) are ignored, so hold each state for a few seconds.
+//! A recording with no state change gives one segment and no jumps.
+//!
 //! Usage:
 //!   latency_probe --pid <player root pid> --seconds <s> [--endpoint <render endpoint id>]
 //!                 [--out probe.json] [--dump <prefix>]
 //!
 //! `--dump` also writes the raw recordings (interleaved stereo f32 LE, 44.1 kHz) to
 //! `<prefix>-source.f32` and `<prefix>-output.f32`, and their first-packet QPC times to
-//! `<prefix>-times.json`, for offline analysis.
+//! `<prefix>-times.json`, for offline analysis (the times are unreliable for alignment).
+//!
+//! The analysis is pure functions over the two mono signals, unit-tested with synthetic
+//! signals (`cargo test --workspace` runs them: the example is declared with `test = true`).
 
 use std::thread;
 use std::time::Instant;
@@ -29,7 +45,19 @@ use wasapi::{AudioClient, DeviceEnumerator, Direction, SampleType, StreamMode, W
 
 const RATE: usize = 44_100;
 const MAX_LAG_MS: usize = 300;
+const MAX_LAG: usize = MAX_LAG_MS * RATE / 1000;
 const DECIMATE: usize = 8;
+/// Lag-timeline window length (frames) and hop (0.25 s).
+const WINDOW: usize = 4096;
+const HOP: usize = RATE / 4;
+/// Windows that match worse than this are skipped (no usable alignment there).
+const MIN_WINDOW_CORR: f64 = 0.5;
+/// Peak amplitude at or below which a stretch counts as digital silence (-140 dB).
+const SILENCE_PEAK: f32 = 1e-7;
+/// Window lags this close (frames) belong to the same segment.
+const SEGMENT_TOLERANCE: i64 = 2;
+/// Shortest run of windows reported as a segment.
+const MIN_SEGMENT_WINDOWS: usize = 4;
 const BLOCK: usize = RATE / 100;
 const NEIGHBOURS: usize = 10;
 /// -30 dB in energy.
@@ -37,8 +65,6 @@ const GAP_RATIO: f64 = 1e-3;
 /// Neighbours count as audible when their median energy is within 30 dB of the stream's
 /// median block energy.
 const AUDIBLE_RELATIVE: f64 = 1e-3;
-/// Longest window used for the lag search.
-const SEARCH_SECONDS: usize = 10;
 
 struct Args {
     pid: u32,
@@ -207,8 +233,8 @@ fn decimate(x: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Pearson correlation of `out[i]` with `src[i + shift]` over the overlapping range of
-/// `out` indices `range`.
+/// Pearson correlation of `out[i]` with `src[i + shift]` over the `out` indices `range`
+/// (indices outside either signal are skipped).
 fn correlation(out: &[f32], src: &[f32], shift: i64, range: (usize, usize)) -> f64 {
     let (mut sx, mut sy, mut sxx, mut syy, mut sxy, mut n) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     for i in range.0..range.1 {
@@ -237,34 +263,216 @@ fn correlation(out: &[f32], src: &[f32], shift: i64, range: (usize, usize)) -> f
     cov / (vx * vy).sqrt()
 }
 
-/// Best lag `d` (samples, output later than source) for `out[i] ~ src[i + offset - d]`.
-fn find_lag(out: &[f32], src: &[f32], offset: i64) -> (usize, f64) {
-    let max_lag = MAX_LAG_MS * RATE / 1000;
-    // Search window: up to 10 s in the middle of the output recording.
-    let len = out.len().min(SEARCH_SECONDS * RATE);
-    let first = (out.len() - len) / 2;
-    let window = (first, first + len);
+fn peak(x: &[f32]) -> f32 {
+    x.iter().fold(0.0, |m, &s| m.max(s.abs()))
+}
 
-    let out8 = decimate(out);
-    let src8 = decimate(src);
-    let w8 = (window.0 / DECIMATE, window.1 / DECIMATE);
-    let off8 = offset / DECIMATE as i64;
-    let mut best = (0usize, f64::MIN);
-    for d8 in 0..=max_lag / DECIMATE {
-        let r = correlation(&out8, &src8, off8 - d8 as i64, w8);
-        if r > best.1 {
-            best = (d8, r);
+fn energy(x: &[f32]) -> f64 {
+    x.iter().map(|&s| f64::from(s) * f64::from(s)).sum()
+}
+
+/// Normalised correlation (cosine, scale invariant) of `a` with `src[start..start + a.len()]`;
+/// `None` when that range is outside `src`, 0 when the source part has no energy.
+fn cosine_at(a: &[f32], a_norm: f64, src: &[f32], start: i64) -> Option<f64> {
+    if start < 0 || start as usize + a.len() > src.len() {
+        return None;
+    }
+    let b = &src[start as usize..start as usize + a.len()];
+    let (mut dot, mut bb) = (0.0f64, 0.0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        dot += f64::from(x) * f64::from(y);
+        bb += f64::from(y) * f64::from(y);
+    }
+    Some(if bb > 0.0 {
+        dot / (a_norm * bb.sqrt())
+    } else {
+        0.0
+    })
+}
+
+/// Best lag (frames, `out[i] ~ src[i - lag]`) of the output window starting at `start` and
+/// its normalised correlation; coarse search on the decimated signals, then a fine search of
+/// +-2 decimation steps at full rate. `None` when nothing could be compared.
+fn window_lag(
+    out: &[f32],
+    src: &[f32],
+    out8: &[f32],
+    src8: &[f32],
+    start: usize,
+) -> Option<(i64, f64)> {
+    let w8 = (start / DECIMATE, (start + WINDOW) / DECIMATE);
+    let a8 = &out8[w8.0..w8.1];
+    let n8 = energy(a8).sqrt();
+    let mut coarse: Option<(i64, f64)> = None;
+    for d8 in -((MAX_LAG / DECIMATE) as i64)..=(MAX_LAG / DECIMATE) as i64 {
+        if let Some(r) = cosine_at(a8, n8, src8, w8.0 as i64 - d8) {
+            if coarse.is_none_or(|(_, best)| r > best) {
+                coarse = Some((d8, r));
+            }
         }
     }
-    let centre = best.0 * DECIMATE;
-    let mut fine = (centre, f64::MIN);
-    for d in centre.saturating_sub(2 * DECIMATE)..=(centre + 2 * DECIMATE).min(max_lag) {
-        let r = correlation(out, src, offset - d as i64, window);
-        if r > fine.1 {
-            fine = (d, r);
+    let centre = coarse?.0 * DECIMATE as i64;
+    let a = &out[start..start + WINDOW];
+    let n = energy(a).sqrt();
+    let mut fine: Option<(i64, f64)> = None;
+    let reach = 2 * DECIMATE as i64;
+    for d in (centre - reach).max(-(MAX_LAG as i64))..=(centre + reach).min(MAX_LAG as i64) {
+        if let Some(r) = cosine_at(a, n, src, start as i64 - d) {
+            if fine.is_none_or(|(_, best)| r > best) {
+                fine = Some((d, r));
+            }
         }
     }
     fine
+}
+
+/// One analysed window: first output frame, best lag in frames, peak correlation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WindowLag {
+    start: usize,
+    lag: i64,
+    corr: f64,
+}
+
+/// Lag of every window (4096 frames, every 0.25 s) in [-300, +300] ms. Windows start at
+/// 300 ms so that every candidate lag has source audio; windows where the output window or
+/// the whole source search range is digital silence, or whose best correlation is below
+/// [`MIN_WINDOW_CORR`], are left out.
+fn lag_timeline(out: &[f32], src: &[f32]) -> Vec<WindowLag> {
+    let out8 = decimate(out);
+    let src8 = decimate(src);
+    let mut v = Vec::new();
+    let mut start = MAX_LAG;
+    while start + WINDOW <= out.len() && start + WINDOW + MAX_LAG <= src.len() {
+        let silent = peak(&out[start..start + WINDOW]) <= SILENCE_PEAK
+            || peak(&src[start - MAX_LAG..start + WINDOW + MAX_LAG]) <= SILENCE_PEAK;
+        if !silent {
+            if let Some((lag, corr)) = window_lag(out, src, &out8, &src8, start) {
+                if corr >= MIN_WINDOW_CORR {
+                    v.push(WindowLag { start, lag, corr });
+                }
+            }
+        }
+        start += HOP;
+    }
+    v
+}
+
+/// A run of windows with a steady lag.
+#[derive(Debug, Clone, PartialEq)]
+struct Segment {
+    start_s: f64,
+    end_s: f64,
+    /// Median window lag, frames.
+    lag_frames: i64,
+    mean_corr: f64,
+    windows: usize,
+    /// Output frame range covered (first window start .. last window end).
+    span: (usize, usize),
+}
+
+impl Segment {
+    fn lag_ms(&self) -> f64 {
+        self.lag_frames as f64 * 1000.0 / RATE as f64
+    }
+}
+
+fn close_run(run: &mut Vec<WindowLag>, segments: &mut Vec<Segment>) {
+    if run.len() >= MIN_SEGMENT_WINDOWS {
+        let mut lags: Vec<i64> = run.iter().map(|w| w.lag).collect();
+        lags.sort_unstable();
+        let first = run[0].start;
+        let end = run[run.len() - 1].start + WINDOW;
+        segments.push(Segment {
+            start_s: first as f64 / RATE as f64,
+            end_s: end as f64 / RATE as f64,
+            lag_frames: lags[lags.len() / 2],
+            mean_corr: run.iter().map(|w| w.corr).sum::<f64>() / run.len() as f64,
+            windows: run.len(),
+            span: (first, end),
+        });
+    }
+    run.clear();
+}
+
+/// Runs of consecutive windows whose lag stays within +-2 frames of the previous window's,
+/// at least [`MIN_SEGMENT_WINDOWS`] long.
+fn segments(windows: &[WindowLag]) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut run: Vec<WindowLag> = Vec::new();
+    for &w in windows {
+        if run
+            .last()
+            .is_some_and(|l| (w.lag - l.lag).abs() > SEGMENT_TOLERANCE)
+        {
+            close_run(&mut run, &mut out);
+        }
+        run.push(w);
+    }
+    close_run(&mut run, &mut out);
+    out
+}
+
+/// `next.lag - prev.lag` in ms for each pair of consecutive segments. Across a release the
+/// output content skips forward, so the jump is minus the added latency; across an attach it
+/// is plus it.
+fn jumps_ms(segments: &[Segment]) -> Vec<f64> {
+    segments
+        .windows(2)
+        .map(|p| p[1].lag_ms() - p[0].lag_ms())
+        .collect()
+}
+
+struct Analysis {
+    windows: usize,
+    segments: Vec<Segment>,
+    jumps_ms: Vec<f64>,
+    /// Index of the segment with the most windows, and the whole-span Pearson correlation of
+    /// the output with the source at that segment's lag (scale invariant).
+    dominant: Option<(usize, f64)>,
+}
+
+fn analyse(out: &[f32], src: &[f32]) -> Analysis {
+    let windows = lag_timeline(out, src);
+    let segments = segments(&windows);
+    let jumps_ms = jumps_ms(&segments);
+    // The first of equally long segments wins.
+    let dominant = segments
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, s)| (s.windows, std::cmp::Reverse(*i)))
+        .map(|(i, s)| (i, correlation(out, src, -s.lag_frames, s.span)));
+    Analysis {
+        windows: windows.len(),
+        segments,
+        jumps_ms,
+        dominant,
+    }
+}
+
+/// Lag (frames) in force at output frame `at`: that of the segment containing it, else of
+/// the nearest segment; 0 when there are none.
+fn lag_at(segments: &[Segment], at: usize) -> i64 {
+    let dist = |s: &Segment| {
+        if at < s.span.0 {
+            s.span.0 - at
+        } else {
+            at.saturating_sub(s.span.1)
+        }
+    };
+    segments
+        .iter()
+        .min_by_key(|s| dist(s))
+        .map_or(0, |s| s.lag_frames)
+}
+
+fn segment_json(s: &Segment) -> serde_json::Value {
+    json!({
+        "startS": s.start_s,
+        "endS": s.end_s,
+        "lagMs": s.lag_ms(),
+        "meanCorr": s.mean_corr,
+    })
 }
 
 /// Dropout runs (first block index of each) in 10 ms blocks, relative to the stream's own
@@ -343,31 +551,50 @@ fn run() -> Result<(), String> {
     if src_m.len() < RATE || out_m.len() < RATE {
         return Err("less than 1 s recorded; is the player playing?".into());
     }
-    // Source index of the output's first frame, from the packets' QPC times.
-    let offset =
-        ((out.first_qpc as i128 - src.first_qpc as i128) * RATE as i128 / 10_000_000) as i64;
-    let (lag, _) = find_lag(&out_m, &src_m, offset);
-    let corr = correlation(&out_m, &src_m, offset - lag as i64, (0, out_m.len()));
+    let analysis = analyse(&out_m, &src_m);
 
     let out_gaps = dropouts(&out_m);
     let src_gaps = dropouts(&src_m);
-    let lag_blocks = (lag / BLOCK) as i64;
-    let offset_blocks = offset / BLOCK as i64;
     let ours: Vec<usize> = out_gaps
         .iter()
         .copied()
         .filter(|&b| {
-            let s = b as i64 + offset_blocks - lag_blocks;
+            // The source block this output block was playing, at the lag in force there.
+            let lag_blocks = lag_at(&analysis.segments, b * BLOCK) / BLOCK as i64;
+            let s = b as i64 - lag_blocks;
             !src_gaps.iter().any(|&g| (g as i64 - s).abs() <= 2)
         })
         .collect();
 
+    let release: Vec<f64> = analysis
+        .jumps_ms
+        .iter()
+        .filter(|&&j| j < 0.0)
+        .map(|j| -j)
+        .collect();
+    let attach: Vec<f64> = analysis
+        .jumps_ms
+        .iter()
+        .copied()
+        .filter(|&j| j > 0.0)
+        .collect();
+    let dominant = analysis.dominant.map(|(i, corr)| {
+        let mut d = segment_json(&analysis.segments[i]);
+        d["windows"] = json!(analysis.segments[i].windows);
+        d["correlation"] = json!(corr);
+        d
+    });
+
     let report = json!({
         "pid": pid,
         "seconds": secs,
-        "latencyMs": lag as f64 * 1000.0 / RATE as f64,
-        "correlation": corr,
-        "lagSearchMs": [0, MAX_LAG_MS],
+        "windows": analysis.windows,
+        "segments": analysis.segments.iter().map(segment_json).collect::<Vec<_>>(),
+        "jumpsMs": analysis.jumps_ms,
+        "releaseLatencyMs": release,
+        "attachLatencyMs": attach,
+        "dominant": dominant,
+        "correlation": analysis.dominant.map(|(_, c)| c),
         "dropouts": ours.len(),
         "dropoutTimesMs": ours.iter().map(|&b| b * 10).collect::<Vec<_>>(),
         "outputGapsTotal": out_gaps.len(),
@@ -390,4 +617,175 @@ fn run() -> Result<(), String> {
         std::fs::write(path, &text).map_err(|e| format!("write {path}: {e}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic white noise in [-0.5, 0.5).
+    fn noise(frames: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed;
+        (0..frames)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// `out[i] = src[i - lag]` for `i` before `switch`, `src[i - lag_after]` from it on.
+    fn delayed(src: &[f32], frames: usize, switch: usize, lag: i64, lag_after: i64) -> Vec<f32> {
+        (0..frames)
+            .map(|i| {
+                let l = if i < switch { lag } else { lag_after };
+                let j = i as i64 - l;
+                if j < 0 {
+                    0.0
+                } else {
+                    src[j as usize]
+                }
+            })
+            .collect()
+    }
+
+    const RELEASE_FRAMES: i64 = 3_312; // 75.1 ms
+
+    fn release_pair(scale: f32) -> (Vec<f32>, Vec<f32>) {
+        let src: Vec<f32> = noise(14 * RATE, 7).iter().map(|s| s * scale).collect();
+        let out = delayed(&src, 12 * RATE, 5 * RATE, 100, 100 - RELEASE_FRAMES);
+        // The output is the full-scale signal whatever the source level is.
+        let out = out.iter().map(|s| s / scale).collect();
+        (src, out)
+    }
+
+    fn check_release(src: &[f32], out: &[f32]) {
+        let a = analyse(out, src);
+        assert_eq!(a.segments.len(), 2, "{:?}", a.segments);
+        assert_eq!(a.jumps_ms.len(), 1);
+        let want = -(RELEASE_FRAMES as f64) * 1000.0 / RATE as f64;
+        assert!(
+            (a.jumps_ms[0] - want).abs() <= 0.1,
+            "jump {} ms, want {want}",
+            a.jumps_ms[0]
+        );
+        assert!((a.segments[0].lag_ms() - 100.0 * 1000.0 / RATE as f64).abs() < 0.05);
+        assert!(a.segments[0].end_s <= a.segments[1].start_s + 0.3);
+        assert!(a.segments.iter().all(|s| s.mean_corr > 0.9));
+        let (_, corr) = a.dominant.unwrap();
+        assert!(corr > 0.99, "{corr}");
+    }
+
+    #[test]
+    fn release_shows_as_one_negative_jump() {
+        let (src, out) = release_pair(1.0);
+        check_release(&src, &out);
+    }
+
+    #[test]
+    fn jump_is_scale_invariant_for_a_held_source() {
+        // Source held at -80 dB, output at full scale.
+        let (src, out) = release_pair(1e-4);
+        check_release(&src, &out);
+    }
+
+    #[test]
+    fn attach_shows_as_one_positive_jump() {
+        let src = noise(14 * RATE, 11);
+        let out = delayed(&src, 12 * RATE, 5 * RATE, -200, -200 + RELEASE_FRAMES);
+        let a = analyse(&out, &src);
+        assert_eq!(a.segments.len(), 2, "{:?}", a.segments);
+        let want = RELEASE_FRAMES as f64 * 1000.0 / RATE as f64;
+        assert!((a.jumps_ms[0] - want).abs() <= 0.1, "{}", a.jumps_ms[0]);
+        assert!(a.jumps_ms[0] > 0.0);
+    }
+
+    #[test]
+    fn baseline_has_one_segment_and_no_jumps() {
+        let src = noise(14 * RATE, 3);
+        let out = src[..12 * RATE].to_vec();
+        let a = analyse(&out, &src);
+        assert_eq!(a.segments.len(), 1, "{:?}", a.segments);
+        assert!(a.jumps_ms.is_empty());
+        assert_eq!(a.segments[0].lag_frames, 0);
+        let (i, corr) = a.dominant.unwrap();
+        assert_eq!(i, 0);
+        assert!(corr >= 0.999, "{corr}");
+    }
+
+    #[test]
+    fn silent_stretches_are_skipped_not_matched() {
+        let src = noise(14 * RATE, 5);
+        let mut out = src[..12 * RATE].to_vec();
+        out[4 * RATE..8 * RATE].fill(0.0);
+        let a = analyse(&out, &src);
+        let w = lag_timeline(&out, &src);
+        assert_eq!(a.windows, w.len());
+        assert!(w.len() > 20 && w.len() < 40, "{}", w.len());
+        // No window touches the silent stretch; matched ones keep the true lag 0.
+        assert!(w
+            .iter()
+            .all(|x| x.start + WINDOW <= 4 * RATE || x.start >= 8 * RATE));
+        assert!(w.iter().all(|x| x.lag == 0));
+        // All-silent source: nothing to report.
+        let silent = vec![0.0; 14 * RATE];
+        let none = analyse(&out, &silent);
+        assert_eq!(none.windows, 0);
+        assert!(none.dominant.is_none());
+    }
+
+    fn seg(start: usize, lag: i64, windows: usize) -> Segment {
+        Segment {
+            start_s: start as f64 / RATE as f64,
+            end_s: (start + windows * HOP) as f64 / RATE as f64,
+            lag_frames: lag,
+            mean_corr: 1.0,
+            windows,
+            span: (start, start + windows * HOP),
+        }
+    }
+
+    #[test]
+    fn jumps_are_next_minus_previous_in_ms() {
+        let s = [
+            seg(0, 441, 8),
+            seg(RATE * 3, -441, 8),
+            seg(RATE * 6, 441, 8),
+        ];
+        let j = jumps_ms(&s);
+        assert_eq!(j.len(), 2);
+        assert!(
+            (j[0] + 20.0).abs() < 1e-9 && (j[1] - 20.0).abs() < 1e-9,
+            "{j:?}"
+        );
+        assert_eq!(lag_at(&s, RATE * 3 + 10), -441);
+        assert_eq!(lag_at(&s, RATE * 5), -441);
+        assert_eq!(lag_at(&[], 5), 0);
+    }
+
+    #[test]
+    fn segments_need_four_windows_and_tolerate_two_frames() {
+        let w = |i: usize, lag: i64| WindowLag {
+            start: i * HOP,
+            lag,
+            corr: 0.9,
+        };
+        // 3 windows then a jump: dropped. Then 5 windows drifting by 1 frame: kept.
+        let ws = [
+            w(0, 10),
+            w(1, 10),
+            w(2, 11),
+            w(3, 500),
+            w(4, 501),
+            w(5, 502),
+            w(6, 502),
+            w(7, 501),
+        ];
+        let s = segments(&ws);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(s[0].windows, 5);
+        assert_eq!(s[0].lag_frames, 501);
+    }
 }

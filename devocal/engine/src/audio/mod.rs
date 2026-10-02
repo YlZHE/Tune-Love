@@ -93,7 +93,9 @@ pub struct AudioStats {
     pub input_silent_ms: AtomicU64,
     /// `LoadMonitor::ratio() * 1000` while the model runs, 0 otherwise.
     pub load_ratio_milli: AtomicU32,
-    /// Estimated pipeline latency in microseconds (milli-milliseconds).
+    /// Estimated end-to-end added latency in microseconds (milli-milliseconds): capture
+    /// packet + ring A + ring B + device padding + processor latency + 3 render periods for
+    /// the system path (see `render::SYSTEM_PATH_PERIODS`).
     pub latency_ms_milli: AtomicU32,
     /// Capture packets flagged discontinuous / timestamp error, plus ring overflows.
     pub discontinuities: AtomicU64,

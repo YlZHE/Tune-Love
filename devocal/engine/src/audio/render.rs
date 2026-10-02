@@ -890,12 +890,14 @@ impl Renderer {
             .stats
             .input_silent_ms
             .store(now.saturating_sub(since) / 1000, Ordering::Relaxed);
-        // latency = capture period + ring A + ring B + device padding + model latency.
-        let frames = sh.capture_packet_frames.load(Ordering::Relaxed) as u64
-            + sh.in_ring_frames.load(Ordering::Relaxed) as u64
-            + (self.ctx.input.slots() / 2) as u64
-            + padding as u64
-            + sh.proc_latency_frames.load(Ordering::Relaxed) as u64;
+        let frames = latency_frames(
+            u64::from(sh.capture_packet_frames.load(Ordering::Relaxed)),
+            sh.in_ring_frames.load(Ordering::Relaxed) as u64,
+            (self.ctx.input.slots() / 2) as u64,
+            padding as u64,
+            u64::from(sh.proc_latency_frames.load(Ordering::Relaxed)),
+            self.sink.as_ref().map_or(0, |s| s.period_frames() as u64),
+        );
         let micros = frames * 1_000_000 / u64::from(SAMPLE_RATE);
         self.ctx
             .stats
@@ -904,10 +906,44 @@ impl Renderer {
     }
 }
 
+/// Render periods the system adds on top of our own pipeline: the audio engine handing the
+/// player's mix to process loopback, and our output being mixed again.
+///
+/// Calibrated on one real-machine measurement (2026-10-03, Folia, 10 ms render period):
+/// 75.1 ms measured end to end against 42.9 ms estimated without it, 32.2 ms ~ 3 periods.
+/// To be re-measured by the latency sub-project.
+const SYSTEM_PATH_PERIODS: u64 = 3;
+
+/// Estimated end-to-end added latency in frames: capture packet + ring A + ring B + device
+/// padding + processor latency + [`SYSTEM_PATH_PERIODS`] render periods (`period` is 0 when
+/// there is no sink).
+fn latency_frames(
+    capture_packet: u64,
+    ring_a: u64,
+    ring_b: u64,
+    padding: u64,
+    proc_latency: u64,
+    period: u64,
+) -> u64 {
+    capture_packet + ring_a + ring_b + padding + proc_latency + SYSTEM_PATH_PERIODS * period
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rtrb::RingBuffer;
+
+    #[test]
+    fn latency_frames_adds_three_render_periods() {
+        // 441-frame (10 ms) period: 3 x 441 = 1 323 frames on top of the pipeline terms.
+        assert_eq!(
+            latency_frames(441, 128, 1_000, 200, 128, 441),
+            1_897 + 1_323
+        );
+        assert_eq!(latency_frames(1, 2, 3, 4, 5, 441), 15 + 1_323);
+        // No sink: nothing is added.
+        assert_eq!(latency_frames(441, 128, 1_000, 200, 128, 0), 1_897);
+    }
 
     #[test]
     fn trim_policy_drops_only_after_one_second_over() {

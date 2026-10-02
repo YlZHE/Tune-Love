@@ -41,3 +41,8 @@ windows = { version = "0.62.2", features = [
 [dev-dependencies]
 serde_json = "1"
 devocal-core = { path = "../core", features = ["fake"] }
+
+# The probe's lag analysis is pure and unit-tested (`cargo test --workspace` runs them).
+[[example]]
+name = "latency_probe"
+test = true

@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# ort 2.0.0-rc.13 is the latest 2.x release on 2026-10-02 (2.0 final not yet published);
+# it wraps ONNX Runtime 1.28. CPU only: `download-binaries` fetches pyke's prebuilt ONNX
+# Runtime at build time and links it statically (no onnxruntime.dll to ship). Pinned
+# exactly because release candidates may break the API.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "tls-native",
+] }

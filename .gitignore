@@ -21,6 +21,8 @@ devocal/target/
 *.wav
 *.mp3
 *.flac
+# Generated StemgenRT reference fixtures (regenerate with devocal/engine/tools/stemgen_reference.py)
+devocal/engine/tests/fixtures/*.f32
 __pycache__/
 .pytest_cache/
 test-results/

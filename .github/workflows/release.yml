@@ -80,6 +80,10 @@ jobs:
       - run: npm run fetch:cmake
       - run: npm run fetch:python
       - run: npm ci
+      # VC++ runtime DLLs, shipped app-locally (bundle.resources in tauri.release.conf.json).
+      - run: npm run fetch:vcrt
+      # devocal-engine.exe -> src-tauri/binaries/ (bundle.externalBin in tauri.release.conf.json).
+      - run: node scripts/build-devocal-engine.mjs --release
 
       - name: Build installer
         run: npx tauri build --config src-tauri/tauri.release.conf.json

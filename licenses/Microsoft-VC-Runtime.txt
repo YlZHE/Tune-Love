@@ -1,0 +1,15 @@
+Microsoft Visual C++ runtime (x64)
+
+The following files in the installation directory are Microsoft Visual C++
+redistributable files, copyright (c) Microsoft Corporation:
+
+  msvcp140.dll
+  msvcp140_1.dll
+  vcruntime140.dll
+  vcruntime140_1.dll
+
+They are unmodified copies from the Visual Studio 2022 redistributable folder
+(VC\Redist\MSVC\<version>\x64\Microsoft.VC143.CRT), distributed app-locally with
+Tune Love as permitted for "Distributable Code" by the Microsoft Visual Studio
+license terms. They are not covered by Tune Love's GPL-3.0 licence. Microsoft's
+license terms for these files: https://visualstudio.microsoft.com/license-terms/

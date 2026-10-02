@@ -13,6 +13,8 @@ src-tauri/vendor/**/*.zip
 src-tauri/vendor/**/*.tar.gz
 # Sidecar binaries produced by scripts/build-devocal-engine.mjs
 src-tauri/binaries/
+# VC++ runtime DLLs copied from Visual Studio by scripts/fetch-vcrt.ps1
+src-tauri/vcrt/
 devocal/target/
 # Model weights, audio and caches never belong in the repo
 *.onnx

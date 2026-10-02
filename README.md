@@ -65,7 +65,7 @@ WebGPU 运行时使用 `vgpu 0.3.1`，以独立分块按需加载；许可见 `l
 
 当前预览请使用 `src-tauri/target/debug/tune-love.exe`，然后在兼容的音乐软件中播放。`target/release` 中的旧正式构建未随本轮功能更新。
 
-运行要求：Windows 10/11 和 WebView2 Runtime。当前仅构建和验证 Windows x64；不代表已经验证全部播放器和操作系统。
+运行要求：Windows 10 版本 2004（build 19041）或更新的 Windows 10/11，以及 WebView2 Runtime；安装包已自带 VC++ 运行库，无需另装 Visual C++ Redistributable。去人声引擎 `devocal-engine.exe` 依赖系统 DirectML 的 `DMLCreateDevice1`，Windows 10 1903/1909 没有这个入口，因此最低版本为 2004。当前仅构建和验证 Windows x64；不代表已经验证全部播放器和操作系统。
 
 音乐信息来自 Windows GSMTC 媒体会话；Strands 从当前已确认播放器的进程音频回环接收真实 PCM。应用不读取麦克风、不注入播放器或宿主、不保存或上传录音及歌曲信息。播放器不向系统提供会话时显示等待状态；不提供封面或时间线时显示缺省状态。歌手信息按播放器提供的 Artist / Album Artist 显示，不推测作词、作曲人员。
 
@@ -100,6 +100,8 @@ PCM 为 48 kHz、双声道 f32，后台只保留最近最多 8 秒的内存缓�
 - 安装包**未签名**：SmartScreen 提示时点“更多信息 → 仍要运行”。
 - Auto-Tune 控制会向宿主进程注入 agent 并挂钩插件，**可能被杀毒软件误报**；agent 源码在 `reference/`，可自行审阅编译。
 - 升级前请先关闭本程序和已连接的宿主，否则 agent 文件被占用，无法覆盖。
+- 最低系统要求：Windows 10 版本 2004（build 19041）或更新。
+- VC++ 运行库（`msvcp140.dll`、`msvcp140_1.dll`、`vcruntime140.dll`、`vcruntime140_1.dll`）随安装包放在安装目录，无需另装 Visual C++ Redistributable。
 - StemgenRT 权重不随包发布，开发阶段用 `npm run fetch:stemgenrt -- --accept` 下载到本机。
 
 ## 从源码构建
@@ -110,6 +112,18 @@ PCM 为 48 kHz、双声道 f32，后台只保留最近最多 8 秒的内存缓�
 - `npm run fetch:python`：下载固定版本的官方嵌入式 Python 到 `src-tauri/python`，校验 SHA-256，并在 `python313._pth` 中加入 `..\reference`。只在打包安装包时需要，日常开发不用。
 
 两个脚本都可重复运行：目标已存在时只提示 `already present`，不会再次下载。`-Destination <目录>` 可改变解压位置，`-SelfTest` 在临时目录里自检。
+
+打包安装包还需要以下两步（日常开发和 `cargo test` 不需要）：
+
+- `npm run build:engine`（加 `-- --release` 构建发布版）：在 `devocal/` 中构建去人声引擎，复制到 `src-tauri/binaries/devocal-engine-x86_64-pc-windows-msvc.exe`（供 `tauri.release.conf.json` 的 `externalBin` 打包）和 `src-tauri/target/<debug|release>/devocal-engine.exe`（供本地运行时找到）。首次构建会由 `ort` 从 cdn.pyke.io 下载 ONNX Runtime 预编译库并静态链接。
+- `npm run fetch:vcrt`：从本机 Visual Studio（经 `vswhere` 找最新的 `VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT`）复制 4 个 VC++ 运行库 DLL 到 `src-tauri/vcrt/`，安装包把它们放在安装目录根部。
+
+```powershell
+npm run fetch:python
+npm run fetch:vcrt
+npm run build:engine -- --release
+npx tauri build --config src-tauri/tauri.release.conf.json
+```
 
 ## 开发
 

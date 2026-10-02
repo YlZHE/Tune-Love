@@ -1,5 +1,6 @@
 {
   "bundle": {
+    "externalBin": ["binaries/devocal-engine"],
     "resources": {
       "python/": "python/",
       "../reference/app_bridge.py": "reference/app_bridge.py",
@@ -13,7 +14,11 @@
       "../reference/THIRD_PARTY_NOTICES.md": "licenses/reference-THIRD_PARTY_NOTICES.md",
       "../reference/vendor/minhook/LICENSE.txt": "licenses/MinHook.txt",
       "../reference/vendor/pluginterfaces/LICENSE.txt": "licenses/VST3-pluginterfaces.txt",
-      "../src-tauri/python/LICENSE.txt": "licenses/Python.txt"
+      "../src-tauri/python/LICENSE.txt": "licenses/Python.txt",
+      "vcrt/msvcp140.dll": "msvcp140.dll",
+      "vcrt/msvcp140_1.dll": "msvcp140_1.dll",
+      "vcrt/vcruntime140.dll": "vcruntime140.dll",
+      "vcrt/vcruntime140_1.dll": "vcruntime140_1.dll"
     }
   }
 }

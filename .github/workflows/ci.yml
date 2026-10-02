@@ -92,6 +92,43 @@ jobs:
       - run: npm run build
       - run: cargo test --manifest-path src-tauri/Cargo.toml
 
+  devocal:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/registry
+          key: devocal-cargo-registry-${{ runner.os }}-${{ hashFiles('devocal/Cargo.lock') }}
+          restore-keys: devocal-cargo-registry-${{ runner.os }}-
+
+      # ort-sys (download-binaries) downloads prebuilt ONNX Runtime from cdn.pyke.io into
+      # %LOCALAPPDATA%\ort.pyke.io\dfbin\<target>\<hash>\ and its build script records that
+      # directory as a link search path; it never re-runs just because the directory is gone.
+      # So the download is cached in the same entry as devocal/target: a restored target
+      # always comes with the onnxruntime.lib it links against.
+      - name: Cache devocal target and ONNX Runtime download
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            devocal/target
+            ~/AppData/Local/ort.pyke.io
+          key: devocal-target-${{ runner.os }}-${{ hashFiles('devocal/Cargo.lock') }}
+          restore-keys: devocal-target-${{ runner.os }}-
+
+      # Tests marked #[ignore] need the StemgenRT model and stay skipped.
+      - run: cargo test --workspace
+        working-directory: devocal
+
   bridge:
     runs-on: windows-2022  # VS 2022: build.rs pins the "Visual Studio 17 2022" CMake generator
     timeout-minutes: 30

@@ -3,7 +3,7 @@
 1. **安装包未签名。** 运行时 Windows SmartScreen 可能提示“已保护你的电脑”，请点击“更多信息 → 仍要运行”。默认安装位置为 `%LOCALAPPDATA%\Tune Love\`，无需管理员权限。
 2. **杀毒软件可能误报。** Auto-Tune 控制需要向宿主（DAW）进程注入一个 agent，并挂钩插件的参数处理函数，这与恶意软件的常见行为相似，因此可能被杀毒软件误报。agent 的源码在仓库的 `reference/` 目录，可自行审阅与编译。
 3. **升级前请先关闭本程序和已连接的宿主。** 否则已加载的 agent 文件被占用，安装程序无法覆盖。
-4. **StemgenRT 权重不随安装包发布。** 开发阶段可用 `npm run fetch:stemgenrt -- --accept` 下载到本机。
+4. **StemgenRT 权重不随安装包发布。** 当前版本不使用去人声功能，安装包用户无需下载任何东西；`npm run fetch:stemgenrt -- --accept` 仅供从源码开发时使用。
 5. **仅供免费、非商业使用。** 本程序以 GPL-3.0 许可证发布，第三方许可文本见安装目录下的 `licenses\` 文件夹。
 
 安装包的 SHA-256 见 `SHA256SUMS.txt`。

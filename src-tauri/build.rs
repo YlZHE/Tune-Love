@@ -15,7 +15,7 @@ fn cmake_executable(manifest: &std::path::Path) -> PathBuf {
     let local = manifest.join("vendor/tools/cmake-3.30.5-windows-x86_64/bin/cmake.exe");
     if !local.is_file() {
         panic!(
-            "required pinned CMake 3.30.5 is missing at {}; restore the retained verified toolchain",
+            "required pinned CMake 3.30.5 is missing at {}; run `npm run fetch:cmake` to download it",
             local.display()
         );
     }
@@ -116,12 +116,6 @@ fn build_native_keyfinder(native_opt: Option<u32>) {
         "cargo:rerun-if-changed={}",
         manifest
             .join("vendor/tools/cmake-3.30.5-windows-x86_64/share/cmake-3.30/Modules")
-            .display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest
-            .join("vendor/tools/cmake-3.30.5-SHA-256.txt")
             .display()
     );
     println!("cargo:rerun-if-changed=build.rs");

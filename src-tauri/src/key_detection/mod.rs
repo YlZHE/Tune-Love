@@ -1,7 +1,9 @@
 mod engine;
 pub mod scale_match;
 pub mod song_cache;
-mod stability;
+/// Key-label stabilizer driven by the detection loop; public so offline tools
+/// (examples/key_benchmark.rs) can replay the same confirmation rules.
+pub mod stability;
 mod stream;
 mod types;
 

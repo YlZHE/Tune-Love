@@ -6,14 +6,14 @@ use super::{
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Identity {
+pub struct Identity {
     pub source_id: String,
     pub track_key: String,
     pub target_generation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Observation {
+pub struct Observation {
     pub identity: Option<Identity>,
     pub playing: bool,
     pub capture_generation: u64,
@@ -21,7 +21,7 @@ pub(super) struct Observation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct AnalysisToken {
+pub struct AnalysisToken {
     identity: Identity,
     capture_generation: u64,
     sample_end_sequence: u64,
@@ -30,7 +30,7 @@ pub(super) struct AnalysisToken {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct StableSnapshot {
+pub struct StableSnapshot {
     pub identity: Option<Identity>,
     pub status: &'static str,
     pub key: Option<MusicalKey>,
@@ -39,7 +39,7 @@ pub(super) struct StableSnapshot {
     pub autotune_target: Option<AutoTuneTarget>,
 }
 
-pub(super) struct Stabilizer {
+pub struct Stabilizer {
     identity: Option<Identity>,
     playing: bool,
     capture_generation: u64,
@@ -57,6 +57,12 @@ pub(super) struct Stabilizer {
     matcher: ScaleMatcher,
     /// Remembered results of earlier plays; consulted only on a song change.
     cache: Option<Arc<Mutex<SongCache>>>,
+}
+
+impl Default for Stabilizer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Stabilizer {

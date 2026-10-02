@@ -1,13 +1,9 @@
 // Offline-only evaluator. No capture APIs, no audio persistence, no plugin writes.
 use tune_love::audio::PcmWindow;
-#[cfg(test)]
-use tune_love::key_detection;
-use tune_love::key_detection::{detect, Mode, MusicalKey, RollingDetector};
+use tune_love::key_detection::{detect, stability, Mode, MusicalKey, RollingDetector};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{path::Path, process::Command, time::Instant};
-#[path = "../src/key_detection/stability.rs"]
-mod stability;
 
 const SECOND: usize = 48_000 * 2;
 const LIMIT_SECONDS: usize = 32;
@@ -133,9 +129,17 @@ fn evaluate(pcm: &[f32], expected: Option<MusicalKey>, streaming: bool) -> Resul
             return Err("offline window not ready".into());
         }
         let token = stable
-            .begin(&observed, second as u64 * 1_000)
+            .begin_if_current(&observed, &observed, second as u64 * 1_000)
             .ok_or("offline window rejected")?;
-        stable.complete(&token, &observed, candidate, false, second as u64 * 1_000);
+        // No chroma evidence: this benchmark measures the key label only.
+        stable.complete_with_evidence(
+            &token,
+            &observed,
+            candidate,
+            None,
+            false,
+            second as u64 * 1_000,
+        );
         let snapshot = stable.snapshot();
         if snapshot.key.is_some() {
             first_confirmed.get_or_insert(second);

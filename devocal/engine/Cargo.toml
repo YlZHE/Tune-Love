@@ -14,3 +14,6 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
     "download-binaries",
     "tls-native",
 ] }
+
+[dev-dependencies]
+devocal-core = { path = "../core", features = ["fake"] }

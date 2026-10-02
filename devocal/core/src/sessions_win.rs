@@ -351,19 +351,16 @@ impl SessionVolumes for WinSessions {
         Ok(out)
     }
 
-    /// Sessions with this pid-free identifier on every active render endpoint. Like
-    /// `sessions_for_tree`, fails rather than returning a partial list.
-    fn sessions_with_identifier(
-        &self,
-        session_identifier: &str,
-    ) -> Result<Vec<SessionInfo>, String> {
+    /// Sessions with one of these pid-free identifiers on every active render endpoint, from
+    /// one enumeration. Like `sessions_for_tree`, fails rather than returning a partial list.
+    fn sessions_with_identifiers(&self, identifiers: &[&str]) -> Result<Vec<SessionInfo>, String> {
         let all = enumerate()?;
         if let Some(e) = all.error {
             return Err(e);
         }
         let mut out = Vec::new();
         for s in &all.sessions {
-            if self::session_identifier(s)? == session_identifier {
+            if identifiers.contains(&self::session_identifier(s)?.as_str()) {
                 out.push(info(s, instance_id(s)?)?);
             }
         }

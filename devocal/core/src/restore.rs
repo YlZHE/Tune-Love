@@ -1,7 +1,7 @@
 //! Crash-safe restore file. Written atomically before any player session volume is
 //! lowered; whoever survives (engine, app, next app start) restores from it.
 
-use crate::sessions::{is_held, SessionVolumes};
+use crate::sessions::{is_held, SessionInfo, SessionVolumes};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, Write};
@@ -96,17 +96,65 @@ enum Relaunched {
     Failed,
 }
 
+/// Sessions matching the identifiers of a restore file's entries, looked up once per
+/// `restore` call (one enumeration on Windows, however many entries need it) and only if one
+/// does. A failed lookup fails every entry that needed it, as a per-entry lookup would have.
+struct IdentifierLookup<'a> {
+    identifiers: Vec<&'a str>,
+    found: Option<Result<Vec<SessionInfo>, String>>,
+}
+
+impl<'a> IdentifierLookup<'a> {
+    fn new(entries: &'a [RestoreEntry]) -> Self {
+        let mut identifiers: Vec<&str> = Vec::new();
+        for e in entries {
+            let id = e.session_identifier.as_str();
+            if !id.is_empty() && !identifiers.contains(&id) {
+                identifiers.push(id);
+            }
+        }
+        Self {
+            identifiers,
+            found: None,
+        }
+    }
+
+    /// The current sessions with this identifier (`Err` if the one lookup failed).
+    fn with(
+        &mut self,
+        sessions: &dyn SessionVolumes,
+        identifier: &str,
+    ) -> Result<Vec<SessionInfo>, ()> {
+        let ids = &self.identifiers;
+        match self
+            .found
+            .get_or_insert_with(|| sessions.sessions_with_identifiers(ids))
+        {
+            Ok(all) => Ok(all
+                .iter()
+                .filter(|s| s.session_identifier == identifier)
+                .cloned()
+                .collect()),
+            Err(_) => Err(()),
+        }
+    }
+}
+
 /// The entry's process has exited, or it is alive but its recorded session is gone. Windows
 /// persists per-app session volume (keyed by endpoint, executable and session GUID, not pid), so
 /// a relaunched player, or a session the live player recreated, comes back at the held volume.
 /// Find those sessions by the pid-free session identifier and restore the ones still held.
-fn restore_relaunched(e: &RestoreEntry, sessions: &dyn SessionVolumes) -> Relaunched {
+fn restore_relaunched(
+    e: &RestoreEntry,
+    sessions: &dyn SessionVolumes,
+    lookup: &mut IdentifierLookup,
+) -> Relaunched {
     if e.session_identifier.is_empty() {
         return Relaunched::Gone;
     }
-    let found = match sessions.sessions_with_identifier(&e.session_identifier) {
+    let found = match lookup.with(sessions, &e.session_identifier) {
         Ok(found) => found,
-        Err(_) => return Relaunched::Failed,
+        Err(()) => return Relaunched::Failed,
     };
     if found.is_empty() {
         return Relaunched::Awaiting;
@@ -135,10 +183,11 @@ fn restore_relaunched(e: &RestoreEntry, sessions: &dyn SessionVolumes) -> Relaun
 fn count_relaunched(
     e: &RestoreEntry,
     sessions: &dyn SessionVolumes,
+    lookup: &mut IdentifierLookup,
     out: &mut RestoreOutcome,
     retry: &mut Vec<RestoreEntry>,
 ) {
-    match restore_relaunched(e, sessions) {
+    match restore_relaunched(e, sessions, lookup) {
         Relaunched::Gone => out.gone += 1,
         Relaunched::Restored => out.restored += 1,
         Relaunched::LeftChanged => out.left_changed += 1,
@@ -189,12 +238,13 @@ pub fn restore(path: &Path, sessions: &dyn SessionVolumes) -> RestoreOutcome {
     };
 
     let mut retry: Vec<RestoreEntry> = Vec::new();
+    let mut lookup = IdentifierLookup::new(&record.entries);
     for e in &record.entries {
         match sessions.process_created(e.pid) {
             Ok(Some(created)) if created == e.created_at => {}
             Ok(_) => {
                 // Process gone, or the pid now belongs to a different process.
-                count_relaunched(e, sessions, &mut out, &mut retry);
+                count_relaunched(e, sessions, &mut lookup, &mut out, &mut retry);
                 continue;
             }
             Err(_) => {
@@ -207,7 +257,7 @@ pub fn restore(path: &Path, sessions: &dyn SessionVolumes) -> RestoreOutcome {
             Ok(Some(_)) => {}
             Ok(None) => {
                 // Process alive, recorded session gone: it may have been recreated.
-                count_relaunched(e, sessions, &mut out, &mut retry);
+                count_relaunched(e, sessions, &mut lookup, &mut out, &mut retry);
                 continue;
             }
             Err(_) => {
@@ -459,6 +509,61 @@ mod tests {
         assert_eq!((out.gone, out.restored, out.awaiting_player), (1, 0, 0));
         assert_eq!(f.set_volume_calls(), 0);
         assert!(!dir.file().exists());
+    }
+
+    #[test]
+    fn awaiting_entries_cost_one_identifier_lookup_per_restore() {
+        let dir = TempDir::new("one-lookup");
+        let f = FakeSessions::new();
+        // Five exited players' entries, on five devices the player never returns to.
+        let entries: Vec<RestoreEntry> = (0..5)
+            .map(|i| RestoreEntry {
+                session_identifier: format!("ep{i}|player.exe%b{{0}}"),
+                instance_id: format!("ep{i}|player|1%b10"),
+                ..player_entry(0.8)
+            })
+            .collect();
+        write_entries(&dir, entries);
+        let out = restore(&dir.file(), &f);
+        assert_eq!(out.awaiting_player, 5);
+        assert_eq!(f.identifier_lookups(), 1);
+        restore(&dir.file(), &f);
+        assert_eq!(f.identifier_lookups(), 2, "one per call");
+
+        // One entry's lookup failing fails every entry that needed it (all kept).
+        f.fail_sessions_with_identifier("ep3|player.exe%b{0}");
+        let out = restore(&dir.file(), &f);
+        assert_eq!((out.failed, out.awaiting_player), (5, 0));
+        assert_eq!(f.identifier_lookups(), 3);
+        assert_eq!(read(&dir.file()).unwrap().unwrap().entries.len(), 5);
+
+        // Entries whose process and session are alive need no lookup at all.
+        let dir = TempDir::new("no-lookup");
+        let f = FakeSessions::new();
+        f.set_process_created(10, Some(111));
+        f.add_session(
+            SessionInfo {
+                instance_id: "ep|s".into(),
+                session_identifier: "ep|player".into(),
+                pid: 10,
+                endpoint_id: "ep".into(),
+                active: true,
+            },
+            1.0e-4,
+            false,
+        );
+        write_entries(
+            &dir,
+            vec![RestoreEntry {
+                pid: 10,
+                created_at: 111,
+                instance_id: "ep|s".into(),
+                session_identifier: "ep|player".into(),
+                ..player_entry(0.8)
+            }],
+        );
+        assert_eq!(restore(&dir.file(), &f).restored, 1);
+        assert_eq!(f.identifier_lookups(), 0);
     }
 
     #[test]

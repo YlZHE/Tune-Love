@@ -26,8 +26,11 @@
 //! - While nothing is held (no engine, or last State `Idle` with no attach in flight) and the
 //!   restore file exists, `restore` runs every 2 s, or every 200 ms while the last restore
 //!   kept entries awaiting the player (a player relaunched at the persisted held volume is
-//!   fixed within about 200 ms instead of staying silent for up to 2 s). At most one restore
-//!   per tick.
+//!   fixed within about 200 ms instead of staying silent for up to 2 s). The fast cadence
+//!   lasts at most 60 s without progress (each restore enumerates the sessions once), then
+//!   falls back to 2 s; a different restore outcome, an entry restored or removed, or a hold
+//!   or engine exit (which may have changed the awaiting entries) starts it again. At most
+//!   one restore per tick.
 //! - Attenuation gate: drop while attaching/releasing and around an exit; `1/attenuation`
 //!   only from Metrics received while the last State is `Active` (a fresh Metrics after
 //!   entering Active, so a stale value from before the hold is never used), set again only
@@ -59,6 +62,8 @@ pub const RESTORE_RETRY_MS: u64 = 2_000;
 /// Restore retry interval while nothing is held and the restore file has entries awaiting the
 /// player (it may be relaunched at the persisted held volume any moment).
 pub const AWAITING_RESTORE_RETRY_MS: u64 = 200;
+/// The fast cadence falls back to [`RESTORE_RETRY_MS`] after this long without progress.
+pub const AWAITING_RESTORE_FAST_FOR_MS: u64 = 60_000;
 /// Wait before re-attaching the same player after the engine went idle on its own.
 pub const ATTACH_RETRY_MS: u64 = 3_000;
 /// Attaches to one player (pid + creation time) before giving up (`failed`, `attach_failed`).
@@ -287,8 +292,15 @@ pub struct Supervisor<L: EngineLink> {
     attach_gave_up: bool,
 
     last_restore_ms: Option<u64>,
-    /// The last restore kept entries awaiting the player: retry every 200 ms.
+    /// The last restore kept entries awaiting the player: retry every 200 ms...
     restore_awaiting: bool,
+    /// ...for 60 s from this time (the last progress or change).
+    fast_restore_since: Option<u64>,
+    /// The outcome of the last restore (a different one restarts the fast cadence).
+    last_restore_outcome: Option<RestoreOutcome>,
+    /// Something may have changed the awaiting entries (a hold, an engine exit): the next
+    /// restore restarts the fast cadence.
+    restore_reset: bool,
     overridden_at: Option<u64>,
     now_ms: u64,
     media_playing: bool,
@@ -330,6 +342,9 @@ impl<L: EngineLink> Supervisor<L> {
             attach_gave_up: false,
             last_restore_ms: None,
             restore_awaiting: false,
+            fast_restore_since: None,
+            last_restore_outcome: None,
+            restore_reset: false,
             overridden_at: None,
             now_ms: 0,
             media_playing: false,
@@ -534,12 +549,12 @@ impl<L: EngineLink> Supervisor<L> {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 self.apply_gate(GateKey::Drop, None);
-                self.run_restore();
+                self.run_restore(self.now_ms);
                 self.apply_gate(GateKey::Unity, Some(1.0));
             }
             None => {
                 if (self.restore_pending)() {
-                    self.run_restore();
+                    self.run_restore(self.now_ms);
                 }
             }
         }
@@ -734,7 +749,8 @@ impl<L: EngineLink> Supervisor<L> {
         self.pump(now_ms);
         self.engine = None;
         self.apply_gate(GateKey::Drop, None);
-        self.run_restore();
+        self.restore_reset = true;
+        self.run_restore(now_ms);
         self.last_restore_ms = Some(now_ms);
         self.apply_gate(GateKey::Unity, Some(1.0));
         if self.failed || !self.want_hold {
@@ -840,7 +856,17 @@ impl<L: EngineLink> Supervisor<L> {
     }
 
     fn retry_restore(&mut self, now_ms: u64) {
-        let interval = if self.restore_awaiting {
+        if self.engine.as_ref().is_some_and(|e| e.holding()) {
+            // Never while holding; and the engine may change the restore file meanwhile.
+            self.restore_reset = true;
+            return;
+        }
+        let fast = self.restore_awaiting
+            && (self.restore_reset
+                || self
+                    .fast_restore_since
+                    .is_some_and(|t| now_ms.saturating_sub(t) < AWAITING_RESTORE_FAST_FOR_MS));
+        let interval = if fast {
             AWAITING_RESTORE_RETRY_MS
         } else {
             RESTORE_RETRY_MS
@@ -851,21 +877,34 @@ impl<L: EngineLink> Supervisor<L> {
         {
             return;
         }
-        if self.engine.as_ref().is_some_and(|e| e.holding()) {
-            return;
-        }
         self.last_restore_ms = Some(now_ms);
         if (self.restore_pending)() {
-            self.run_restore();
+            self.run_restore(now_ms);
         } else {
             self.restore_awaiting = false;
+            self.fast_restore_since = None;
+            self.last_restore_outcome = None;
         }
     }
 
-    /// Runs the restore and remembers whether entries still await the player.
-    fn run_restore(&mut self) {
+    /// Runs the restore and updates the fast-retry state: entries still await the player;
+    /// progress (an entry restored or removed), a different outcome or a pending reset
+    /// restarts the 60 s fast period.
+    fn run_restore(&mut self, now_ms: u64) {
         let out = (self.restore)();
-        self.restore_awaiting = out.is_some_and(|o| o.awaiting_player > 0);
+        let awaiting = out.is_some_and(|o| o.awaiting_player > 0);
+        if awaiting {
+            let progress = out.is_some_and(|o| o.restored + o.left_changed + o.gone > 0);
+            let changed = out != self.last_restore_outcome;
+            if self.restore_reset || progress || changed || self.fast_restore_since.is_none() {
+                self.fast_restore_since = Some(now_ms);
+            }
+        } else {
+            self.fast_restore_since = None;
+        }
+        self.restore_awaiting = awaiting;
+        self.last_restore_outcome = out;
+        self.restore_reset = false;
     }
 
     // ---- helpers ----
@@ -1657,6 +1696,80 @@ mod tests {
         assert_eq!(r.restores(), 6);
         r.sup.tick(3_000, None, false);
         assert_eq!(r.restores(), 7);
+    }
+
+    /// Restore times in `[from, to)` with a tick every 100 ms and no player.
+    fn restore_ticks(r: &mut Rig, from: u64, to: u64) -> Vec<u64> {
+        let mut at = Vec::new();
+        for t in (from..to).step_by(100) {
+            let before = r.restores();
+            r.sup.tick(t, None, false);
+            if r.restores() > before {
+                at.push(t);
+            }
+        }
+        at
+    }
+
+    #[test]
+    fn fast_restore_backs_off_after_60_s_without_progress_and_restarts_on_a_change() {
+        let mut r = rig_with(true);
+        *r.outcome.lock().unwrap() = awaiting(2);
+        let fast = restore_ticks(&mut r, 0, 60_000);
+        assert_eq!(fast.len(), 300, "every 200 ms for 60 s");
+        assert_eq!(fast.last(), Some(&59_800));
+        // No progress for 60 s: every 2 s.
+        assert_eq!(
+            restore_ticks(&mut r, 60_000, 70_000),
+            vec![61_800, 63_800, 65_800, 67_800, 69_800]
+        );
+        // One entry was restored (progress, different outcome): fast again for 60 s.
+        *r.outcome.lock().unwrap() = Some(RestoreOutcome {
+            restored: 1,
+            awaiting_player: 1,
+            ..Default::default()
+        });
+        assert_eq!(restore_ticks(&mut r, 70_000, 72_000), vec![71_800]);
+        *r.outcome.lock().unwrap() = awaiting(1);
+        assert_eq!(
+            restore_ticks(&mut r, 72_000, 73_000),
+            vec![72_000, 72_200, 72_400, 72_600, 72_800]
+        );
+        // 60 s after the last change (72.0 s) it backs off again.
+        let rest = restore_ticks(&mut r, 73_000, 140_000);
+        assert!(
+            rest.ends_with(&[131_800, 133_800, 135_800, 137_800, 139_800]),
+            "{:?}",
+            &rest[rest.len() - 6..]
+        );
+        // Same outcome, nothing new: stays at 2 s.
+        assert_eq!(restore_ticks(&mut r, 140_000, 144_000).len(), 2);
+    }
+
+    #[test]
+    fn a_hold_restarts_the_fast_restore_cadence() {
+        let mut r = rig_with(true);
+        *r.outcome.lock().unwrap() = awaiting(1);
+        restore_ticks(&mut r, 0, 62_000);
+        assert!(
+            restore_ticks(&mut r, 62_000, 63_000).is_empty(),
+            "backed off"
+        );
+        // A hold and its release may have changed the awaiting entries.
+        let p = player(7);
+        r.hold(63_000, &p);
+        r.sup.release();
+        r.last().push(state(Phase::Releasing, None));
+        r.last().push(state(Phase::Idle, None));
+        let before = r.restores();
+        for t in (63_200..64_000u64).step_by(100) {
+            r.sup.tick(t, Some(p.clone()), true);
+        }
+        assert_eq!(
+            r.restores() - before,
+            4,
+            "fast again: 63.2, 63.4, 63.6, 63.8 s"
+        );
     }
 
     #[test]

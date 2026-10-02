@@ -33,11 +33,16 @@ pub fn endpoint_of_instance(instance_id: &str) -> Option<&str> {
 
 pub trait SessionVolumes {
     fn sessions_for_tree(&self, root_pid: u32) -> Result<Vec<SessionInfo>, String>;
+    /// All current sessions whose (pid-free) session identifier is one of `identifiers`, from
+    /// a single enumeration. Fails rather than returning a partial list.
+    fn sessions_with_identifiers(&self, identifiers: &[&str]) -> Result<Vec<SessionInfo>, String>;
     /// All current sessions whose (pid-free) session identifier equals `session_identifier`.
     fn sessions_with_identifier(
         &self,
         session_identifier: &str,
-    ) -> Result<Vec<SessionInfo>, String>;
+    ) -> Result<Vec<SessionInfo>, String> {
+        self.sessions_with_identifiers(&[session_identifier])
+    }
     fn session(&self, instance_id: &str) -> Result<Option<SessionInfo>, String>;
     fn volume(&self, instance_id: &str) -> Result<f32, String>;
     fn set_volume(&self, instance_id: &str, volume: f32) -> Result<(), String>;
@@ -83,6 +88,8 @@ mod fake {
         fail_set_volume: HashSet<String>,
         fail_process_created: HashSet<u32>,
         fail_sessions_with_identifier: HashSet<String>,
+        /// Number of `sessions_with_identifier(s)` calls (each one enumeration on Windows).
+        identifier_lookups: usize,
         /// Endpoints marked unplugged/disabled: their sessions are not enumerated.
         inactive_endpoints: HashSet<String>,
         /// `default_render_endpoints`; empty (unknown) unless a test sets it.
@@ -223,7 +230,13 @@ mod fake {
             self.state.borrow_mut().fail_process_created.insert(pid);
         }
 
-        /// Makes `sessions_with_identifier(id)` return an error until `clear_failures`.
+        /// Number of identifier lookups so far (each is one full enumeration on Windows).
+        pub fn identifier_lookups(&self) -> usize {
+            self.state.borrow().identifier_lookups
+        }
+
+        /// Makes an identifier lookup that includes `id` return an error until
+        /// `clear_failures`.
         pub fn fail_sessions_with_identifier(&self, session_identifier: &str) {
             self.state
                 .borrow_mut()
@@ -290,24 +303,23 @@ mod fake {
                 .collect())
         }
 
-        fn sessions_with_identifier(
+        fn sessions_with_identifiers(
             &self,
-            session_identifier: &str,
+            identifiers: &[&str],
         ) -> Result<Vec<SessionInfo>, String> {
+            self.state.borrow_mut().identifier_lookups += 1;
             let st = self.state.borrow();
-            if st
-                .fail_sessions_with_identifier
-                .contains(session_identifier)
+            if let Some(id) = identifiers
+                .iter()
+                .find(|id| st.fail_sessions_with_identifier.contains(**id))
             {
-                return Err(format!(
-                    "injected sessions_with_identifier failure: {session_identifier}"
-                ));
+                return Err(format!("injected sessions_with_identifier failure: {id}"));
             }
             Ok(st
                 .sessions
                 .iter()
                 .filter(|s| !st.inactive_endpoints.contains(&s.info.endpoint_id))
-                .filter(|s| s.info.session_identifier == session_identifier)
+                .filter(|s| identifiers.contains(&s.info.session_identifier.as_str()))
                 .map(|s| s.info.clone())
                 .collect())
         }

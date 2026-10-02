@@ -14,6 +14,7 @@ async function prepare(page: Page, view = "/", initial: Record<string, unknown> 
     state.statusPolls = 0;
     state.commandDelayMs = 0;
     state.commandFailure = null;
+    state.commandErrorMessage = null;
     state.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" } },
       invoke: async (command: string, args: any) => {
@@ -21,6 +22,7 @@ async function prepare(page: Page, view = "/", initial: Record<string, unknown> 
         if (command === "devocal_command") {
           state.devocalRequests.push(args.request);
           await new Promise(resolve => setTimeout(resolve, state.commandDelayMs));
+          if (state.commandErrorMessage) throw new Error(state.commandErrorMessage);
           if (state.commandFailure) throw state.commandFailure;
           const action = args.request.action;
           if (action === "enable") state.devocal = { ...state.devocal, phase: "devocal", held: true, latencyMs: 45.4 };
@@ -90,6 +92,53 @@ test("a rejected enable restores the button and tells the user", async ({ page }
   await expect(page.getByRole("status")).toContainText("去人声未能切换");
   await expect(page.getByRole("button", { name: "开启去人声", exact: true })).toHaveAttribute("aria-pressed", "false");
   expect(await requests(page)).toEqual([{ action: "enable" }]);
+});
+
+test("a rejected enable shows the Error message when there is one", async ({ page }) => {
+  await prepare(page);
+  await page.evaluate(() => { (window as any).commandErrorMessage = "引擎还没准备好"; });
+  await reveal(page);
+  await page.getByRole("button", { name: "开启去人声", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("引擎还没准备好");
+});
+
+test("a warning stays visible without hover but a neutral label waits for hover", async ({ page }) => {
+  await prepare(page, "/", { phase: "devocal", held: true, latencyMs: 45.4, sessionOverridden: true });
+  const warning = page.getByText("播放器音量被调整，请调本应用音量", { exact: true });
+  await expect(warning).toBeVisible();
+  await expect(warning).toHaveAttribute("aria-live", "polite");
+  await expect(warning).toHaveCSS("opacity", "1");
+  await expect(page.locator(".footer-controls")).toHaveCSS("opacity", "0");
+  // Inside the 448 px card, clear of the title row and of the controls row.
+  const text = (await warning.boundingBox())!;
+  const card = (await page.locator(".music-window").boundingBox())!;
+  const controls = (await page.locator(".footer-controls").boundingBox())!;
+  const titlebar = (await page.locator(".titlebar").boundingBox())!;
+  expect(text.x).toBeGreaterThanOrEqual(card.x);
+  expect(text.x + text.width).toBeLessThanOrEqual(card.x + card.width);
+  expect(text.y).toBeGreaterThanOrEqual(titlebar.y + titlebar.height);
+  expect(text.y + text.height).toBeLessThanOrEqual(controls.y + 1);
+  await page.screenshot({ path: "artifacts/devocal-warning-no-hover.png" });
+  // Switching to a neutral state removes the warning; its text is hidden until hover.
+  await page.evaluate(() => { (window as any).devocal = { ...(window as any).devocal, sessionOverridden: false }; });
+  const neutral = page.getByText("去人声中 · 延迟 45 ms", { exact: true });
+  await expect(page.locator(".devocal-warning")).toHaveText("");
+  // The neutral label lives in the controls row, which is transparent until hover.
+  await expect(neutral).toBeAttached();
+  await expect(page.locator(".footer-controls")).toHaveCSS("opacity", "0");
+  await reveal(page);
+  await expect(page.locator(".footer-controls")).toHaveCSS("opacity", "1");
+  await expect(neutral).toBeVisible();
+});
+
+test("only one polite live region carries text at a time", async ({ page }) => {
+  await prepare(page, "/", { phase: "unavailable", error: "model_not_found" });
+  await expect(page.getByText("未找到去人声模型", { exact: true })).toHaveCount(1);
+  await expect.poll(() => page.locator(".devocal-warning, .devocal-status").evaluateAll(els => els.filter(el => el.textContent).length)).toBe(1);
+  await page.evaluate(() => { (window as any).devocal = { ...(window as any).devocal, phase: "passthrough", held: true, error: null }; });
+  await expect(page.getByText("原声直通", { exact: true })).toHaveCount(1);
+  await expect.poll(() => page.locator(".devocal-warning, .devocal-status").evaluateAll(els => els.filter(el => el.textContent).length)).toBe(1);
+  await expect(page.getByText("未找到去人声模型")).toHaveCount(0);
 });
 
 test("the status is polled while the window is open", async ({ page }) => {

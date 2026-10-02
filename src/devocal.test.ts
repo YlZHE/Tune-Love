@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { devocalLabel, isDevocalActive, parseDevocalStatus, OFF_STATUS, type DevocalStatus } from "./devocal";
+import { devocalLabel, devocalLabelKind, isDevocalActive, parseDevocalStatus, OFF_STATUS, type DevocalStatus } from "./devocal";
 
 const status = (patch: Partial<DevocalStatus>): DevocalStatus => ({ ...OFF_STATUS, ...patch });
 
@@ -50,6 +50,35 @@ describe("devocalLabel", () => {
   it("shows nothing for idle phases", () => {
     expect(devocalLabel(status({ phase: "off" }))).toBeNull();
     expect(devocalLabel(status({ phase: "releasing" }))).toBeNull();
+  });
+});
+
+describe("devocalLabelKind", () => {
+  const rows: [string, Partial<DevocalStatus>, "warning" | "neutral"][] = [
+    ["sessionOverridden", { phase: "devocal", sessionOverridden: true }, "warning"],
+    ["inputSilent", { phase: "passthrough", held: true, inputSilent: true }, "warning"],
+    ["devocal with latency", { phase: "devocal", held: true, latencyMs: 45.4 }, "neutral"],
+    ["devocal without latency", { phase: "devocal", held: true }, "neutral"],
+    ["fallback overload", { phase: "fallback", held: true, fallbackReason: "overload" }, "warning"],
+    ["fallback model_error", { phase: "fallback", held: true, fallbackReason: "model_error" }, "warning"],
+    ["attaching", { phase: "attaching" }, "neutral"],
+    ["restarting", { phase: "restarting" }, "neutral"],
+    ["failed", { phase: "failed" }, "warning"],
+    ["unavailable, model missing", { phase: "unavailable", error: "model_not_found" }, "warning"],
+    ["unavailable, engine missing", { phase: "unavailable", error: "engine_unavailable: x" }, "warning"],
+    ["unavailable, no error", { phase: "unavailable" }, "warning"],
+    ["passthrough while held", { phase: "passthrough", held: true }, "neutral"],
+  ];
+  for (const [name, patch, kind] of rows)
+    it(`${name} is ${kind}`, () => {
+      expect(devocalLabelKind(status(patch))).toBe(kind);
+      expect(devocalLabel(status(patch))).not.toBeNull();
+    });
+  it("has no kind when there is no label", () => {
+    expect(devocalLabelKind(status({ phase: "off" }))).toBeNull();
+    expect(devocalLabelKind(status({ phase: "passthrough", held: false }))).toBeNull();
+    expect(devocalLabelKind(status({ phase: "fallback", fallbackReason: null }))).toBeNull();
+    expect(devocalLabelKind(status({ phase: "releasing" }))).toBeNull();
   });
 });
 

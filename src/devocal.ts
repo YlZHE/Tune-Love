@@ -43,16 +43,27 @@ export function parseDevocalStatus(value: unknown): DevocalStatus | null {
   };
 }
 
+// "warning" labels need the user's attention while singing along and must stay
+// visible; "neutral" ones are routine state that may sit in the hover controls.
+export type DevocalLabelKind = "warning" | "neutral";
+export interface DevocalNotice { text: string; kind: DevocalLabelKind }
+
+const warning = (text: string): DevocalNotice => ({ text, kind: "warning" });
+const neutral = (text: string): DevocalNotice => ({ text, kind: "neutral" });
+
 // First matching row wins. null means "show nothing".
-export function devocalLabel(s: DevocalStatus): string | null {
-  if (s.sessionOverridden) return "播放器音量被调整，请调本应用音量";
-  if (s.inputSilent) return "未录到播放器声音（可能是独占模式）";
-  if (s.phase === "devocal") return s.latencyMs === null ? "去人声中" : `去人声中 · 延迟 ${Math.round(s.latencyMs)} ms`;
-  if (s.phase === "fallback" && s.fallbackReason === "overload") return "性能不足，已退回原声";
-  if (s.phase === "fallback" && s.fallbackReason === "model_error") return "去人声模型出错，已退回原声";
-  if (s.phase === "attaching" || s.phase === "restarting") return "正在接管播放器…";
-  if (s.phase === "failed") return "去人声引擎多次异常，已保持原声";
-  if (s.phase === "unavailable") return s.error?.startsWith("engine_unavailable") ? "去人声引擎无法启动" : "未找到去人声模型";
-  if (s.phase === "passthrough" && s.held) return "原声直通";
+export function devocalNotice(s: DevocalStatus): DevocalNotice | null {
+  if (s.sessionOverridden) return warning("播放器音量被调整，请调本应用音量");
+  if (s.inputSilent) return warning("未录到播放器声音（可能是独占模式）");
+  if (s.phase === "devocal") return neutral(s.latencyMs === null ? "去人声中" : `去人声中 · 延迟 ${Math.round(s.latencyMs)} ms`);
+  if (s.phase === "fallback" && s.fallbackReason === "overload") return warning("性能不足，已退回原声");
+  if (s.phase === "fallback" && s.fallbackReason === "model_error") return warning("去人声模型出错，已退回原声");
+  if (s.phase === "attaching" || s.phase === "restarting") return neutral("正在接管播放器…");
+  if (s.phase === "failed") return warning("去人声引擎多次异常，已保持原声");
+  if (s.phase === "unavailable") return warning(s.error?.startsWith("engine_unavailable") ? "去人声引擎无法启动" : "未找到去人声模型");
+  if (s.phase === "passthrough" && s.held) return neutral("原声直通");
   return null;
 }
+
+export const devocalLabel = (s: DevocalStatus): string | null => devocalNotice(s)?.text ?? null;
+export const devocalLabelKind = (s: DevocalStatus): DevocalLabelKind | null => devocalNotice(s)?.kind ?? null;

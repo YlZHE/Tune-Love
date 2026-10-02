@@ -8,7 +8,7 @@ import type { TransportControls } from "../nowPlaying";
 import type { TransportAction } from "../useMediaTransport";
 import { autoTune, useAutoTune } from "../useAutoTune";
 import { controlLabel, type ControlRole } from "../autotuneControl";
-import { devocalLabel } from "../devocal";
+import { devocalNotice } from "../devocal";
 import { useDevocal } from "../useDevocal";
 import "./AutoTuneSettings.css";
 import "./PlayerControls.css";
@@ -37,7 +37,10 @@ export function PlayerControls({ children, hovered, playing, hasTrack, transport
     void autoTune.setValue(role, value).catch(error => onNotice(error instanceof Error ? error.message : "参数未能发送"));
   };
   const { status: devocalStatus, enabled: vocalRemovalEnabled, toggle: toggleDevocal } = useDevocal();
-  const devocalText = devocalLabel(devocalStatus);
+  const devocalLine = devocalNotice(devocalStatus);
+  // Exactly one of the two live regions holds text, so nothing is announced twice.
+  const warningText = devocalLine?.kind === "warning" ? devocalLine.text : "";
+  const neutralText = devocalLine?.kind === "neutral" ? devocalLine.text : "";
   const visible = hovered || focused || panel !== null || touch;
   const previousDisabled = !hasTrack || !transport?.canPrevious || transportPending;
   const nextDisabled = !hasTrack || !transport?.canNext || transportPending;
@@ -73,6 +76,7 @@ export function PlayerControls({ children, hovered, playing, hasTrack, transport
 
   const setOpen = (name: Exclude<Panel, null>, open: boolean) => setPanel(open ? name : null);
   return <footer className="player-footer" data-controls-visible={visible} data-panel-open={panel !== null}>
+    <span className="devocal-warning" aria-live="polite">{warningText}</span>
     <div className="footer-information" aria-hidden={visible} inert={visible}>{children(visible)}</div>
     <div ref={controls} className="footer-controls" role="group" aria-label="音乐和电音控制" aria-describedby={previewId}
       onFocusCapture={() => setFocused(keyboard.current)}
@@ -112,9 +116,9 @@ export function PlayerControls({ children, hovered, playing, hasTrack, transport
         </Popover.Root>
         <AppTooltip content={vocalRemovalEnabled ? "关闭去人声，恢复原唱" : "开启去人声"} side="top" disabled={panel !== null}>
           <IconButton size="1" variant="ghost" radius="full" className={`footer-control-button vocal-removal-control ${vocalRemovalEnabled ? "is-enabled" : ""}`}
-            aria-label={vocalRemovalEnabled ? "关闭去人声" : "开启去人声"} aria-pressed={vocalRemovalEnabled} onClick={() => { toggleDevocal().catch(() => onNotice("去人声未能切换，请重试")); }}><UserSound size={17} weight={vocalRemovalEnabled ? "fill" : "regular"} /></IconButton>
+            aria-label={vocalRemovalEnabled ? "关闭去人声" : "开启去人声"} aria-pressed={vocalRemovalEnabled} onClick={() => { toggleDevocal().catch(error => onNotice(error instanceof Error ? error.message : "去人声未能切换，请重试")); }}><UserSound size={17} weight={vocalRemovalEnabled ? "fill" : "regular"} /></IconButton>
         </AppTooltip>
-        <span className="devocal-status" aria-live="polite">{devocalText}</span>
+        <span className="devocal-status" aria-live="polite">{neutralText}</span>
       </div>
       <div className="transport-controls" aria-busy={transportPending}>
         <AppTooltip content="上一首" side="top" disabled={previousDisabled || panel !== null}>

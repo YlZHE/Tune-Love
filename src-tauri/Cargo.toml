@@ -21,6 +21,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 base64 = "0.22"
 rustfft = "6.4"
 devocal-core = { path = "../devocal/core" }
+# One app per user: a second instance would restore (undo) the first one's player hold.
+tauri-plugin-single-instance = "2.5"
 
 [target.'cfg(windows)'.dependencies]
 png = "0.17.16"

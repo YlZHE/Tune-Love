@@ -15,6 +15,17 @@ pub fn run() {
     let key_detection = key_detection::KeyDetectionState::new(audio.clone());
     let devocal = devocal::DevocalState::new(gate);
     tauri::Builder::default()
+        // First plugin, as the plugin requires. A second launch exits here, before setup:
+        // otherwise its startup and periodic restore would undo this instance's player hold
+        // and delete its restore record (both share `devocal-restore.json`).
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            use tauri::Manager;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(media)
         .manage(media::transport::TransportState::default())
         .manage(audio)

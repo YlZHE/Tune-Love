@@ -11,6 +11,7 @@ mod engine;
 mod holder;
 #[allow(dead_code)]
 mod load;
+mod notify;
 mod pipe;
 #[allow(dead_code)]
 mod processor;

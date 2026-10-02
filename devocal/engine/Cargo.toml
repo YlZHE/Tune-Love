@@ -38,6 +38,10 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Variant",
 ] }
 
+# `#[implement]` (the session/endpoint notification callbacks) expands to paths in
+# `windows_core`, so it must be a direct dependency; same version as `windows` uses.
+windows-core = "0.62.2"
+
 [dev-dependencies]
 serde_json = "1"
 devocal-core = { path = "../core", features = ["fake"] }

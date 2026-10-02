@@ -26,8 +26,9 @@
 //!   `tick` on which it happened; the release continues (`begin_release` again is a no-op),
 //!   ends `Idle`, and that session's entry stays in the restore file for a later restore.
 //! - Failures in `follow` are counted in [`FollowReport::failed`] with the first message in
-//!   [`FollowReport::error`]; until a pass succeeds the capture gain falls back to 1.0 (no
-//!   compensation), because a session that could not be lowered plays at its full level.
+//!   [`FollowReport::error`]; until a pass succeeds the capture gain falls back to at most 1.0
+//!   (no compensation), because a session that could not be lowered plays at its full level:
+//!   `original / v` when it plays at a volume `v` above the reference.
 //! - The outcome of every `restore::restore` the holder runs is surfaced: at attach in
 //!   [`AttachReport`] (or the `Err` message), after the player exited in
 //!   [`FollowReport::restore_failed`] / [`FollowReport::restore_corrupt`] (not counted in
@@ -36,6 +37,18 @@
 //! Gain reference (ruling 16): `original` is the smallest original volume among the lowered
 //! sessions, so the compensating gain `original / HELD_VOLUME` never makes any session
 //! louder than before the takeover; quieter-than-max sessions are not boosted.
+//!
+//! Never amplify an unlowered session: a session `follow` finds not at the held volume played
+//! at its observed volume `v` until it is lowered, so `v` is recorded in the gain history
+//! before the lowering and the capture gain stays at most `original / v` for the window. A
+//! session the player creates on a new endpoint starts at whatever volume Windows remembers
+//! for the app there (1.0 on a new device), not at the user's original.
+//!
+//! Default render device change ([`Holder::default_device_changed`]): the player recreates its
+//! stream on the new endpoint, unlowered at first. The capture gain is 0 (silent, never
+//! amplified) from the change until a `follow` pass completes without errors (so every tree
+//! session is held or the user's own near-zero) and with a tree session on the new default
+//! endpoint, or for at most [`DEVICE_MUTE_US`]; then the normal rules apply again.
 
 use crate::dsp::GainHistory;
 use devocal_core::restore::{self, RestoreEntry, RestoreRecord, RESTORE_VERSION};
@@ -51,6 +64,8 @@ pub const RAMP_STEPS: u32 = 4;
 pub const RAMP_STEP_US: u64 = 10_000;
 /// Window of the conservative capture gain (see `GainHistory`).
 pub const GAIN_WINDOW_US: u64 = 100_000;
+/// Longest the capture stays silent after a default render device change.
+pub const DEVICE_MUTE_US: u64 = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HolderPhase {
@@ -163,6 +178,15 @@ enum Candidate {
     Adopt { session: SessionInfo, original: f32 },
 }
 
+/// Capture silenced after a default render device change (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeviceMute {
+    /// The capture gain is 0 before this time at the latest.
+    until_us: u64,
+    /// The new default render endpoint (`None`: none, or its id was unreadable).
+    endpoint: Option<String>,
+}
+
 pub struct Holder<S: SessionVolumes> {
     sessions: S,
     restore_path: PathBuf,
@@ -194,6 +218,8 @@ pub struct Holder<S: SessionVolumes> {
     attach_unread: bool,
     /// Session identifiers of kept restore entries replaced by our own entries at attach.
     absorbed: HashSet<String>,
+    /// Capture silenced after a default render device change.
+    device_mute: Option<DeviceMute>,
 }
 
 /// True for a volume the holder lowers: finite, above `HELD_VOLUME` and not already held.
@@ -283,6 +309,7 @@ impl<S: SessionVolumes> Holder<S> {
             release_error: None,
             attach_unread: false,
             absorbed: HashSet::new(),
+            device_mute: None,
         }
     }
 
@@ -409,6 +436,7 @@ impl<S: SessionVolumes> Holder<S> {
         self.attach_failure = None;
         self.release_error = None;
         self.attach_unread = unread;
+        self.device_mute = None;
         Ok(report)
     }
 
@@ -469,12 +497,15 @@ impl<S: SessionVolumes> Holder<S> {
             Ok(t) => t,
             Err(e) => {
                 r.fail(format!("enumerating the player's sessions failed: {e}"));
-                self.settle_gain(now_us, true, false);
+                self.settle_gain(now_us, Some(self.original), false);
                 return r;
             }
         };
 
         let mut degraded = false;
+        // The loudest effective volume a session left unlowered by this pass plays at (an
+        // unreadable one is assumed at `original`).
+        let mut unlowered = self.original;
         let mut spiked = false;
         let mut candidates = Vec::new();
         for s in &tree {
@@ -500,13 +531,15 @@ impl<S: SessionVolumes> Holder<S> {
                     // relative to its own original for the next window.
                     let o = &self.owned[i];
                     let id = o.entry.instance_id.clone();
-                    self.record_gain(now_us, self.original * v / o.entry.original_volume);
+                    let level = self.original * v / o.entry.original_volume;
+                    self.record_gain(now_us, level);
                     spiked = true;
                     match self.sessions.set_volume(&id, HELD_VOLUME) {
                         Ok(()) => self.owned[i].last_set = Some(HELD_VOLUME),
                         Err(e) => {
                             r.fail(format!("lowering session {id} again failed: {e}"));
                             degraded = true;
+                            unlowered = unlowered.max(level);
                         }
                     }
                 }
@@ -539,16 +572,24 @@ impl<S: SessionVolumes> Holder<S> {
                 Err(e) => {
                     r.fail(format!("writing the restore file failed: {e}"));
                     degraded = true;
+                    for c in &candidates {
+                        if let Candidate::Lower { volume, .. } = c {
+                            unlowered = unlowered.max(*volume);
+                        }
+                    }
                 }
                 Ok(targets) => {
                     let mut lowered_min: Option<f32> = None;
                     for (i, lower) in targets {
-                        if lower.is_none() {
+                        let Some(v) = lower else {
                             self.owned[i].last_set = Some(HELD_VOLUME); // adopted, already held
                             continue;
-                        }
-                        // It played at its original level until now: gain 1 for the window.
-                        self.record_gain(now_us, self.original);
+                        };
+                        // It played at `v` until now (a new session starts at whatever volume
+                        // Windows remembers for the app on its endpoint, 1.0 on a new device):
+                        // no more gain than original / v for the next window. Recorded before
+                        // the lowering, like the re-lower path above.
+                        self.record_gain(now_us, v);
                         spiked = true;
                         let id = self.owned[i].entry.instance_id.clone();
                         match self.sessions.set_volume(&id, HELD_VOLUME) {
@@ -561,6 +602,7 @@ impl<S: SessionVolumes> Holder<S> {
                             Err(e) => {
                                 r.fail(format!("lowering session {id} failed: {e}"));
                                 degraded = true;
+                                unlowered = unlowered.max(v);
                             }
                         }
                     }
@@ -579,14 +621,42 @@ impl<S: SessionVolumes> Holder<S> {
                 }
             }
         }
-        self.settle_gain(now_us, degraded, spiked);
+        self.settle_gain(now_us, degraded.then_some(unlowered), spiked);
+        if let Some(m) = &self.device_mute {
+            let on_new_endpoint = m
+                .endpoint
+                .as_ref()
+                .is_none_or(|ep| tree.iter().any(|s| &s.endpoint_id == ep));
+            if now_us >= m.until_us || (r.failed == 0 && !degraded && on_new_endpoint) {
+                self.device_mute = None;
+            }
+        }
         r
+    }
+
+    /// The default render device changed (to `endpoint`, `None` if there is none or its id is
+    /// unknown): silence the capture until the player is held on it (see the module docs).
+    /// Only while attaching or held; a later change restarts the timeout.
+    pub fn default_device_changed(&mut self, now_us: u64, endpoint: Option<String>) {
+        if matches!(self.stage, Stage::Attaching | Stage::Held) {
+            self.device_mute = Some(DeviceMute {
+                until_us: now_us.saturating_add(DEVICE_MUTE_US),
+                endpoint,
+            });
+        }
     }
 
     /// Gain for the captured audio: `original / max(effective volume in the last 100 ms)`,
     /// with `original` the quietest lowered session's original, so no session is louder than
-    /// it was before the takeover.
+    /// it was before the takeover. 0 while silenced after a default device change.
     pub fn capture_gain(&self, now_us: u64) -> f32 {
+        if self
+            .device_mute
+            .as_ref()
+            .is_some_and(|m| now_us < m.until_us)
+        {
+            return 0.0;
+        }
         self.gains.conservative_gain(self.original, now_us)
     }
 
@@ -758,6 +828,7 @@ impl<S: SessionVolumes> Holder<S> {
         self.attach_failure = None;
         self.gains = GainHistory::new(GAIN_WINDOW_US);
         self.effective = self.original;
+        self.device_mute = None;
         self.set_attenuation(1.0);
     }
 
@@ -847,13 +918,15 @@ impl<S: SessionVolumes> Holder<S> {
     }
 
     /// After a follow pass: the steady effective volume is `HELD_VOLUME` when every lowered
-    /// session is held, otherwise `original` (gain 1). Recorded after any spike so the spike
-    /// only covers its window.
-    fn settle_gain(&mut self, now_us: u64, degraded: bool, spiked: bool) {
-        let target = if degraded || !self.lowered_any {
-            self.original
-        } else {
-            HELD_VOLUME
+    /// session is held; with `degraded` (some session could not be read or lowered) it is that
+    /// level, at least `original` (gain 1, no compensation), so a session still playing above
+    /// the reference is not amplified either; with nothing lowered yet it is `original`.
+    /// Recorded after any spike so the spike only covers its window.
+    fn settle_gain(&mut self, now_us: u64, degraded: Option<f32>, spiked: bool) {
+        let target = match degraded {
+            Some(level) => level.max(self.original),
+            None if !self.lowered_any => self.original,
+            None => HELD_VOLUME,
         };
         if spiked || target != self.effective {
             self.record_gain(now_us, target);
@@ -1413,8 +1486,9 @@ mod tests {
         let r = h.follow(t);
         assert_eq!((r.newly_lowered, r.failed), (0, 1));
         assert!(r.error.as_deref().is_some_and(|e| e.contains("late")));
-        // An unlowered session plays at full level: no compensation while it does.
-        assert!(h.capture_gain(t + 200 * MS) <= 1.0 + 1e-6);
+        // An unlowered session plays at full level: no compensation while it does, and no
+        // more than original / 0.8 since it plays above the reference.
+        assert!(h.capture_gain(t + 200 * MS) <= 0.5 / 0.8 + 1e-6);
 
         h.sessions().clear_failures();
         let r = h.follow(t + 500 * MS);
@@ -1756,6 +1830,130 @@ mod tests {
         assert_eq!(h.attenuation_epoch(), e0 + 1);
         assert!(h.capture_gain(t + 100 * MS) <= 1.0 + 1e-6);
         assert!((h.capture_gain(t + 101 * MS) - 2500.0).abs() < 0.1);
+    }
+
+    /// Session `id` of the player on endpoint `ep` (its own session identifier there).
+    fn info_on(id: &str, ep: &str) -> SessionInfo {
+        SessionInfo {
+            endpoint_id: ep.into(),
+            session_identifier: format!("{ep}|ident:player"),
+            ..info(id, PID)
+        }
+    }
+
+    #[test]
+    fn a_new_session_at_full_volume_is_never_amplified() {
+        let dir = TempDir::new("new-loud");
+        let mut h = holder(&dir, &[("a", 0.3)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let t = T0 + 500 * MS;
+        assert!((h.capture_gain(t) - 3000.0).abs() < 0.05);
+        // The player recreated its stream on a new device: Windows starts it at 1.0.
+        h.sessions()
+            .add_session(info_on("ep2|player", "ep2"), 1.0, false);
+        let r = h.follow(t);
+        assert_eq!(r.newly_lowered, 1);
+        assert_eq!(vol(&h, "ep2|player"), HELD_VOLUME);
+        assert_eq!(entries(&dir)[1].original_volume, 1.0);
+        // It played at 1.0 until now: no more than original / 1.0 for the whole window.
+        for ms in 0..=100 {
+            let g = h.capture_gain(t + ms * MS);
+            assert!(g <= 0.3 / 1.0 + 1e-6, "+{ms} ms: gain {g}");
+        }
+        assert!((h.capture_gain(t + 101 * MS) - 3000.0).abs() < 0.05);
+        assert!(
+            (h.attenuation() - 1e-4 / 0.3).abs() < 1e-9,
+            "reference unchanged"
+        );
+    }
+
+    #[test]
+    fn default_device_change_mutes_until_the_player_is_held_on_the_new_endpoint() {
+        let dir = TempDir::new("device-mute");
+        let mut h = holder(&dir, &[("a", 0.3)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let t = T0 + 500 * MS;
+        h.default_device_changed(t, Some("ep2".into()));
+        assert_eq!(h.capture_gain(t), 0.0);
+        // A clean pass before the player moved does not end the mute.
+        assert_eq!(h.follow(t + MS), FollowReport::default());
+        assert_eq!(h.capture_gain(t + MS), 0.0);
+        // The player's new session appears on the new endpoint at 1.0 and is lowered.
+        h.sessions()
+            .add_session(info_on("ep2|player", "ep2"), 1.0, false);
+        let tf = t + 40 * MS;
+        assert_eq!(h.capture_gain(tf), 0.0);
+        assert_eq!(h.follow(tf).newly_lowered, 1);
+        // Unmuted with the conservative gain: original / 1.0 for the window, then 3000.
+        let g = h.capture_gain(tf);
+        assert!(g > 0.0 && g <= 0.3 + 1e-6, "{g}");
+        assert!(h.capture_gain(tf + 100 * MS) <= 0.3 + 1e-6);
+        assert!((h.capture_gain(tf + 101 * MS) - 3000.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn default_device_mute_ends_after_one_second_without_a_follow() {
+        let dir = TempDir::new("device-mute-timeout");
+        let mut h = holder(&dir, &[("a", 0.3)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let t = T0 + 500 * MS;
+        h.default_device_changed(t, Some("ep2".into()));
+        assert_eq!(h.capture_gain(t + 999 * MS), 0.0);
+        assert!((h.capture_gain(t + DEVICE_MUTE_US) - 3000.0).abs() < 0.05);
+        // A pass after the timeout clears it for good.
+        assert_eq!(h.follow(t + 1_200 * MS), FollowReport::default());
+        assert!((h.capture_gain(t + 1_200 * MS) - 3000.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn default_device_mute_outlasts_a_failed_follow_then_normal_rules_apply() {
+        let dir = TempDir::new("device-mute-fail");
+        let mut h = holder(&dir, &[("a", 0.3)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let t = T0 + 500 * MS;
+        h.default_device_changed(t, Some("ep2".into()));
+        h.sessions()
+            .add_session(info_on("ep2|player", "ep2"), 1.0, false);
+        h.sessions().fail_set_volume("ep2|player");
+        let r = h.follow(t + 10 * MS);
+        assert_eq!((r.newly_lowered, r.failed), (0, 1));
+        assert_eq!(
+            h.capture_gain(t + 10 * MS),
+            0.0,
+            "not lowered: still silent"
+        );
+        assert_eq!(h.capture_gain(t + 999 * MS), 0.0);
+        // After the timeout: the unlowered session plays at 1.0, so no compensation (gain
+        // original / 1.0 at most).
+        let g = h.capture_gain(t + DEVICE_MUTE_US);
+        assert!(g > 0.0 && g <= 0.3 + 1e-6, "{g}");
+    }
+
+    #[test]
+    fn default_device_change_without_a_new_endpoint_ends_on_the_next_clean_pass() {
+        let dir = TempDir::new("device-mute-none");
+        let mut h = holder(&dir, &[("a", 0.3)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let t = T0 + 500 * MS;
+        h.default_device_changed(t, None);
+        assert_eq!(h.capture_gain(t), 0.0);
+        assert_eq!(h.follow(t + MS), FollowReport::default());
+        assert!((h.capture_gain(t + MS) - 3000.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn default_device_change_is_ignored_unless_holding() {
+        let dir = TempDir::new("device-mute-idle");
+        let mut h = holder(&dir, &[("a", 0.3)]);
+        h.default_device_changed(T0, Some("ep2".into()));
+        assert_eq!(h.capture_gain(T0), 1.0);
+        // An attach starts unmuted, and a change while held ends with the player's exit.
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        assert!((h.capture_gain(T0 + 131 * MS) - 3000.0).abs() < 0.05);
+        h.default_device_changed(T0 + 200 * MS, Some("ep2".into()));
+        h.sessions().set_process_created(PID, None);
+        assert!(h.follow(T0 + 201 * MS).player_exited);
+        assert_eq!(h.capture_gain(T0 + 202 * MS), 1.0);
     }
 
     #[test]

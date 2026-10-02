@@ -34,8 +34,11 @@
 //! 4. `Holder::tick`: `Held` while attaching -> `AttachDone`; `Failed` while attaching ->
 //!    `Failure` + `begin_release`; `Failed` while releasing is one-shot (logged, the entry
 //!    stays in the restore file) and the next `Idle` is `ReleaseDone`;
-//! 5. every 0.5 s, and at once when the safety guard asks (`take_follow_request`):
-//!    `Holder::follow` while active; every 0.5 s also the output endpoint check;
+//! 5. every 0.5 s, and at once when the safety guard asks (`take_follow_request`) or a
+//!    notification arrived ([`SessionSignals`]: a new session, a default render device
+//!    change): `Holder::follow` while active; every 0.5 s and after a notification also the
+//!    output endpoint check. A default render device change while attaching or active first
+//!    silences the capture (`Holder::default_device_changed`);
 //! 6. `SharedGains` from the Holder (after the tick and follow, so the audio threads see the
 //!    gain that matches the volumes just set);
 //! 7. `Metrics` once per second;
@@ -76,6 +79,7 @@ use crate::audio::endpoint::session_endpoint;
 use crate::audio::{now_us, AudioConfig, AudioHandle, SharedGains};
 use crate::dsp::SAMPLE_RATE;
 use crate::holder::{Holder, HolderPhase};
+use crate::notify::{SessionSignals, SessionWatcher};
 use crate::pipe::{pipe_name, Accepted, PipeServer};
 use crate::processor::{Processor, Stage};
 use crate::separator::Separator;
@@ -253,6 +257,11 @@ pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     last_follow_error: Option<String>,
     unattenuated_seen: u64,
     exit_requested: bool,
+    /// Set by the session/endpoint notification callbacks (see [`crate::notify`]).
+    signals: Arc<SessionSignals>,
+    /// A notification asked for a follow pass that has not run yet (it arrived while
+    /// attaching).
+    event_follow: bool,
 }
 
 impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
@@ -282,7 +291,14 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             last_follow_error: None,
             unattenuated_seen: 0,
             exit_requested: false,
+            signals: Arc::new(SessionSignals::default()),
+            event_follow: false,
         }
+    }
+
+    /// The flags the notification callbacks set ([`SessionWatcher`] in [`run`]).
+    pub fn signals(&self) -> Arc<SessionSignals> {
+        self.signals.clone()
     }
 
     #[cfg(test)]
@@ -726,11 +742,28 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         if due {
             self.next_check_us = Some(now_us + CHECK_INTERVAL_US);
         }
+        // Notifications are taken every pass; they matter only while holding.
+        let created = self.signals.take_session_created();
+        let default_changed = self.signals.take_default_changed();
+        let holding = matches!(self.phase, Phase::Attaching | Phase::Active);
+        if holding {
+            if created || default_changed.is_some() {
+                self.event_follow = true;
+            }
+            if let Some(endpoint) = default_changed {
+                // Silent (never amplified) until the player is held on the new endpoint.
+                self.holder.default_device_changed(now_us, endpoint);
+            }
+        } else {
+            self.event_follow = false;
+        }
         let requested = self.audio_live() && self.audio.take_follow_request();
-        if (due || requested) && self.phase == Phase::Active {
+        let event = self.event_follow && self.phase == Phase::Active;
+        if (due || requested || event) && self.phase == Phase::Active {
+            self.event_follow = false;
             self.follow(now_us, ev);
         }
-        if due && self.audio_live() {
+        if (due || event) && self.audio_live() {
             self.follow_endpoint();
         }
     }
@@ -1180,6 +1213,14 @@ pub fn run(args: Args) -> i32 {
         RealAudio::default(),
         stemgen_loader(),
     );
+    // Without notifications the engine still follows every 0.5 s.
+    let mut watcher = match SessionWatcher::start(core.signals()) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("devocal engine: no session notifications ({e}); polling only");
+            None
+        }
+    };
     let mut st = LoopState::default();
     let mut clock = now_us;
     let mut reader_done = false;
@@ -1194,6 +1235,9 @@ pub fn run(args: Args) -> i32 {
         }
         input.link_closed = reader_done || write_failed.load(Ordering::Acquire);
         input.app_exited = app.exited();
+        if let Some(w) = watcher.as_mut() {
+            w.maintain();
+        }
         let mut events = Vec::new();
         let exit = loop_once(&mut core, &mut st, input, &mut clock, &mut events);
         for e in &events {
@@ -1212,6 +1256,8 @@ pub fn run(args: Args) -> i32 {
         thread::sleep(Duration::from_micros(TICK_US));
     }
     core.stop_audio();
+    // Unregister the notifications while COM is still initialised on this thread.
+    drop(watcher);
     drop(out_tx);
     let _ = flushed_rx.recv_timeout(FLUSH_TIMEOUT);
     0
@@ -2080,6 +2126,122 @@ mod tests {
         r.audio().request_follow();
         r.run(1);
         assert_eq!(r.volume(SESSION), HELD_VOLUME);
+    }
+
+    /// The capture gain the engine last published to the audio side.
+    fn published_capture_gain(r: &Rig) -> f32 {
+        r.audio()
+            .st()
+            .gains
+            .as_ref()
+            .expect("audio started")
+            .capture_gain()
+    }
+
+    #[test]
+    fn session_notification_runs_follow_at_once() {
+        let (mut r, _) = Rig::attached("session-event");
+        r.run(450);
+        assert!((published_capture_gain(&r) - 8000.0).abs() < 0.5);
+        // The player opens a second stream; Windows starts its session at 1.0.
+        const NEW: &str = "ep1|player|2%b100";
+        r.core
+            .sessions()
+            .add_session(session(NEW, "ep1"), 1.0, false);
+        r.run(1);
+        assert_eq!(r.volume(NEW), 1.0, "no follow due yet");
+        r.core.signals().notify_session_created();
+        r.run(1);
+        assert_eq!(r.volume(NEW), HELD_VOLUME);
+        // It played at 1.0 until now: the capture gain is at most 0.8 / 1.0 (no x8000).
+        let g = published_capture_gain(&r);
+        assert!(g > 0.0 && g <= 0.8 + 1e-6, "{g}");
+        r.run(100);
+        assert!(published_capture_gain(&r) <= 0.8 + 1e-6);
+        r.run(1);
+        assert!((published_capture_gain(&r) - 8000.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn session_notification_while_attaching_is_followed_once_active() {
+        let mut r = Rig::new("session-event-attaching");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.send(attach());
+        r.run(5);
+        assert_eq!(r.core.phase(), Phase::Attaching);
+        const NEW: &str = "ep1|player|2%b100";
+        r.core
+            .sessions()
+            .add_session(session(NEW, "ep1"), 1.0, false);
+        r.core.signals().notify_session_created();
+        r.run(40);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert_eq!(r.volume(NEW), HELD_VOLUME, "followed without waiting 0.5 s");
+    }
+
+    #[test]
+    fn default_device_change_mutes_the_capture_until_the_player_is_held_there() {
+        let (mut r, _) = Rig::attached("device-change");
+        r.run(300);
+        assert!((published_capture_gain(&r) - 8000.0).abs() < 0.5);
+        r.core.signals().notify_default_changed(Some("ep2".into()));
+        r.run(1);
+        assert_eq!(published_capture_gain(&r), 0.0, "silent at once");
+        r.run(300);
+        assert_eq!(
+            published_capture_gain(&r),
+            0.0,
+            "the player has not moved yet (a 0.5 s follow ran meanwhile)"
+        );
+        // The player recreates its stream on the new device, where Windows starts it at 1.0.
+        r.core.sessions().set_active(SESSION, false);
+        r.core
+            .sessions()
+            .add_session(session(SESSION2, "ep2"), 1.0, false);
+        r.core.signals().notify_session_created();
+        r.run(1);
+        assert_eq!(r.volume(SESSION2), HELD_VOLUME);
+        assert_eq!(r.audio().st().rebinds, vec![Some("ep2".to_string())]);
+        // Back with the conservative gain: original / 1.0 for the window, then 8000.
+        let g = published_capture_gain(&r);
+        assert!(g > 0.0 && g <= 0.8 + 1e-6, "{g}");
+        r.run(100);
+        assert!(published_capture_gain(&r) <= 0.8 + 1e-6);
+        r.run(1);
+        assert!((published_capture_gain(&r) - 8000.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn default_device_mute_times_out_after_one_second() {
+        let (mut r, _) = Rig::attached("device-change-timeout");
+        r.run(300);
+        r.core.signals().notify_default_changed(Some("ep2".into()));
+        r.run(1);
+        assert_eq!(published_capture_gain(&r), 0.0);
+        // The player stays on its endpoint (e.g. pinned to it): 1 s of silence, then normal.
+        r.run(999);
+        assert_eq!(published_capture_gain(&r), 0.0);
+        r.run(1);
+        assert!((published_capture_gain(&r) - 8000.0).abs() < 0.5);
+        assert!(r.audio().st().rebinds.is_empty());
+    }
+
+    #[test]
+    fn notifications_while_idle_are_dropped() {
+        let mut r = Rig::new("events-idle");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.core.signals().notify_default_changed(Some("ep2".into()));
+        r.core.signals().notify_session_created();
+        r.run(5);
+        r.send(attach());
+        r.run(200);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert!(
+            (published_capture_gain(&r) - 8000.0).abs() < 0.5,
+            "a stale device change does not mute a new hold"
+        );
     }
 
     #[test]

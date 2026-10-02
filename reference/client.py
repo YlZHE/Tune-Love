@@ -283,7 +283,9 @@ def select_profile(profiles, plugin_file, architecture=None):
         raise ValueError('Ambiguous profile selection; choose an explicit component/profile')
     # A profile can be distributed for a default installation path and selected for another install.
     data = copy.deepcopy(matches[0].data)
-    data['plugin_file'] = str(Path(plugin_file).resolve())
+    # Keep the host's spelling: attach and the in-process agent compare against the module
+    # path the host reports, which may go through a junction, symlink or 8.3 short name.
+    data['plugin_file'] = ntpath.abspath(str(plugin_file))
     return Profile(data)
 
 

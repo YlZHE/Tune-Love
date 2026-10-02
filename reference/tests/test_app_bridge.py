@@ -10,7 +10,7 @@ try:
     import app_bridge
 except ImportError:
     app_bridge = None
-from reference.tests.test_client import pe_bytes, fixture_profile
+from reference.tests.test_client import pe_bytes, fixture_profile, make_junction
 
 
 class BridgeTests(unittest.TestCase):
@@ -73,6 +73,18 @@ class BridgeTests(unittest.TestCase):
     def apply(self, connection, sequence=1, values=None):
         return self.bridge.command({"op": "apply", "connectionId": connection, "sequence": sequence,
                                     "values": {"retune": .5} if values is None else values})
+
+    def test_connect_works_when_the_host_loaded_the_plugin_through_a_junction(self):
+        real = Path(self.temp.name) / "real-vst3"
+        real.mkdir()
+        (real / self.plugin.name).write_bytes(pe_bytes())
+        link = Path(self.temp.name) / "linked-vst3"
+        make_junction(link, real)
+        self.plugin = link / self.plugin.name
+        self.profile = fixture_profile(self.plugin)
+        self.loaded = [{"name": self.plugin.name, "path": str(self.plugin)}]
+        self.bridge = self.make_bridge()
+        self.connect()
 
     def test_disconnected_and_connect_have_no_implicit_values_or_clear(self):
         self.assertEqual(self.bridge.command({"op": "status"})["state"]["phase"], "disconnected")

@@ -39,6 +39,12 @@ def pe_bytes(machine=0x8664):
     return bytes(data)
 
 
+def make_junction(link, target):
+    """Directory junction (no admin needed) so a path differs from its resolved form."""
+    subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(target)],
+                   check=True, capture_output=True)
+
+
 def fixture_profile(path, offset=0):
     return {
         'schema_version': 1, 'profile_id': f'fixture-{offset}',
@@ -239,6 +245,17 @@ class ClientTests(unittest.TestCase):
             client.select_profile([wrong], self.plugin)
         with self.assertRaisesRegex(ValueError, 'Ambiguous'):
             client.select_profile([wanted, wanted], self.plugin)
+
+    def test_profile_selection_keeps_the_hosts_path_spelling(self):
+        # Hosts report the path they loaded (junction, symlink or 8.3 short name);
+        # attach and the agent compare against that spelling, so it must not be resolved away.
+        real = Path(self.temp.name) / 'real-plugins'
+        real.mkdir()
+        (real / 'fixture.vst3').write_bytes(pe_bytes())
+        link = Path(self.temp.name) / 'linked-plugins'
+        make_junction(link, real)
+        selected = client.select_profile([client.Profile(self.profile)], link / 'fixture.vst3')
+        self.assertEqual(selected.plugin_file, str(link / 'fixture.vst3'))
 
     def make_client(self, responses=None):
         self.packets = []

@@ -36,9 +36,9 @@ pub struct RestoreOutcome {
     pub restored: usize,
     pub left_changed: usize,
     pub gone: usize,
-    /// Entries whose player process has exited and whose session identifier matches no current
-    /// session. Windows persists the held volume per app, so they stay in the file until the
-    /// player is launched again and they can be restored.
+    /// Entries whose player process has exited (or whose recorded session is gone) and whose
+    /// session identifier matches no current session. Windows persists the held volume per app,
+    /// so they stay in the file until the player's session appears again and can be restored.
     pub awaiting_player: usize,
     /// Entries that could not be evaluated or restored because of an error (process, session or
     /// volume lookup, `set_volume`). They stay in the restore file for a later retry. An unreadable
@@ -96,9 +96,10 @@ enum Relaunched {
     Failed,
 }
 
-/// The entry's process has exited. Windows persists per-app session volume (keyed by endpoint,
-/// executable and session GUID, not pid), so the player's next launch comes back at the held
-/// volume. Find its sessions by the pid-free session identifier and restore those still held.
+/// The entry's process has exited, or it is alive but its recorded session is gone. Windows
+/// persists per-app session volume (keyed by endpoint, executable and session GUID, not pid), so
+/// a relaunched player, or a session the live player recreated, comes back at the held volume.
+/// Find those sessions by the pid-free session identifier and restore the ones still held.
 fn restore_relaunched(e: &RestoreEntry, sessions: &dyn SessionVolumes) -> Relaunched {
     if e.session_identifier.is_empty() {
         return Relaunched::Gone;
@@ -130,15 +131,38 @@ fn restore_relaunched(e: &RestoreEntry, sessions: &dyn SessionVolumes) -> Relaun
     }
 }
 
+/// Runs [`restore_relaunched`] and records its result in `out` (and `retry` for kept entries).
+fn count_relaunched(
+    e: &RestoreEntry,
+    sessions: &dyn SessionVolumes,
+    out: &mut RestoreOutcome,
+    retry: &mut Vec<RestoreEntry>,
+) {
+    match restore_relaunched(e, sessions) {
+        Relaunched::Gone => out.gone += 1,
+        Relaunched::Restored => out.restored += 1,
+        Relaunched::LeftChanged => out.left_changed += 1,
+        Relaunched::Awaiting => {
+            out.awaiting_player += 1;
+            retry.push(e.clone());
+        }
+        Relaunched::Failed => {
+            out.failed += 1;
+            retry.push(e.clone());
+        }
+    }
+}
+
 /// Restores every entry whose process (pid + creation time) and session still exist and whose
 /// volume is still the held value; anything else is left as the user has it.
 ///
-/// If the entry's process has exited (or its pid was reused), the player's sessions are looked
-/// up by the entry's pid-free `session_identifier` instead, because Windows re-applies the
-/// persisted held volume when the player is launched again: held sessions are restored (counted
-/// in `restored`), sessions the user changed are left alone (`left_changed`), and with no
-/// matching session yet the entry is kept (`awaiting_player`). Entries without an identifier
-/// count as `gone`.
+/// If the entry's process has exited (or its pid was reused), or the process is alive but the
+/// recorded session no longer exists, the player's sessions are looked up by the entry's
+/// pid-free `session_identifier` instead, because Windows re-applies the persisted held volume
+/// to a relaunched player or a recreated session: held sessions are restored (counted in
+/// `restored`), sessions the user changed are left alone (`left_changed`), and with no matching
+/// session yet the entry is kept (`awaiting_player`). Entries without an identifier count as
+/// `gone`.
 ///
 /// Entries that hit an error (process/session/volume lookup, `set_volume`) are counted in
 /// `failed` and kept: the file is rewritten atomically with only those entries, and deleted only
@@ -170,19 +194,7 @@ pub fn restore(path: &Path, sessions: &dyn SessionVolumes) -> RestoreOutcome {
             Ok(Some(created)) if created == e.created_at => {}
             Ok(_) => {
                 // Process gone, or the pid now belongs to a different process.
-                match restore_relaunched(e, sessions) {
-                    Relaunched::Gone => out.gone += 1,
-                    Relaunched::Restored => out.restored += 1,
-                    Relaunched::LeftChanged => out.left_changed += 1,
-                    Relaunched::Awaiting => {
-                        out.awaiting_player += 1;
-                        retry.push(e.clone());
-                    }
-                    Relaunched::Failed => {
-                        out.failed += 1;
-                        retry.push(e.clone());
-                    }
-                }
+                count_relaunched(e, sessions, &mut out, &mut retry);
                 continue;
             }
             Err(_) => {
@@ -194,7 +206,8 @@ pub fn restore(path: &Path, sessions: &dyn SessionVolumes) -> RestoreOutcome {
         match sessions.session(&e.instance_id) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                out.gone += 1;
+                // Process alive, recorded session gone: it may have been recreated.
+                count_relaunched(e, sessions, &mut out, &mut retry);
                 continue;
             }
             Err(_) => {
@@ -384,6 +397,49 @@ mod tests {
         assert_eq!(f.set_volume_calls(), 0);
         assert_eq!(f.volume("ep|player|1%b20").unwrap(), 0.4);
         assert!(!dir.file().exists());
+    }
+
+    #[test]
+    fn live_player_with_recreated_session_is_restored_by_identifier() {
+        // pid 10 is still the same process, but its old session is gone and a new one (same
+        // identifier, new instance id) came back at the persisted held volume.
+        let dir = TempDir::new("recreated");
+        let f = FakeSessions::new();
+        f.set_process_created(10, Some(111));
+        f.add_session(
+            SessionInfo {
+                instance_id: "ep|player|2%b10".into(),
+                session_identifier: PLAYER.into(),
+                pid: 10,
+                endpoint_id: "ep".into(),
+                active: true,
+            },
+            1.0e-4,
+            false,
+        );
+        write_entries(&dir, vec![player_entry(0.8)]);
+
+        let out = restore(&dir.file(), &f);
+        assert_eq!((out.restored, out.gone, out.awaiting_player), (1, 0, 0));
+        assert_eq!(f.volume("ep|player|2%b10").unwrap(), 0.8);
+        assert!(!dir.file().exists());
+    }
+
+    #[test]
+    fn live_player_without_any_session_waits_for_it() {
+        let dir = TempDir::new("live-await");
+        let f = FakeSessions::new();
+        f.set_process_created(10, Some(111)); // alive, but no session at all yet
+        write_entries(&dir, vec![player_entry(0.8)]);
+
+        let out = restore(&dir.file(), &f);
+        assert_eq!(
+            (out.restored, out.gone, out.failed, out.awaiting_player),
+            (0, 0, 0, 1)
+        );
+        assert_eq!(f.set_volume_calls(), 0);
+        let kept = read(&dir.file()).unwrap().expect("file must be kept");
+        assert_eq!(kept.entries, vec![player_entry(0.8)]);
     }
 
     #[test]

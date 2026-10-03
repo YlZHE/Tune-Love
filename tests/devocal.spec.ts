@@ -15,6 +15,7 @@ async function prepare(page: Page, view = "/", initial: Record<string, unknown> 
     state.commandDelayMs = 0;
     state.commandFailure = null;
     state.commandErrorMessage = null;
+    state.openSettingsCalls = [];
     state.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" } },
       invoke: async (command: string, args: any) => {
@@ -30,6 +31,8 @@ async function prepare(page: Page, view = "/", initial: Record<string, unknown> 
           if (action === "release") state.devocal = { ...OFF };
           return structuredClone(state.devocal);
         }
+        if (command === "get_model_status") return [];
+        if (command === "open_settings") { state.openSettingsCalls.push(args); return null; }
         if (command === "get_now_playing") return { status: "idle", track: null, capturedAtMs: Date.now() };
         if (command === "get_audio_level" || command === "get_key_detection") return null;
         if (command === "plugin:window|is_always_on_top") return true;
@@ -137,12 +140,12 @@ test("a warning stays visible without hover but a neutral label waits for hover"
 
 test("only one polite live region carries text at a time", async ({ page }) => {
   await prepare(page, "/", { phase: "unavailable", error: "model_not_found" });
-  await expect(page.getByText("未找到去人声模型", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("未找到去人声模型，请在设置中下载", { exact: true })).toHaveCount(1);
   await expect.poll(() => page.locator(".devocal-warning, .devocal-status").evaluateAll(els => els.filter(el => el.textContent).length)).toBe(1);
   await page.evaluate(() => { (window as any).devocal = { ...(window as any).devocal, phase: "passthrough", held: true, error: null }; });
   await expect(page.getByText("原声直通", { exact: true })).toHaveCount(1);
   await expect.poll(() => page.locator(".devocal-warning, .devocal-status").evaluateAll(els => els.filter(el => el.textContent).length)).toBe(1);
-  await expect(page.getByText("未找到去人声模型")).toHaveCount(0);
+  await expect(page.getByText("未找到去人声模型，请在设置中下载")).toHaveCount(0);
 });
 
 test("the status is polled while the window is open", async ({ page }) => {

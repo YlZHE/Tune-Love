@@ -34,6 +34,7 @@ async function prepare(context: BrowserContext) {
         if (command === "get_audio_level") return null;
         if (command === "plugin:window|is_always_on_top") return true;
         if (command === "get_devocal_status") return { phase:"off",held:false,latencyMs:null,loadRatio:null,fallbackReason:null,sessionOverridden:false,inputSilent:false,error: null };
+        if (command === "get_model_status") return [];
         if (command === "plugin:window|is_visible") return true;
         if (command !== "autotune_command") return null;
         const request = args.request;

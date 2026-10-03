@@ -64,11 +64,19 @@ describe("devocalLabel", () => {
     expect(devocalLabel(status({ phase: "devocal", held: true, error: "model_load_failed: x" }))).toBe("去人声中");
   });
   it("tells a missing model apart from an engine that cannot start", () => {
-    expect(devocalLabel(status({ phase: "unavailable", error: "model_not_found" }))).toBe("未找到去人声模型");
+    expect(devocalLabel(status({ phase: "unavailable", error: "model_not_found" }))).toBe("未找到去人声模型，请在设置中下载");
     expect(devocalLabel(status({ phase: "unavailable", error: "engine_unavailable: spawn failed" }))).toBe("去人声引擎无法启动");
     expect(devocalLabel(status({ phase: "unavailable", error: "engine_unavailable" }))).toBe("去人声引擎无法启动");
-    expect(devocalLabel(status({ phase: "unavailable", error: null }))).toBe("未找到去人声模型");
-    expect(devocalLabel(status({ phase: "unavailable", error: "no_model: x" }))).toBe("未找到去人声模型");
+    expect(devocalLabel(status({ phase: "unavailable", error: null }))).toBe("未找到去人声模型，请在设置中下载");
+    expect(devocalLabel(status({ phase: "unavailable", error: "no_model: x" }))).toBe("未找到去人声模型，请在设置中下载");
+  });
+  it("offers to open the model settings only for a missing model", () => {
+    expect(devocalNotice(status({ phase: "unavailable", error: "model_not_found" })))
+      .toEqual({ text: "未找到去人声模型，请在设置中下载", kind: "warning", action: "open-model-settings" });
+    expect(devocalNotice(status({ phase: "unavailable", error: "engine_unavailable: spawn failed" })))
+      .toEqual({ text: "去人声引擎无法启动", kind: "warning" });
+    expect(devocalNotice(status({ phase: "unavailable", error: "engine_unavailable" }))).not.toHaveProperty("action");
+    expect(devocalNotice(status({ phase: "failed", error: "engine_crashed" }))).not.toHaveProperty("action");
   });
   it("shows passthrough only while the player is held", () => {
     expect(devocalLabel(status({ phase: "passthrough", held: true }))).toBe("原声直通");

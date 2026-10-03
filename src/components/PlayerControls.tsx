@@ -10,6 +10,7 @@ import { autoTune, useAutoTune } from "../useAutoTune";
 import { controlLabel, type ControlRole } from "../autotuneControl";
 import { devocalNotice } from "../devocal";
 import { useDevocal } from "../useDevocal";
+import { openSettings } from "../openSettings";
 import "./AutoTuneSettings.css";
 import "./PlayerControls.css";
 
@@ -78,7 +79,10 @@ export function PlayerControls({ children, hovered, playing, hasTrack, transport
 
   const setOpen = (name: Exclude<Panel, null>, open: boolean) => setPanel(open ? name : null);
   return <footer className="player-footer" data-controls-visible={visible} data-panel-open={panel !== null}>
-    <span className="devocal-warning" aria-live="polite">{warningText}</span>
+    <span className="devocal-warning" aria-live="polite">{warningText && devocalLine?.action === "open-model-settings"
+      ? <button type="button" className="devocal-warning-action"
+        onClick={() => openSettings("devocal-model").catch(() => onNotice("未能打开设置，请重试"))}>{warningText}</button>
+      : warningText}</span>
     <div className="footer-information" aria-hidden={visible} inert={visible}>{children(visible)}</div>
     <div ref={controls} className="footer-controls" role="group" aria-label="音乐和电音控制" aria-describedby={previewId}
       onFocusCapture={() => setFocused(keyboard.current)}

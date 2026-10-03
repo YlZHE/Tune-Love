@@ -3,7 +3,7 @@ StemgenRT-5.8 (real-time vocal separation model)
 
 Project:  https://github.com/sweetspotsoundsystem/StemgenRT-5.8
 Model:    model/model.onnx at commit 61df8f4aa1555ef110308d01ea92b54ace770979
-          https://media.githubusercontent.com/media/sweetspotsoundsystem/stemgen-rt/61df8f4aa1555ef110308d01ea92b54ace770979/model/model.onnx
+          https://github.com/sweetspotsoundsystem/stemgen-rt/raw/61df8f4aa1555ef110308d01ea92b54ace770979/model/model.onnx
           37,529,132 bytes, SHA-256 77164d6a581fafb2a31f53fd8ffde44c07cf618472952a4cdba14e68dda3b8b9
 
 The model weights are NOT included in this repository. scripts/fetch-stemgenrt.mjs

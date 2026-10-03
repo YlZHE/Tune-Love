@@ -11,12 +11,14 @@ import { AutoApplySettings } from "./components/AutoApplySettings";
 import { DevocalSettings } from "./components/DevocalSettings";
 import { useNowPlaying } from "./useNowPlaying";
 import { useAppColors } from "./useAppColors";
+import { useSettingsSectionRequest } from "./settingsSection";
 
 export function SettingsPage() {
   const snapshot = useNowPlaying();
   const track = snapshot.status === "ready" ? snapshot.track : null;
   const colors = useAppColors(track?.artworkDataUrl ?? null);
   const [error, setError] = useState("");
+  const sectionRequest = useSettingsSectionRequest();
   const close = useCallback(async () => {
     try {
       if (isTauri()) await getCurrentWindow().close();
@@ -41,7 +43,7 @@ export function SettingsPage() {
         </AppTooltip>
       </header>
       <section className="settings-page-content" aria-label="设置内容">
-        <AutoTuneSettings /><AutoApplySettings /><DevocalSettings /><ColorSettings track={track} colors={colors} /><BackgroundSettings />
+        <AutoTuneSettings /><AutoApplySettings /><DevocalSettings request={sectionRequest} /><ColorSettings track={track} colors={colors} /><BackgroundSettings />
       </section>
       {error && <p className="settings-error" role="status">{error}</p>}
     </main>

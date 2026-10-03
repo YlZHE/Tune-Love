@@ -1201,17 +1201,40 @@ impl Renderer {
     }
 }
 
-/// Render periods the system adds on top of our own pipeline: the audio engine handing the
-/// player's mix to process loopback, and our output being mixed again.
+/// Part of the system path that does not scale with the render period, in microseconds.
 ///
-/// Calibrated on one real-machine measurement (2026-10-03, Folia, 10 ms render period):
-/// 75.1 ms measured end to end against 42.9 ms estimated without it, 32.2 ms ~ 3 periods.
-/// To be re-measured by the latency sub-project.
-const SYSTEM_PATH_PERIODS: u64 = 3;
+/// Zero on purpose. It would be the process-loopback delivery offset `S` (38,547 us median in
+/// the P0 report), but only if that offset were shown not to depend on the period, i.e.
+/// |S - S_small| < 2000 us. `S_small` is N/A: no endpoint on the measuring machine offers a
+/// smaller period (all six are 48 kHz, 480 frames), so the condition is not shown, `S` is not
+/// used, and the whole system path is attributed to the period-scaled term below.
+pub(crate) const SYSTEM_PATH_FIXED_US: u64 = 0;
+
+/// Part of the system path that scales with the render period, in tenths of a period.
+///
+/// Source: `docs/2026-10-03_devocal-latency-p0-report.md` section 2 (Folia, P = 441 frames =
+/// 10 ms, measured 2026-10-03). The estimate then still contained 3 periods for the system
+/// path, so our own part is `E - 3 * P`: our_a = 55.8 - 30 = 25.8 ms, our_c = 65.8 - 30 =
+/// 35.8 ms. Against the measured release jumps M_a = 58.0 ms and M_c = 68.0 ms the system
+/// path is sys_a = 58.0 - 25.8 = 32.2 ms and sys_c = 68.0 - 35.8 = 32.2 ms (they agree), so
+/// sys = 32.2 ms and tenths = round(10 * 32.2 / 10) = 32, i.e. 3.2 periods. Re-measure on a
+/// machine with a smaller period before trusting the scaling with the period.
+pub(crate) const SYSTEM_PATH_PERIOD_TENTHS: u64 = 32;
+
+/// Frames the system adds on top of our own pipeline (the audio engine handing the player's
+/// mix to process loopback, and our output being mixed again) for a render period of `period`
+/// frames. `period` is 0 when there is no sink, and then so is the system path.
+fn system_path_frames(period: u64) -> u64 {
+    if period == 0 {
+        return 0;
+    }
+    SYSTEM_PATH_FIXED_US * u64::from(SAMPLE_RATE) / 1_000_000
+        + SYSTEM_PATH_PERIOD_TENTHS * period / 10
+}
 
 /// Estimated end-to-end added latency in frames: capture packet + ring A + ring B + device
-/// padding + processor latency + [`SYSTEM_PATH_PERIODS`] render periods (`period` is 0 when
-/// there is no sink).
+/// padding + processor latency + [`system_path_frames`] (zero when `period` is 0, i.e. there
+/// is no sink).
 fn latency_frames(
     capture_packet: u64,
     ring_a: u64,
@@ -1220,7 +1243,7 @@ fn latency_frames(
     proc_latency: u64,
     period: u64,
 ) -> u64 {
-    capture_packet + ring_a + ring_b + padding + proc_latency + SYSTEM_PATH_PERIODS * period
+    capture_packet + ring_a + ring_b + padding + proc_latency + system_path_frames(period)
 }
 
 #[cfg(test)]
@@ -1809,15 +1832,39 @@ mod tests {
         assert_eq!(r.decay_drop, 0, "given up");
     }
 
+    /// Frames to milliseconds at the engine rate.
+    fn frames_to_ms(frames: u64) -> f64 {
+        frames as f64 * 1000.0 / f64::from(SAMPLE_RATE)
+    }
+
     #[test]
-    fn latency_frames_adds_three_render_periods() {
-        // 441-frame (10 ms) period: 3 x 441 = 1 323 frames on top of the pipeline terms.
+    fn system_path_matches_the_p0_measurement() {
+        // P0 report 2026-10-03: P = 441 frames (10 ms); sys_a = 58.0 - (55.8 - 30) = 32.2 ms,
+        // sys_c = 68.0 - (65.8 - 30) = 32.2 ms, so sys = 32.2 ms.
+        let ms = frames_to_ms(system_path_frames(441));
+        assert!((ms - 32.2).abs() <= 1.0, "{ms} ms");
+    }
+
+    #[test]
+    fn latency_estimate_reproduces_state_a() {
+        // State (a): the engine reported E_a = 55.8 ms with 3 periods (30 ms) as the system
+        // path, so our own part is 25.8 ms; the measured release jump M_a was 58.0 ms.
+        let our_a = (25.8_f64 * f64::from(SAMPLE_RATE) / 1000.0).round() as u64;
+        let ms = frames_to_ms(our_a + system_path_frames(441));
+        assert!((ms - 58.0).abs() <= 1.0, "{ms} ms");
+    }
+
+    #[test]
+    fn latency_frames_adds_the_system_path() {
         assert_eq!(
             latency_frames(441, 128, 1_000, 200, 128, 441),
-            1_897 + 1_323
+            1_897 + system_path_frames(441)
         );
-        assert_eq!(latency_frames(1, 2, 3, 4, 5, 441), 15 + 1_323);
-        // No sink: nothing is added.
+        assert_eq!(
+            latency_frames(1, 2, 3, 4, 5, 441),
+            15 + system_path_frames(441)
+        );
+        // No sink (period 0): nothing is added.
         assert_eq!(latency_frames(441, 128, 1_000, 200, 128, 0), 1_897);
     }
 

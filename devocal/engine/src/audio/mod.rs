@@ -94,8 +94,8 @@ pub struct AudioStats {
     /// `LoadMonitor::ratio() * 1000` while the model runs, 0 otherwise.
     pub load_ratio_milli: AtomicU32,
     /// Estimated end-to-end added latency in microseconds (milli-milliseconds): capture
-    /// packet + ring A + ring B + device padding + processor latency + 3 render periods for
-    /// the system path (see `render::SYSTEM_PATH_PERIODS`).
+    /// packet + ring A + ring B + device padding + processor latency + the calibrated system
+    /// path (about 3.2 render periods, see `render::SYSTEM_PATH_PERIOD_TENTHS`).
     pub latency_ms_milli: AtomicU32,
     /// Capture packets flagged discontinuous / timestamp error, plus ring overflows.
     pub discontinuities: AtomicU64,
@@ -384,7 +384,7 @@ pub const MAX_EXTRA_HEADROOM_FRAMES: usize = 441;
 pub const PREROLL_FRAMES: usize = 441;
 /// Devocal latency budget (50 ms at 44.1 kHz). Covers the engine-internal part only (capture
 /// packet, ring A, model latency, render target); the published latency estimate adds
-/// `render::SYSTEM_PATH_PERIODS` render periods for the system path on top of it.
+/// the calibrated system path (`render::SYSTEM_PATH_PERIOD_TENTHS`) on top of it.
 pub const LATENCY_BUDGET_FRAMES: usize = 2_205;
 
 /// Gains as `f32` bit patterns; published by the engine loop from the Holder every 1 ms.

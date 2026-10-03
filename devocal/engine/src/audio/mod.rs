@@ -275,11 +275,13 @@ impl StarvationDetail {
 }
 
 /// Ruling 24 log of forced fallbacks and overload retries (atomics only; the engine loop
-/// formats the line). A later underrun may overwrite the detail before the engine reads it:
-/// a diagnostic, not a protocol.
+/// formats the line). The render thread writes each counted underrun's detail; the
+/// processing thread copies it into `forced_detail` when that underrun forces the fallback,
+/// before it bumps `forced`, so a later underrun cannot overwrite what is logged.
 #[derive(Debug, Default)]
 pub(crate) struct FallbackLog {
     detail: [AtomicU64; DETAIL_FIELDS],
+    forced_detail: [AtomicU64; DETAIL_FIELDS],
     /// The fallback's trigger: 1 underrun, 2 load.
     pub trigger: AtomicU8,
     pub forced_at_us: AtomicU64,
@@ -304,6 +306,22 @@ impl FallbackLog {
     pub fn detail(&self) -> StarvationDetail {
         StarvationDetail::from_words(self.detail.each_ref().map(|a| a.load(Ordering::Relaxed)))
     }
+
+    /// Keeps the latest counted underrun's detail as the forced fallback's (processing
+    /// thread, before `forced` is bumped).
+    pub fn keep_forced_detail(&self) {
+        for (to, from) in self.forced_detail.iter().zip(&self.detail) {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    pub fn forced_detail(&self) -> StarvationDetail {
+        StarvationDetail::from_words(
+            self.forced_detail
+                .each_ref()
+                .map(|a| a.load(Ordering::Relaxed)),
+        )
+    }
 }
 
 /// The engine log line for a forced fallback (ruling 24).
@@ -324,7 +342,7 @@ pub(crate) fn fallback_line(run: u32, log: &FallbackLog, now_us: u64) -> String 
         },
     );
     if trigger != 2 {
-        let d = log.detail();
+        let d = log.forced_detail();
         l.push_str(&format!(
             " | starved {} ms before: verdict={} wake={} padding={} ring_b={} shortfall={} \
              since_capture_us={} since_push_us={} block_busy_us={} check_late_us={} headroom={}",

@@ -332,7 +332,9 @@ pub enum Verdict {
     /// Behind, during the model's warm-up (its output is the passthrough): treated as jitter.
     WarmUp,
     /// Behind, and the first such within [`OVERLOAD_REPEAT_US`]: a hiccup (a slow hop or a
-    /// late packet still being processed at the check), treated as jitter.
+    /// late packet still being processed at the check), treated as jitter. Earlier strikes are
+    /// forgotten by a new stream and by every accepted "on" (user, swap or retry: render
+    /// consumes its pre-roll request), so a retry is judged on its own hiccups.
     Isolated,
     /// Behind again within [`OVERLOAD_REPEAT_US`]: forces the fallback.
     Repeated,
@@ -395,6 +397,9 @@ impl OverloadJudge {
             .is_some_and(|t| now_us.saturating_sub(t) < OVERLOAD_REPEAT_US);
         self.last_behind_us = Some(now_us);
         if seen.warming {
+            // Recorded above all the same: a model too slow to keep up already starves in
+            // its warm-up, so its first underrun after it is a repeat and forces at once.
+            // These warm-up strikes carry the slow-model guarantee (fix round 1 test).
             Verdict::WarmUp
         } else if repeat {
             Verdict::Repeated
@@ -1451,6 +1456,9 @@ impl Renderer {
             .preroll_request
             .swap(false, Ordering::AcqRel)
         {
+            // An accepted "on" (user, model swap or overload retry): the overload judgement
+            // starts afresh, so a retry is not failed by the strike before its fallback.
+            self.overload.reset();
             let extra = self.headroom.total();
             let base = (period + hop + extra).min(buffer);
             let n = preroll_frames(
@@ -4220,6 +4228,9 @@ mod tests {
         spikes: Vec<(u64, u64)>,
         /// The first `.0` model hops take `.1` us each (cold model after idle).
         cold: Option<(usize, u64)>,
+        /// Devocal "on" again at these times (a retry or a user on/off/on): `WarmingUp` again
+        /// with a pre-roll request, as `accept_on` does.
+        ons: Vec<u64>,
     }
 
     impl HiccupCfg {
@@ -4231,6 +4242,7 @@ mod tests {
                 spikes: Vec::new(),
                 // Measured after 14 s idle: 1.95 / 1.56 / 1.41 / 1.31 ms.
                 cold: Some((4, 1_600)),
+                ons: Vec::new(),
             }
         }
     }
@@ -4246,6 +4258,8 @@ mod tests {
         max_jitter: usize,
         /// The detail published with each counted underrun (ruling 24 log).
         details: Vec<StarvationDetail>,
+        /// When the first warm-up ended (the first block published as `FadingIn`).
+        warm_end: Option<u64>,
     }
 
     /// Event-driven model of capture (441 frames per 10 ms at `phase`), the processing thread
@@ -4274,6 +4288,8 @@ mod tests {
         shared.preroll_request.store(true, Ordering::Release);
         let mut spikes = cfg.spikes.clone();
         spikes.sort_unstable();
+        let mut ons = cfg.ons.clone();
+        ons.sort_unstable();
         let mut o = HiccupOut::default();
         let (mut next_read, mut next_capture) = (0u64, cfg.phase);
         let (mut ring_a, mut model_hops, mut pushed) = (0usize, 0usize, 0u64);
@@ -4298,7 +4314,13 @@ mod tests {
             Some(t + d)
         };
         while next_read < cfg.len_us {
-            let candidates = [Some(next_read), Some(next_capture), busy_until, deadline];
+            let candidates = [
+                Some(next_read),
+                Some(next_capture),
+                busy_until,
+                deadline,
+                ons.first().copied(),
+            ];
             let (which, t) = candidates
                 .iter()
                 .enumerate()
@@ -4336,6 +4358,7 @@ mod tests {
                         if blocks_left == 0 && stage == Stage::WarmingUp {
                             stage = Stage::FadingIn;
                             blocks_left = 7;
+                            o.warm_end.get_or_insert(t);
                         } else if blocks_left == 0 {
                             stage = Stage::Devocal;
                         }
@@ -4361,9 +4384,17 @@ mod tests {
                     };
                     Some(Wake::Data)
                 }
-                _ => {
+                3 => {
                     deadline = None;
                     Some(Wake::Deadline)
+                }
+                _ => {
+                    ons.remove(0);
+                    stage = Stage::WarmingUp;
+                    blocks_left = 69;
+                    publish(&r, stage);
+                    shared.preroll_request.store(true, Ordering::Release);
+                    None
                 }
             };
             let Some(w) = wake else { continue };
@@ -4577,6 +4608,13 @@ mod tests {
         };
         log.set_detail(d);
         assert_eq!(log.detail(), d);
+        // The forced fallback keeps it; a later underrun's detail does not reach the line.
+        log.keep_forced_detail();
+        log.set_detail(StarvationDetail {
+            shortfall: 999,
+            ..d
+        });
+        assert_eq!(log.forced_detail(), d);
         log.trigger.store(1, Ordering::Relaxed);
         log.forced_at_us.store(9_000, Ordering::Relaxed);
         log.load_milli.store(356, Ordering::Relaxed);
@@ -4593,5 +4631,95 @@ mod tests {
         log.trigger.store(2, Ordering::Relaxed);
         let l = crate::audio::fallback_line(3, &log, 59_000);
         assert!(l.contains("trigger=load") && !l.contains("starved"), "{l}");
+    }
+
+    /// Ruling 24 fix round 1: an accepted "on" (here the overload retry, which pre-rolls)
+    /// starts the overload judgement afresh. A hiccup before the retry and one 3 s after it
+    /// (within `OVERLOAD_REPEAT_US` of the first) are both isolated: no fallback.
+    #[test]
+    fn the_first_hiccup_after_a_retry_is_isolated() {
+        let mut c = HiccupCfg::new(3_750, 7 * SEC);
+        c.spikes = vec![(3 * SEC, 5_000), (6 * SEC, 15_000)];
+        c.ons = vec![3_500 * MS];
+        let o = hiccup_sim(&c);
+        let late: Vec<_> = o.underruns.iter().filter(|u| u.0 >= 2 * SEC).collect();
+        assert_eq!(late.len(), 2, "{o:?}");
+        assert!(
+            late[1].0 >= 6 * SEC && late[1].2 == Stage::Devocal,
+            "{late:?}"
+        );
+        assert!(late.iter().all(|u| u.1.backlog_frames >= 128), "{late:?}");
+        assert!(forced(&o).is_empty(), "{o:?}");
+        let isolated = Verdict::Isolated.code();
+        let v: Vec<u64> = o.details.iter().map(|d| d.verdict).collect();
+        assert_eq!(&v[v.len() - 2..], &[isolated, isolated], "{v:?}");
+    }
+
+    /// Ruling 24 fix round 1: the worst-case slow model (one hop takes 10 or 30 ms against
+    /// 2.9 ms of audio) still forces the fallback within the warm-up plus one of its
+    /// starvation periods (it starves once every two hops: +10 ms and +58.5 ms here, during
+    /// the fade-in). This rests on the warm-up strikes: the warm-up never forces, but its
+    /// backlogged underruns are the earlier one that makes the first one after it a repeat.
+    #[test]
+    fn the_worst_slow_model_falls_back_right_after_the_warm_up() {
+        for hop_us in [10_000u64, 30_000] {
+            for phase in (0..10_000).step_by(2_500) {
+                let mut c = HiccupCfg::new(phase, 69 * hop_us + 20 * hop_us);
+                c.hop_us = hop_us;
+                c.cold = None;
+                let o = hiccup_sim(&c);
+                let warm_end = o.warm_end.expect("warm-up ends");
+                let warm: Vec<_> = o
+                    .underruns
+                    .iter()
+                    .filter(|u| u.2 == Stage::WarmingUp)
+                    .collect();
+                assert!(
+                    !warm.is_empty(),
+                    "hop {hop_us} phase {phase}: a warm-up strike"
+                );
+                let f = forced(&o);
+                // One starvation period of such a model: it starves once every two hops.
+                assert!(
+                    f.first().is_some_and(|&t| t <= warm_end + 2 * hop_us),
+                    "hop {hop_us} phase {phase}: forced {f:?}, warm-up ended {warm_end}"
+                );
+            }
+        }
+    }
+
+    /// Ruling 24 fix round 1: a new stream and an accepted "on" both forget the earlier
+    /// strike.
+    #[test]
+    fn after_open_and_an_accepted_on_reset_the_overload_judge() {
+        let behind = Starvation {
+            ran_model: true,
+            backlog_frames: 300,
+            warming: false,
+            force: false,
+        };
+        let sink = FakeSink::new(441);
+        let (mut r, shared, _tx) = test_renderer(Some(sink));
+        r.after_open();
+        let t = 10 * SEC;
+        assert_eq!(r.overload.judge(behind, 128, false, t), Verdict::Isolated);
+        r.after_open();
+        assert_eq!(
+            r.overload.judge(behind, 128, false, t + MS),
+            Verdict::Isolated,
+            "a new stream forgets the strike"
+        );
+        shared.preroll_request.store(true, Ordering::Release);
+        r.fill_at(Wake::Data, t + 2 * MS).unwrap();
+        assert!(!shared.preroll_request.load(Ordering::Acquire), "consumed");
+        assert_eq!(
+            r.overload.judge(behind, 128, false, t + 3 * MS),
+            Verdict::Isolated,
+            "an accepted on forgets the strike"
+        );
+        assert_eq!(
+            r.overload.judge(behind, 128, false, t + 4 * MS),
+            Verdict::Repeated
+        );
     }
 }

@@ -356,6 +356,9 @@ fn force_overload(ctx: &mut ProcessingCtx, st: &mut State, overloaded: bool, now
     log.stage.store(stage_code(stage), Ordering::Relaxed);
     log.retry_armed
         .store(st.retry.forced(now), Ordering::Relaxed);
+    if !overloaded {
+        log.keep_forced_detail();
+    }
     log.forced.fetch_add(1, Ordering::Release);
 }
 
@@ -977,6 +980,40 @@ mod tests {
         shared.stop.store(true, Ordering::Release);
         shared.wake.set();
         thread.join().unwrap();
+    }
+
+    /// Ruling 24 fix round 1: a retry coming due while a model swap is pending waits; the swap
+    /// turns devocal on again itself, and the retry is then dropped without spending the
+    /// budget. The forced fallback keeps the detail of the underrun that forced it.
+    #[test]
+    fn a_retry_due_during_a_pending_swap_is_left_to_the_swap() {
+        use super::super::StarvationDetail;
+        use crate::separator::DelayOnly;
+        let (mut ctx, mut st) = ctx_for(Processor::new(Some(Box::new(DelayOnly::new(HOP)))));
+        apply_command(&mut ctx, &mut st, ProcCommand::SetDevocal(true));
+        let t = 10_000_000;
+        ctx.shared.fallback_log.set_detail(StarvationDetail {
+            shortfall: 58,
+            ..StarvationDetail::default()
+        });
+        force_overload(&mut ctx, &mut st, false, t);
+        assert_eq!(ctx.shared.fallback_log.forced_detail().shortfall, 58);
+        assert_eq!(ctx.processor.stage(), Stage::Fallback);
+        st.pending = Some(Box::new(DelayOnly::new(HOP)));
+        let due = t + OVERLOAD_RETRY_DELAY_US;
+        assert!(!retry_overload(&mut ctx, &mut st, due));
+        assert!(st.retry.pending(), "still scheduled");
+        assert_eq!(ctx.processor.stage(), Stage::Fallback);
+        assert!(try_swap(&mut ctx, &mut st));
+        assert_eq!(
+            ctx.processor.stage(),
+            Stage::WarmingUp,
+            "the swap turned devocal on again"
+        );
+        assert!(!retry_overload(&mut ctx, &mut st, due + 1));
+        assert!(!st.retry.pending(), "dropped");
+        assert_eq!(ctx.shared.fallback_log.retries.load(Ordering::Acquire), 0);
+        assert!(st.retry.forced(due + 2), "budget unspent");
     }
 
     #[test]

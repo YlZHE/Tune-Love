@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "mirrors": ["https://ghfast.top/", "https://ghproxy.net/", "https://ghproxy.vip/"],
+  "models": [
+    {
+      "id": "stemgenrt-hop128",
+      "name": "StemgenRT（低延迟）",
+      "tier": "realtime",
+      "files": [
+        {
+          "file": "model.onnx",
+          "bytes": 37529132,
+          "sha256": "77164d6a581fafb2a31f53fd8ffde44c07cf618472952a4cdba14e68dda3b8b9",
+          "origin": "https://github.com/sweetspotsoundsystem/stemgen-rt/raw/61df8f4aa1555ef110308d01ea92b54ace770979/model/model.onnx",
+          "mirrorable": true
+        }
+      ],
+      "sampleRate": 44100,
+      "latencyMs": 5.8,
+      "runtime": "cpu",
+      "license": { "code": "MIT", "weights": "pending", "trainingData": ["MUSDB18-HQ（仅教育用途）", "MoisesDB（CC BY-NC-SA 4.0）"] },
+      "source": "https://github.com/sweetspotsoundsystem/stemgen-rt"
+    }
+  ]
+}

@@ -10,6 +10,7 @@
 
 pub mod gate;
 pub mod link;
+pub mod model;
 pub mod supervisor;
 
 use std::ffi::OsString;

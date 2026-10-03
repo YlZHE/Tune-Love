@@ -11,8 +11,12 @@
 //! counted per gap if input kept flowing (`UnderrunJudge`). Ruling 18: an underrun while the
 //! processing thread was not behind is jitter and raises the target by one hop (at most one
 //! capture packet in total); when a user "on" is accepted the output pre-rolls once by about
-//! one capture packet of silence. A queue more than 20 ms over target for a whole second is trimmed back (fade
-//! out, skip, fade in). Output gain is ramped across each write; every sample is clamped to
+//! one capture packet of silence. Both are released again (O1, [`Headroom`]): the pre-roll
+//! once the model has warmed up, the jitter part after 5 s without an underrun (backing off
+//! up to 60 s while jitter keeps returning); the released audio is skipped at a quiet spot
+//! (at most 1 s later), and not at all if nothing extra is queued (paused). A queue more
+//! than 20 ms over target for a whole second is trimmed back. Both skips fade out, skip and
+//! fade in. Output gain is ramped across each write; every sample is clamped to
 //! [-1, 1] (non-finite -> 0) before it reaches the device.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +43,7 @@ use super::{
     PREROLL_FRAMES,
 };
 use crate::dsp::{fade_edges, frames_for_ms, SAMPLE_RATE};
+use crate::processor::Stage;
 
 /// Trim only when the queue exceeds the target by more than this...
 pub const TRIM_MARGIN_MS: f32 = 20.0;
@@ -167,11 +172,155 @@ pub fn grow_headroom(extra: usize, hop: usize, cap: usize) -> usize {
     (extra + hop).min(cap)
 }
 
+/// Jitter headroom is released after this long without a counted underrun (design: 5 s).
+pub const HEADROOM_DECAY_US: u64 = 5_000_000;
+/// Cap of the quiet-period backoff, and how long after a decay a new underrun still counts
+/// as the jitter returning (which doubles the quiet period).
+pub const HEADROOM_DECAY_MAX_US: u64 = 60_000_000;
+/// A pre-roll is kept at least this long when no model stage has been seen yet: the
+/// processing thread sets the request before it publishes `WarmingUp` (Review Focus 4).
+pub const PREROLL_GRACE_US: u64 = 200_000;
+/// A released headroom is skipped at a quiet spot, but waits at most this long for one.
+pub const LOW_ENERGY_WAIT_US: u64 = 1_000_000;
+/// A quiet spot: the frames to fade and skip have an RMS at most this fraction (-6 dB) of
+/// the recent output RMS.
+pub const LOW_ENERGY_RATIO: f32 = 0.5;
+/// Time constant of the recent output power average, in frames (100 ms).
+const RECENT_POWER_FRAMES: f64 = 4_410.0;
+
+/// Render headroom on top of period + hop: jitter growth (ruling 18) plus the pre-roll of an
+/// accepted "on", together at most the cap. Both are released again (O1): the pre-roll once
+/// the model has warmed up, the jitter part after a quiet period without underruns that
+/// backs off while jitter keeps returning. Pure; times in microseconds.
+pub struct Headroom {
+    jitter: usize,
+    preroll: usize,
+    preroll_at_us: u64,
+    /// A model warm-up stage (`WarmingUp` / `FadingIn`) was seen since the pre-roll began.
+    preroll_model_seen: bool,
+    /// The quiet period runs from here: the last counted underrun (which is also the last
+    /// growth; after a decay there is nothing left to release until the next underrun).
+    last_underrun_us: u64,
+    quiet_needed_us: u64,
+    last_decay_us: Option<u64>,
+}
+
+impl Headroom {
+    pub fn new() -> Self {
+        Self {
+            jitter: 0,
+            preroll: 0,
+            preroll_at_us: 0,
+            preroll_model_seen: false,
+            last_underrun_us: 0,
+            quiet_needed_us: HEADROOM_DECAY_US,
+            last_decay_us: None,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Jitter plus pre-roll headroom in frames (never above the cap passed in).
+    pub fn total(&self) -> usize {
+        self.jitter + self.preroll
+    }
+
+    /// A counted underrun at `now_us`; `jitter` when the processing thread was not behind,
+    /// which grows the jitter part by `hop` (total at most `cap`). Every underrun restarts
+    /// the quiet period; one within [`HEADROOM_DECAY_MAX_US`] of the last decay doubles it
+    /// (up to that cap), otherwise it is back to [`HEADROOM_DECAY_US`].
+    pub fn on_underrun(&mut self, jitter: bool, hop: usize, cap: usize, now_us: u64) {
+        self.last_underrun_us = now_us;
+        self.quiet_needed_us = match self.last_decay_us {
+            Some(d) if now_us.saturating_sub(d) < HEADROOM_DECAY_MAX_US => self
+                .quiet_needed_us
+                .saturating_mul(2)
+                .min(HEADROOM_DECAY_MAX_US),
+            _ => HEADROOM_DECAY_US,
+        };
+        if jitter {
+            self.jitter = grow_headroom(self.jitter, hop, cap.saturating_sub(self.preroll));
+        }
+    }
+
+    /// A pre-roll of `frames` began at `now_us` (sized by [`preroll_frames`] within the cap).
+    pub fn add_preroll(&mut self, frames: usize, now_us: u64) {
+        if frames == 0 {
+            return;
+        }
+        self.preroll += frames;
+        self.preroll_at_us = now_us;
+        self.preroll_model_seen = false;
+    }
+
+    /// Releases what is no longer needed, given the processor's `stage`; returns the frames
+    /// released. The pre-roll is held while the model warms up (`WarmingUp`, `FadingIn`)
+    /// and released at any other stage once a warm-up stage was seen or
+    /// [`PREROLL_GRACE_US`] has passed. The jitter part is released whole once the quiet
+    /// period has passed without an underrun.
+    pub fn release(&mut self, stage: Stage, now_us: u64) -> usize {
+        let mut freed = 0;
+        if self.preroll > 0 {
+            if matches!(stage, Stage::WarmingUp | Stage::FadingIn) {
+                self.preroll_model_seen = true;
+            } else if self.preroll_model_seen
+                || now_us.saturating_sub(self.preroll_at_us) >= PREROLL_GRACE_US
+            {
+                freed += self.preroll;
+                self.preroll = 0;
+                self.preroll_model_seen = false;
+            }
+        }
+        if self.jitter > 0 && now_us.saturating_sub(self.last_underrun_us) >= self.quiet_needed_us {
+            freed += self.jitter;
+            self.jitter = 0;
+            self.last_decay_us = Some(now_us);
+        }
+        freed
+    }
+}
+
+/// Skip a released headroom now: the frames involved are quiet (RMS at most
+/// [`LOW_ENERGY_RATIO`] of the recent output RMS), or it has waited [`LOW_ENERGY_WAIT_US`].
+pub fn decay_now(window_rms: f32, recent_rms: f32, waited_us: u64) -> bool {
+    window_rms <= LOW_ENERGY_RATIO * recent_rms || waited_us >= LOW_ENERGY_WAIT_US
+}
+
+/// Mean square of interleaved samples split across two slices (a ring chunk); 0 if empty.
+fn mean_square(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len() + b.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let sum: f64 = a
+        .iter()
+        .chain(b)
+        .map(|&s| f64::from(s) * f64::from(s))
+        .sum();
+    sum / n as f64
+}
+
+/// Updates the exponential average of the per-frame mean square (time constant
+/// [`RECENT_POWER_FRAMES`]) with `frames` (interleaved stereo); non-finite frames are skipped.
+pub(crate) fn track_power(ms: f64, frames: &[f32]) -> f64 {
+    let alpha = 1.0 / RECENT_POWER_FRAMES;
+    frames.chunks_exact(2).fold(ms, |m, f| {
+        let p = (f64::from(f[0]) * f64::from(f[0]) + f64::from(f[1]) * f64::from(f[1])) / 2.0;
+        if p.is_finite() {
+            m + (p - m) * alpha
+        } else {
+            m
+        }
+    })
+}
+
 /// Pre-roll size for an accepted "on" (0 = none). Never stacks: nothing while a pre-roll is
 /// still being written, nothing when the queue (ring B + device) already holds target + hop,
 /// and never more than the headroom left below `cap`: the pre-roll is counted inside the
-/// headroom (`extra`), so the target rises with it and the standing latency stays within
-/// period + hop + `cap`.
+/// headroom (`extra` = [`Headroom::total`]), so the target rises with it and the standing
+/// latency stays within period + hop + `cap`.
 pub fn preroll_frames(
     active: bool,
     queued: usize,
@@ -583,8 +732,15 @@ struct Renderer {
     /// Fed without a shortfall since the last gap; a starvation is judged only when primed.
     primed: bool,
     underruns: UnderrunJudge,
-    /// Jitter headroom on top of period + hop (ruling 18).
-    extra: usize,
+    /// Jitter and pre-roll headroom on top of period + hop (ruling 18, O1).
+    headroom: Headroom,
+    /// Released headroom still queued, to be skipped at a quiet spot; since when.
+    decay_drop: usize,
+    decay_since_us: u64,
+    /// The pending `drop_pending` is a headroom decay (counted as `render_decay_frames`).
+    drop_is_decay: bool,
+    /// Exponential average of the mean square of the real frames written (`track_power`).
+    recent_ms: f64,
     /// Pre-roll silence still to write, and whether its leading fade-out is still to do.
     preroll_left: usize,
     preroll_fade: bool,
@@ -608,7 +764,11 @@ impl Renderer {
             drop_pending: 0,
             primed: false,
             underruns: UnderrunJudge::new(),
-            extra: 0,
+            headroom: Headroom::new(),
+            decay_drop: 0,
+            decay_since_us: 0,
+            drop_is_decay: false,
+            recent_ms: 0.0,
             preroll_left: 0,
             preroll_fade: false,
             last_frame: [0.0; 2],
@@ -670,8 +830,9 @@ impl Renderer {
     /// underruns and a forced fallback. The request persists until a sink consumes it in
     /// `fill`, so it also survives a failed rebind (no sink, `fill` not called) and is
     /// consumed by the next stream that opens. Consumed, it starts one non-stacking pre-roll
-    /// that is added to `extra`: a standing headroom of at most `MAX_EXTRA_HEADROOM_FRAMES`
-    /// that lasts until the next open resets `extra` here.
+    /// that is added to the headroom (at most `MAX_EXTRA_HEADROOM_FRAMES` with the jitter
+    /// part) and released once the model has warmed up ([`Headroom::release`]); an open
+    /// resets the headroom here.
     fn after_open(&mut self) {
         self.discard_all();
         if let Some(s) = &self.sink {
@@ -692,9 +853,13 @@ impl Renderer {
         self.drop_pending = 0;
         self.primed = false;
         self.underruns.reset();
-        // A new stream starts without learned headroom (which includes any earlier pre-roll)
-        // and without a pre-roll in progress; a pending request is kept (see above).
-        self.extra = 0;
+        // A new stream starts without learned headroom (which includes any earlier pre-roll),
+        // without a pre-roll in progress and without a pending decay; a pending request is
+        // kept (see above).
+        self.headroom.reset();
+        self.decay_drop = 0;
+        self.drop_is_decay = false;
+        self.recent_ms = 0.0;
         self.ctx.stats.headroom_frames.store(0, Ordering::Relaxed);
         self.preroll_left = 0;
         self.preroll_fade = false;
@@ -735,7 +900,21 @@ impl Renderer {
         }
         self.fade_in.apply(dst);
         self.gaps.apply(&mut self.ctx.markers, self.read_pos, dst);
+        self.recent_ms = track_power(self.recent_ms, &self.staging[at * 2..(at + n) * 2]);
         self.read_pos += n as u64;
+    }
+
+    /// RMS of the next `n` frames in ring B, read without consuming them (0 if empty or if
+    /// fewer than `n` frames are queued).
+    fn peek_rms(&mut self, n: usize) -> f32 {
+        match self.ctx.input.read_chunk(n * 2) {
+            // Dropped without a commit: the slots stay in the ring.
+            Ok(chunk) => {
+                let (a, b) = chunk.as_slices();
+                mean_square(a, b).sqrt() as f32
+            }
+            Err(_) => 0.0,
+        }
     }
 
     fn skip(&mut self, n: usize) {
@@ -748,12 +927,20 @@ impl Renderer {
         self.read_pos += n as u64;
     }
 
-    /// One wake: returns the device padding after the write.
+    /// One wake: waits for the device event, then [`Self::fill_at`] the current time.
     fn fill(&mut self) -> Result<usize, String> {
         let Some(sink) = self.sink.as_ref() else {
             return Ok(0);
         };
         sink.wait(WAIT_MS);
+        self.fill_at(now_us())
+    }
+
+    /// Fills the device at `now` (microseconds); returns the device padding after the write.
+    fn fill_at(&mut self, now: u64) -> Result<usize, String> {
+        let Some(sink) = self.sink.as_ref() else {
+            return Ok(0);
+        };
         self.ctx
             .stats
             .diag
@@ -763,7 +950,6 @@ impl Renderer {
         let period = sink.period_frames();
         let buffer = sink.buffer_frames().min(self.staging.len() / 2);
         let hop = self.ctx.shared.proc_hop.load(Ordering::Relaxed) as usize;
-        let now = now_us();
         let last_input = self.ctx.shared.last_input_us.load(Ordering::Acquire);
         if let Some(seen) = self.underruns.poll(last_input, now) {
             // Snapshot first, then the count (the processing thread reads them in that order).
@@ -772,52 +958,60 @@ impl Renderer {
                 .underrun_snapshot
                 .store(pack_starvation(seen), Ordering::Release);
             self.ctx.stats.underruns.fetch_add(1, Ordering::AcqRel);
-            if !is_backlogged(seen.ran_model, seen.backlog_frames, hop) {
-                // Jitter, not a slow model: more headroom instead of a fallback.
-                self.extra = grow_headroom(self.extra, hop, MAX_EXTRA_HEADROOM_FRAMES);
-                self.ctx
-                    .stats
-                    .headroom_frames
-                    .store(self.extra as u32, Ordering::Relaxed);
-            }
+            // Jitter (not a slow model) grows the headroom instead of a fallback; any counted
+            // underrun restarts the quiet period before the headroom decays.
+            let jitter = !is_backlogged(seen.ran_model, seen.backlog_frames, hop);
+            self.headroom
+                .on_underrun(jitter, hop, MAX_EXTRA_HEADROOM_FRAMES, now);
         }
         let mut avail = self.ctx.input.slots() / 2;
         // Pre-roll request from an accepted "on". It stays set until a fill with a sink
         // consumes it here (also across a failed rebind). Consuming it may start no pre-roll
         // (`preroll_frames` returns 0 while one is in progress, when the queue is already
-        // deep, or at the cap). A started pre-roll is added to `extra`, so the target
-        // includes it and it remains as standing headroom (`extra` <= `MAX_EXTRA_HEADROOM_FRAMES`)
-        // until the next `after_open`.
+        // deep, or at the cap). A started pre-roll is added to the headroom, so the target
+        // includes it until `Headroom::release` lets it go after the model's warm-up.
         if self
             .ctx
             .shared
             .preroll_request
             .swap(false, Ordering::AcqRel)
         {
-            let base = (period + hop + self.extra).min(buffer);
+            let extra = self.headroom.total();
+            let base = (period + hop + extra).min(buffer);
             let n = preroll_frames(
                 self.preroll_left > 0,
                 avail + padding,
                 base,
                 hop,
-                self.extra,
+                extra,
                 MAX_EXTRA_HEADROOM_FRAMES,
             );
             if n > 0 {
                 self.preroll_left = n;
                 self.preroll_fade = true;
-                self.extra += n;
-                self.ctx
-                    .stats
-                    .headroom_frames
-                    .store(self.extra as u32, Ordering::Relaxed);
+                self.headroom.add_preroll(n, now);
             }
         }
-        let target = (period + hop + self.extra).min(buffer);
+        // O1: headroom no longer needed leaves the target now; the audio it holds is skipped
+        // below at a quiet spot.
+        let stage = stage_from_code(self.ctx.stats.stage.load(Ordering::Acquire));
+        let freed = self.headroom.release(stage, now);
+        if freed > 0 {
+            if self.decay_drop == 0 {
+                self.decay_since_us = now;
+            }
+            self.decay_drop += freed;
+        }
+        self.ctx
+            .stats
+            .headroom_frames
+            .store(self.headroom.total() as u32, Ordering::Relaxed);
+        let target = (period + hop + self.headroom.total()).min(buffer);
         self.trim.set_target(target);
 
         if let Some(d) = self.trim.observe(avail + padding, now) {
             self.drop_pending = d;
+            self.drop_is_decay = false;
         }
         let room = buffer.saturating_sub(padding);
         let need = target.saturating_sub(padding).min(room);
@@ -853,6 +1047,28 @@ impl Renderer {
             return self.write_out(need, padding);
         }
 
+        if self.decay_drop > 0 && self.drop_pending == 0 {
+            // O1: the released headroom is what is queued beyond the target now.
+            let spare = (padding + avail).saturating_sub(target);
+            if spare == 0 {
+                // Nothing extra is queued (player paused): nothing to skip.
+                self.decay_drop = 0;
+            } else {
+                let window =
+                    self.peek_rms((self.fade_frames + self.decay_drop.min(spare)).min(avail));
+                let recent = self.recent_ms.sqrt() as f32;
+                let waited = now.saturating_sub(self.decay_since_us);
+                if decay_now(window, recent, waited) {
+                    self.drop_pending = self
+                        .decay_drop
+                        .min(spare)
+                        .min(avail.saturating_sub(self.fade_frames));
+                    self.drop_is_decay = self.drop_pending > 0;
+                    self.decay_drop = 0;
+                }
+            }
+        }
+
         let mut w = 0;
         if self.drop_pending > 0 && avail > 0 {
             // Trim: fade out what plays next, skip the excess, fade the rest in.
@@ -861,14 +1077,17 @@ impl Renderer {
             fade_edges(&mut self.staging[..k * 2], false, true, k);
             avail -= k;
             let d = self.drop_pending.min(avail);
-            self.ctx
-                .stats
-                .diag
-                .render_trim_frames
-                .fetch_add(d as u64, Ordering::Relaxed);
+            let diag = &self.ctx.stats.diag;
+            let counter = if self.drop_is_decay {
+                &diag.render_decay_frames
+            } else {
+                &diag.render_trim_frames
+            };
+            counter.fetch_add(d as u64, Ordering::Relaxed);
             self.skip(d);
             avail -= d;
             self.drop_pending = 0;
+            self.drop_is_decay = false;
             self.fade_in.start(0);
             w = k;
         }
@@ -975,10 +1194,24 @@ fn latency_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtrb::RingBuffer;
+    use rtrb::{Producer, RingBuffer};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
 
+    /// A 441-frame-period, 4 410-frame-buffer device. The test can drain `padding` (device
+    /// playback) and read every written sample in `out`.
     struct FakeSink {
-        padding: usize,
+        padding: Arc<AtomicUsize>,
+        out: Arc<Mutex<Vec<f32>>>,
+    }
+
+    impl FakeSink {
+        fn new(padding: usize) -> Self {
+            Self {
+                padding: Arc::new(AtomicUsize::new(padding)),
+                out: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     impl Sink for FakeSink {
@@ -989,11 +1222,12 @@ mod tests {
             4_410
         }
         fn padding(&self) -> Result<usize, String> {
-            Ok(self.padding)
+            Ok(self.padding.load(Ordering::Relaxed))
         }
         fn wait(&self, _timeout_ms: u32) {}
         fn write(&mut self, stereo: &[f32]) -> Result<(), String> {
-            self.padding += stereo.len() / 2;
+            self.padding.fetch_add(stereo.len() / 2, Ordering::Relaxed);
+            self.out.lock().unwrap().extend_from_slice(stereo);
             Ok(())
         }
         fn describe(&self) -> &'static str {
@@ -1001,11 +1235,12 @@ mod tests {
         }
     }
 
-    /// A renderer on rings only (no devices); `sink` as given. Returns the shared state.
-    fn test_renderer(sink: Option<FakeSink>) -> (Renderer, Arc<Shared>) {
+    /// A renderer on rings only (no devices); `sink` as given. Returns the shared state and
+    /// ring B's producer.
+    fn test_renderer(sink: Option<FakeSink>) -> (Renderer, Arc<Shared>, Producer<f32>) {
         use crate::audio::{AudioStats, OwnedEvent, SharedGains};
-        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
-        let (_in_tx, in_rx) = RingBuffer::<f32>::new(8_192);
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        let (in_tx, in_rx) = RingBuffer::<f32>::new(8_192);
         let (_mk_tx, mk_rx) = RingBuffer::<u64>::new(8);
         let (_ctl_tx, ctl_rx) = RingBuffer::<RenderCommand>::new(8);
         let shared = Arc::new(Shared {
@@ -1034,7 +1269,7 @@ mod tests {
         if let Some(s) = sink {
             r.sink = Some(Box::new(s));
         }
-        (r, shared)
+        (r, shared, in_tx)
     }
 
     #[test]
@@ -1053,9 +1288,14 @@ mod tests {
     /// `ready` and its first `after_open`; opening must not wipe the request.
     #[test]
     fn after_open_keeps_a_pending_preroll_request() {
-        let (mut r, shared) = test_renderer(None);
-        // Per-stream state left by an earlier stream: headroom and a pre-roll in progress.
-        r.extra = MAX_EXTRA_HEADROOM_FRAMES;
+        let (mut r, shared, _tx) = test_renderer(None);
+        // Per-stream state left by an earlier stream: headroom, a pre-roll in progress and a
+        // pending decay.
+        r.headroom
+            .on_underrun(true, 300, MAX_EXTRA_HEADROOM_FRAMES, 1);
+        r.headroom.add_preroll(MAX_EXTRA_HEADROOM_FRAMES - 300, 2);
+        assert_eq!(r.headroom.total(), MAX_EXTRA_HEADROOM_FRAMES);
+        r.decay_drop = 128;
         r.preroll_left = PREROLL_FRAMES;
         r.preroll_fade = true;
         r.ctx
@@ -1066,19 +1306,288 @@ mod tests {
         r.after_open();
         assert!(shared.preroll_request.load(Ordering::Acquire));
         // Still resets the per-stream state.
-        assert_eq!((r.extra, r.preroll_left, r.preroll_fade), (0, 0, false));
+        assert_eq!(
+            (
+                r.headroom.total(),
+                r.decay_drop,
+                r.preroll_left,
+                r.preroll_fade
+            ),
+            (0, 0, 0, false)
+        );
         assert_eq!(r.ctx.stats.headroom_frames.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn a_request_kept_through_after_open_is_consumed_by_the_next_fill() {
-        let (mut r, shared) = test_renderer(Some(FakeSink { padding: 0 }));
+        let (mut r, shared, _tx) = test_renderer(Some(FakeSink::new(0)));
         shared.preroll_request.store(true, Ordering::Release);
         r.after_open();
         assert!(r.fill().is_ok());
         assert!(!shared.preroll_request.load(Ordering::Acquire), "consumed");
         // A full capture packet of pre-roll, counted inside the headroom.
-        assert_eq!(r.extra, PREROLL_FRAMES);
+        assert_eq!(r.headroom.total(), PREROLL_FRAMES);
+        assert_eq!(
+            r.ctx.stats.headroom_frames.load(Ordering::Relaxed),
+            PREROLL_FRAMES as u32
+        );
+    }
+
+    const MS: u64 = 1_000;
+    const SEC: u64 = 1_000_000;
+
+    #[test]
+    fn preroll_headroom_lasts_only_while_the_model_warms() {
+        let t = 10 * SEC;
+        let mut h = Headroom::new();
+        h.add_preroll(441, t);
+        assert_eq!(h.total(), 441);
+        assert_eq!(h.release(Stage::WarmingUp, t + MS), 0);
+        assert_eq!(h.release(Stage::FadingIn, t + 100 * MS), 0);
+        assert_eq!(h.release(Stage::Devocal, t + 300 * MS), 441);
+        assert_eq!(h.total(), 0);
+    }
+
+    /// Review Focus 4: the request can reach the renderer before the processor publishes
+    /// `WarmingUp`; the pre-roll must survive that.
+    #[test]
+    fn preroll_kept_until_model_stage_seen_or_grace() {
+        let t = 10 * SEC;
+        let mut h = Headroom::new();
+        h.add_preroll(441, t);
+        assert_eq!(h.release(Stage::Passthrough, t + MS), 0);
+        assert_eq!(h.release(Stage::Passthrough, t + 199 * MS), 0);
+        assert_eq!(h.release(Stage::Passthrough, t + 200 * MS), 441);
+        assert_eq!(h.total(), 0);
+    }
+
+    #[test]
+    fn jitter_headroom_decays_after_5s_without_underrun() {
+        let t = 10 * SEC;
+        let cap = MAX_EXTRA_HEADROOM_FRAMES;
+        let mut h = Headroom::new();
+        h.on_underrun(true, 128, cap, t);
+        h.on_underrun(true, 128, cap, t + MS);
+        assert_eq!(h.total(), 256);
+        assert_eq!(h.release(Stage::Passthrough, t + MS + 4_999 * MS), 0);
+        assert_eq!(h.release(Stage::Devocal, t + MS + 5 * SEC), 256);
+        assert_eq!(h.total(), 0);
+    }
+
+    #[test]
+    fn any_underrun_restarts_the_quiet_timer() {
+        let t = 10 * SEC;
+        let cap = MAX_EXTRA_HEADROOM_FRAMES;
+        let mut h = Headroom::new();
+        h.on_underrun(true, 128, cap, t);
+        // A backlogged (not jitter) underrun: no growth, but the output was not quiet.
+        h.on_underrun(false, 128, cap, t + 3 * SEC);
+        assert_eq!(h.total(), 128);
+        assert_eq!(h.release(Stage::Devocal, t + 5 * SEC), 0);
+        assert_eq!(h.release(Stage::Devocal, t + 8 * SEC), 128);
+    }
+
+    #[test]
+    fn jitter_regrows_after_decay_up_to_the_cap() {
+        let t = 10 * SEC;
+        let cap = MAX_EXTRA_HEADROOM_FRAMES;
+        let mut h = Headroom::new();
+        h.on_underrun(true, 128, cap, t);
+        assert_eq!(h.release(Stage::Devocal, t + 5 * SEC), 128);
+        let mut steps = Vec::new();
+        for i in 1..=4 {
+            h.on_underrun(true, 128, cap, t + 5 * SEC + i * MS);
+            steps.push(h.total());
+        }
+        assert_eq!(steps, vec![128, 256, 384, 441]);
+        // A pre-roll and the jitter share the cap.
+        let mut h = Headroom::new();
+        h.add_preroll(300, t);
+        h.on_underrun(true, 128, cap, t + MS);
+        h.on_underrun(true, 128, cap, t + 2 * MS);
+        assert_eq!(h.total(), cap);
+    }
+
+    /// Review Focus 5: jitter that keeps coming back must not cost a skip every 5 s.
+    #[test]
+    fn decay_backs_off_when_jitter_returns() {
+        let cap = MAX_EXTRA_HEADROOM_FRAMES;
+        let mut h = Headroom::new();
+        let t0 = 10 * SEC;
+        h.on_underrun(true, 128, cap, t0);
+        let t = t0 + 5 * SEC;
+        assert_eq!(h.release(Stage::Devocal, t), 128, "first decay after 5 s");
+        // Jitter again 2 s after the decay: 10 s of quiet needed.
+        h.on_underrun(true, 128, cap, t + 2 * SEC);
+        assert_eq!(h.release(Stage::Devocal, t + 2 * SEC + 9_999 * MS), 0);
+        assert_eq!(h.release(Stage::Devocal, t + 12 * SEC), 128);
+        // Again 1 s after that decay: 20 s.
+        h.on_underrun(true, 128, cap, t + 13 * SEC);
+        assert_eq!(h.release(Stage::Devocal, t + 13 * SEC + 19_999 * MS), 0);
+        assert_eq!(h.release(Stage::Devocal, t + 33 * SEC), 128);
+        // 40 s, then never more than 60 s however often it returns.
+        h.on_underrun(true, 128, cap, t + 34 * SEC);
+        assert_eq!(h.release(Stage::Devocal, t + 34 * SEC + 39_999 * MS), 0);
+        assert_eq!(h.release(Stage::Devocal, t + 74 * SEC), 128);
+        let mut last = t + 74 * SEC;
+        for _ in 0..3 {
+            h.on_underrun(true, 128, cap, last + SEC);
+            assert_eq!(h.release(Stage::Devocal, last + SEC + 59_999 * MS), 0);
+            assert_eq!(h.release(Stage::Devocal, last + 61 * SEC), 128);
+            last += 61 * SEC;
+        }
+        // An underrun 60 s or more after the last decay starts over at 5 s.
+        let u = last + HEADROOM_DECAY_MAX_US;
+        h.on_underrun(true, 128, cap, u);
+        assert_eq!(h.release(Stage::Devocal, u + 4_999 * MS), 0);
+        assert_eq!(h.release(Stage::Devocal, u + 5 * SEC), 128);
+    }
+
+    #[test]
+    fn decay_waits_for_a_quiet_spot_at_most_1s() {
+        assert!(decay_now(0.4, 1.0, 0));
+        assert!(decay_now(0.5, 1.0, 0), "-6 dB is quiet enough");
+        assert!(!decay_now(0.6, 1.0, 999_999));
+        assert!(decay_now(0.6, 1.0, 1_000_000));
+        assert!(decay_now(0.0, 0.0, 0), "silence");
+    }
+
+    #[test]
+    fn peeking_ring_b_does_not_consume() {
+        let (mut r, _shared, mut tx) = test_renderer(None);
+        for i in 0..20 {
+            tx.push(if i % 2 == 0 { 0.6 } else { 0.8 }).unwrap();
+        }
+        let before = r.ctx.input.slots();
+        // Plain rtrb: a chunk dropped without a commit leaves the slots in place.
+        {
+            let chunk = r.ctx.input.read_chunk(12).unwrap();
+            assert_eq!(chunk.len(), 12);
+        }
+        assert_eq!(r.ctx.input.slots(), before);
+        // RMS of (0.6, 0.8) frames: sqrt((0.36 + 0.64) / 2).
+        let rms = r.peek_rms(6);
+        assert!((rms - 0.5f32.sqrt()).abs() < 1e-6, "{rms}");
+        assert_eq!(r.ctx.input.slots(), before);
+        assert_eq!(r.peek_rms(0), 0.0);
+    }
+
+    /// Ring B gets 441 frames of 0.5 per 10 ms until `feed_until_us`; the device plays one
+    /// 441-frame period every 10 ms; `fill_at` runs every 1 ms from `t0` for `ms` ms.
+    /// Calls `each(r, now, first)` after every fill, `first` being the index in `out` of
+    /// the first sample that fill wrote.
+    #[allow(clippy::too_many_arguments)]
+    fn simulate(
+        r: &mut Renderer,
+        tx: &mut Producer<f32>,
+        padding: &AtomicUsize,
+        out: &Mutex<Vec<f32>>,
+        t0: u64,
+        ms: u64,
+        feed_until_us: u64,
+        mut each: impl FnMut(&mut Renderer, u64, usize),
+    ) {
+        for i in 0..ms {
+            let now = t0 + i * MS;
+            if now < feed_until_us {
+                let frames = (i + 1) * 441 / 10 - i * 441 / 10;
+                for _ in 0..frames * 2 {
+                    tx.push(0.5).unwrap();
+                }
+            }
+            if i > 0 && i % 10 == 0 {
+                let p = padding.load(Ordering::Relaxed);
+                padding.store(p.saturating_sub(441), Ordering::Relaxed);
+            }
+            let first = out.lock().unwrap().len();
+            r.fill_at(now).unwrap();
+            each(r, now, first);
+        }
+    }
+
+    fn decay_frames(r: &Renderer) -> u64 {
+        r.ctx.stats.diag.render_decay_frames.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn decay_trims_the_released_headroom_with_fades() {
+        let sink = FakeSink::new(0);
+        let (padding, out) = (sink.padding.clone(), sink.out.clone());
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        let t0 = 10 * SEC;
+        let cap = MAX_EXTRA_HEADROOM_FRAMES;
+        r.headroom.on_underrun(true, cap, cap, t0);
+        assert_eq!(r.headroom.total(), 441);
+        let fade = r.fade_frames;
+        let mut decayed_at = None;
+        simulate(
+            &mut r,
+            &mut tx,
+            &padding,
+            &out,
+            t0,
+            6_500,
+            u64::MAX,
+            |r, now, first| {
+                let d = decay_frames(r);
+                if now < t0 + 5 * SEC {
+                    assert_eq!(d, 0, "no decay before 5 s ({now})");
+                }
+                if d > 0 && decayed_at.is_none() {
+                    decayed_at = Some(now);
+                    // Fade out into the skip: the last frame before it is silent.
+                    let o = out.lock().unwrap();
+                    let block = &o[first..];
+                    assert!(block.len() / 2 >= fade, "{}", block.len());
+                    assert!(block[0] > 0.4, "starts at full level: {}", block[0]);
+                    assert_eq!(block[(fade - 1) * 2], 0.0);
+                    assert_eq!(block[(fade - 1) * 2 + 1], 0.0);
+                }
+            },
+        );
+        let at = decayed_at.expect("the released headroom was trimmed");
+        assert!(
+            at.abs_diff(t0 + 6 * SEC) <= 20 * MS,
+            "forced after a 1 s wait: {} ms",
+            (at - t0) / MS
+        );
+        let d = decay_frames(&r);
+        assert!(d > 0 && d <= 441, "{d}");
+        assert_eq!(
+            r.ctx.stats.diag.render_trim_frames.load(Ordering::Relaxed),
+            0,
+            "not counted as a trim"
+        );
+        assert_eq!(r.headroom.total(), 0);
+        assert_eq!(r.ctx.stats.headroom_frames.load(Ordering::Relaxed), 0);
+    }
+
+    /// Review Focus 5: with the player paused nothing is queued beyond the target, so the
+    /// released headroom costs no content.
+    #[test]
+    fn decay_during_pause_drops_nothing() {
+        let sink = FakeSink::new(0);
+        let (padding, out) = (sink.padding.clone(), sink.out.clone());
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        let t0 = 10 * SEC;
+        let cap = MAX_EXTRA_HEADROOM_FRAMES;
+        r.headroom.on_underrun(true, cap, cap, t0);
+        simulate(
+            &mut r,
+            &mut tx,
+            &padding,
+            &out,
+            t0,
+            6_000,
+            t0 + 100 * MS,
+            |_, _, _| {},
+        );
+        assert_eq!(decay_frames(&r), 0);
+        assert_eq!(r.headroom.total(), 0);
+        assert_eq!(r.decay_drop, 0, "cancelled");
+        assert_eq!(r.ctx.stats.headroom_frames.load(Ordering::Relaxed), 0);
     }
 
     #[test]

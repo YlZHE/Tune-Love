@@ -106,8 +106,9 @@ pub struct AudioStats {
     pub stage: AtomicU8,
     /// Processor fallback reason ([`reason_code`]: 0 none, 1 Overload, 2 ModelError).
     pub fallback_reason: AtomicU8,
-    /// Extra render headroom in frames added after jitter underruns (on top of
-    /// one period + one hop; at most [`MAX_EXTRA_HEADROOM_FRAMES`]).
+    /// Extra render headroom in frames (on top of one period + one hop; at most
+    /// [`MAX_EXTRA_HEADROOM_FRAMES`]): jitter growth plus a pre-roll, as
+    /// `render::Headroom::total`; both decay again (O1).
     pub headroom_frames: AtomicU32,
     /// A thread ended without being stopped (error or panic). `capture_failed` also covers
     /// process loopback errors; render device errors are `AudioHandle::output_failed`
@@ -136,6 +137,8 @@ pub struct DiagCounters {
     pub render_pad_frames: AtomicU64,
     pub render_trim_frames: AtomicU64,
     pub render_preroll_frames: AtomicU64,
+    /// Ring B frames skipped when released headroom decays (O1); not in `render_trim_frames`.
+    pub render_decay_frames: AtomicU64,
 }
 
 /// Process-wide run counter: tells apart the logs of successive `AudioHandle::start`s.
@@ -217,6 +220,7 @@ pub(crate) fn diag_loop_with(
             &d.render_pad_frames,
             &d.render_trim_frames,
             &d.render_preroll_frames,
+            &d.render_decay_frames,
             &stats.unattenuated_blocks,
             &stats.underruns,
         ]
@@ -237,6 +241,7 @@ pub(crate) fn diag_loop_with(
         "r_pad_fr",
         "r_trim",
         "r_preroll",
+        "r_decay",
         "guard",
         "underruns",
     ];
@@ -250,8 +255,8 @@ pub(crate) fn diag_loop_with(
         "devocal diag: run={run} start t={:.6} unix_ms={unix_ms}",
         last_us as f64 / 1e6
     ));
-    let line = |last: &[u64; 16], now: [u64; 16], t_us: u64, span_us: u64, partial: bool| {
-        let mut fields = [("", 0u64); 16];
+    let line = |last: &[u64; 17], now: [u64; 17], t_us: u64, span_us: u64, partial: bool| {
+        let mut fields = [("", 0u64); 17];
         for (i, f) in fields.iter_mut().enumerate() {
             *f = (names[i], now[i].wrapping_sub(last[i]));
         }
@@ -1117,6 +1122,8 @@ mod tests {
         let mut gaps = render::GapFader::new(edge_fade_frames());
         let (mut mk_tx, mut mk_rx) = RingBuffer::<u64>::new(8);
         let mut trim = render::TrimPolicy::new(1_000);
+        let mut headroom = render::Headroom::new();
+        let mut power = 0.0f64;
         let mut block = vec![0.25f32; 441 * 2];
         let mut loud = vec![3.0f32; 441 * 2];
         let before = alloc_count::this_thread();
@@ -1141,10 +1148,18 @@ mod tests {
             );
             let _ = judge.poll(i + 20, i + 30);
             let _ = render::grow_headroom(i as usize, 128, MAX_EXTRA_HEADROOM_FRAMES);
+            headroom.on_underrun(i % 2 == 0, 128, MAX_EXTRA_HEADROOM_FRAMES, i * 3_000_000);
+            headroom.add_preroll(64, i * 3_000_000 + 1);
+            let _ = headroom.release(Stage::WarmingUp, i * 3_000_000 + 2);
+            let _ = headroom.release(Stage::Devocal, i * 3_000_000 + 2_900_000);
+            let _ = headroom.total();
+            let _ = render::decay_now(0.3, 0.5, i * 100_000);
+            power = render::track_power(power, &block);
             let _ = is_backlogged(true, 128, 128);
             let _ = capture::guard_block(&mut block);
         }
         assert_eq!(alloc_count::this_thread() - before, 0);
+        assert!(power.is_finite());
     }
 
     #[test]

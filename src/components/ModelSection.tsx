@@ -2,9 +2,10 @@ import { useEffect, useState } from "react";
 import { Button, Progress } from "@radix-ui/themes";
 import { useModelDownload, type ModelAction } from "../useModelDownload";
 import {
-  MODEL_MANIFEST, approxSize, formatMiB, modelErrorText, modelTotalBytes, progressPercent, progressText,
-  type ModelInfo, type ModelStatus,
+  MODEL_MANIFEST, approxSize, formatMiB, hasModelConsent, isValidMirrorPrefix, modelErrorText, modelTotalBytes,
+  progressPercent, progressText, readMirrorPrefix, rememberModelConsent, type ModelInfo, type ModelStatus,
 } from "../modelDownload";
+import { ModelConsentDialog } from "./ModelConsentDialog";
 import "./ModelSection.css";
 
 type Send = ReturnType<typeof useModelDownload>["send"];
@@ -30,17 +31,28 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
   const actionError = rejection && rejection.phase === phase ? rejection.text : "";
 
   // One command at a time per row, so a fast double-click cannot come back as already_running.
-  const run = (action: ModelAction) => {
+  const run = (action: ModelAction, options?: { mirrorPrefix?: string }) => {
     if (busy) return;
     setRejection(null);
     setBusy(true);
-    send(model.id, action)
+    send(model.id, action, options)
       .catch((e: unknown) => setRejection({ text: e instanceof Error ? e.message : modelErrorText(String(e)), phase }))
       .finally(() => setBusy(false));
   };
-  // Download, resume and retry all go through here; the confirmation box and the
-  // acceleration prefix are added in front of it later.
-  const startDownload = () => run("download");
+  // The consent box is open while this holds the prefix to list in it (null: closed).
+  const [consent, setConsent] = useState<{ mirrorPrefix: string } | null>(null);
+  // Only a non-empty, valid prefix is ever sent or listed.
+  const savedPrefix = () => { const p = readMirrorPrefix(); return p && isValidMirrorPrefix(p) ? p : ""; };
+  const sendDownload = () => run("download", { mirrorPrefix: savedPrefix() });
+  const showConsent = () => setConsent({ mirrorPrefix: savedPrefix() });
+  // Download, resume and retry all go through here: with consent already given for this
+  // model's hashes the request goes out, otherwise the box opens first.
+  const startDownload = () => {
+    if (busy) return;
+    if (hasModelConsent(model)) sendDownload(); else showConsent();
+  };
+  // run() takes the row's busy lock in the same tick, so there is no gap between agreeing and sending.
+  const acceptConsent = () => { rememberModelConsent(model); setConsent(null); sendDownload(); };
 
   const total = status && status.totalBytes > 0 ? status.totalBytes : modelTotalBytes(model);
   const partial = status ? `已下载 ${formatMiB(status.receivedBytes)} / ${formatMiB(total)} MB` : "";
@@ -62,8 +74,8 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
         {importButton}
       </div>
       <p className="model-row-note">
-        {weights === "pending" ? "许可待作者确认 · " : `权重许可：${weights}`}
-        {weights === "pending" && <Button variant="ghost" color="gray" size="1">来源与许可</Button>}
+        {weights === "pending" ? "许可待作者确认 · " : `权重许可：${weights} · `}
+        <Button variant="ghost" color="gray" size="1" disabled={busy} onClick={showConsent}>来源与许可</Button>
       </p>
     </>;
   } else if (status.phase === "missing") {
@@ -117,5 +129,7 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
     <h3>{model.name}</h3>
     {body}
     {actionError && status?.phase !== "failed" && <p role="alert" className="color-error">{actionError}</p>}
+    <ModelConsentDialog model={consent ? model : null} mirrorPrefix={consent?.mirrorPrefix ?? ""}
+      onAccept={acceptConsent} onCancel={() => setConsent(null)} />
   </div>;
 }

@@ -1,9 +1,30 @@
 import { useState } from "react";
-import { Button } from "@radix-ui/themes";
+import { Button, TextField } from "@radix-ui/themes";
 import { UserSound } from "@phosphor-icons/react";
+import { isValidMirrorPrefix, readMirrorPrefix, saveMirrorPrefix } from "../modelDownload";
 import { useDevocal } from "../useDevocal";
 import { ModelSection } from "./ModelSection";
 import "./DevocalSettings.css";
+
+// Optional prefix put in front of the GitHub address as an extra download source. Invalid
+// text is flagged and never saved; an empty field clears the saved prefix.
+function MirrorPrefixField() {
+  const [value, setValue] = useState(readMirrorPrefix);
+  const trimmed = value.trim();
+  const invalid = trimmed !== "" && !isValidMirrorPrefix(trimmed);
+  const commit = () => { if (!invalid) saveMirrorPrefix(trimmed); };
+  return <details className="model-advanced">
+    <summary>高级</summary>
+    <div className="model-advanced-field">
+      <label htmlFor="model-mirror-prefix">下载加速前缀（可选）</label>
+      <TextField.Root id="model-mirror-prefix" size="1" placeholder="https://example.com/" value={value}
+        color={invalid ? "red" : undefined} aria-invalid={invalid}
+        onChange={e => setValue(e.target.value)} onBlur={commit}
+        onKeyDown={e => { if (e.key === "Enter") commit(); }} />
+      {invalid && <p role="alert" className="color-error">须以 https:// 开头、以 / 结尾</p>}
+    </div>
+  </details>;
+}
 
 export function DevocalSettings() {
   const { status, release } = useDevocal();
@@ -19,5 +40,6 @@ export function DevocalSettings() {
         onClick={() => { setError(""); release().catch(() => setError("未能释放播放器，请重试")); }}>释放播放器</Button>
     </div>
     {error && <p role="alert" className="color-error">{error}</p>}
+    <MirrorPrefixField />
   </section>;
 }

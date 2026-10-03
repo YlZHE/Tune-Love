@@ -7,9 +7,11 @@ const MISSING = { id: ID, phase: "missing", receivedBytes: 0, totalBytes: 37_529
 
 // Mocks the native boundary for the settings window. `window.models` is the status list the
 // fake backend reports; `model_command` records the request and moves it the way the real one would.
-async function prepare(page: Page, view = "/?view=settings", opts: { models?: Record<string, unknown>[]; devocal?: Record<string, unknown> } = {}) {
-  await page.addInitScript(({ models, devocal, OFF }) => {
+async function prepare(page: Page, view = "/?view=settings", opts: { models?: Record<string, unknown>[]; devocal?: Record<string, unknown>; consent?: boolean } = {}) {
+  await page.addInitScript(({ models, devocal, OFF, consent }) => {
     const state = window as any;
+    // Download consent is pre-granted unless a test is about the consent box itself.
+    if (consent) localStorage.setItem("helper-model-consent-v1", JSON.stringify({ keys: ["stemgenrt-hop128:77164d6a581fafb2a31f53fd8ffde44c07cf618472952a4cdba14e68dda3b8b9"] }));
     state.isTauri = true;
     state.models = models;
     state.modelRequests = [];
@@ -44,7 +46,7 @@ async function prepare(page: Page, view = "/?view=settings", opts: { models?: Re
         throw new Error(`Unexpected IPC: ${command}`);
       },
     };
-  }, { models: opts.models ?? [MISSING], devocal: opts.devocal ?? {}, OFF });
+  }, { models: opts.models ?? [MISSING], devocal: opts.devocal ?? {}, OFF, consent: opts.consent ?? true });
   await page.setViewportSize({ width: 760, height: 600 });
   await page.goto(view);
   return page.getByRole("group", { name: "StemgenRT（低延迟）" });
@@ -189,4 +191,98 @@ test("settings: the row's buttons are disabled while a command is pending", asyn
   await expect(row.getByRole("progressbar")).toBeVisible();
   expect(await requests(page)).toEqual([request("download")]);
   await expect(row.getByRole("button", { name: "取消", exact: true })).toBeEnabled();
+});
+
+const DOWNLOAD = "下载模型（约 36 MB）";
+const consentStored = (page: Page) => page.evaluate(() => localStorage.getItem("helper-model-consent-v1"));
+
+test("consent dialog lists source, commit, size, sha256, licence, training data, mirrors and location", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings", { consent: false });
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog.getByText("下载去人声模型", { exact: true })).toBeVisible();
+  await expect(dialog).toContainText("https://github.com/sweetspotsoundsystem/stemgen-rt");
+  await expect(dialog).toContainText("61df8f4aa1555ef110308d01ea92b54ace770979");
+  await expect(dialog).toContainText("35.8 MB（37,529,132 字节）");
+  await expect(dialog).toContainText("77164d6a581fafb2a31f53fd8ffde44c07cf618472952a4cdba14e68dda3b8b9");
+  await expect(dialog).toContainText("待确认");
+  await expect(dialog).toContainText("MUSDB18-HQ（仅教育用途）");
+  await expect(dialog).toContainText("MoisesDB（CC BY-NC-SA 4.0）");
+  await expect(dialog).toContainText("非商业");
+  await expect(dialog).toContainText("ghfast.top、ghproxy.net、ghproxy.vip");
+  await expect(dialog).toContainText("models\\stemgenrt-hop128\\");
+  await expect(dialog).not.toContainText("权重采用 MIT");
+  await expect(dialog.getByRole("button", { name: "同意并下载", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "取消", exact: true })).toBeVisible();
+  expect(await requests(page)).toEqual([]);
+});
+
+test("accepting consent remembers it and sends the request", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings", { consent: false });
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "同意并下载", exact: true }).click();
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  await expect(row.getByRole("progressbar")).toBeVisible();
+  expect(await requests(page)).toEqual([request("download")]);
+  expect(await consentStored(page)).toContain(ID);
+});
+
+test("cancelling consent sends no model_command", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings", { consent: false });
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  expect(await requests(page)).toEqual([]);
+  expect(await consentStored(page)).toBeNull();
+  await expect(row.getByRole("button", { name: DOWNLOAD, exact: true })).toBeEnabled();
+});
+
+test("consent is remembered per model sha256", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings", { consent: false });
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "同意并下载", exact: true }).click();
+  await expect(row.getByRole("progressbar")).toBeVisible();
+  // Back to missing: the second click goes straight through.
+  await setModels(page, [MISSING]);
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  await expect.poll(async () => (await requests(page)).length).toBe(2);
+  // A consent recorded for another hash does not count.
+  await setModels(page, [MISSING]);
+  await page.evaluate(() => localStorage.setItem("helper-model-consent-v1", JSON.stringify({ keys: ["stemgenrt-hop128:deadbeef"] })));
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect(page.getByRole("alertdialog")).toBeVisible();
+  expect(await requests(page)).toHaveLength(2);
+});
+
+test("the source-and-licence button always opens the consent box", async ({ page }) => {
+  const row = await prepare(page);
+  await row.getByRole("button", { name: "来源与许可", exact: true }).click();
+  await expect(page.getByRole("alertdialog")).toContainText("待确认");
+  expect(await requests(page)).toEqual([]);
+});
+
+test("mirror prefix: invalid input is flagged and not sent; a valid one is sent and listed", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings", { consent: false });
+  await page.getByText("高级", { exact: true }).click();
+  const input = page.getByLabel("下载加速前缀（可选）");
+  await expect(input).toHaveAttribute("placeholder", "https://example.com/");
+  await input.fill("http://x/");
+  await input.blur();
+  await expect(page.getByRole("alert").filter({ hasText: "须以 https:// 开头、以 / 结尾" })).toBeVisible();
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "同意并下载", exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(1);
+  expect((await requests(page))[0].mirrorPrefix).toBeNull();
+
+  await setModels(page, [MISSING]);
+  await input.fill("https://my.proxy/");
+  await input.blur();
+  await expect(page.getByRole("alert").filter({ hasText: "须以 https:// 开头" })).toHaveCount(0);
+  await page.evaluate(() => localStorage.removeItem("helper-model-consent-v1"));
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect(page.getByRole("alertdialog")).toContainText("my.proxy");
+  await page.getByRole("alertdialog").getByRole("button", { name: "同意并下载", exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(2);
+  expect((await requests(page))[1].mirrorPrefix).toBe("https://my.proxy/");
 });

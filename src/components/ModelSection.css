@@ -11,3 +11,13 @@
 .model-row-details dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 8px 0 0; }
 .model-row-details dt { color: var(--gray-10, #909090); }
 .model-row-details dd { margin: 0; overflow-wrap: anywhere; user-select: text; }
+
+.model-consent-body { display: grid; gap: 8px; margin-top: 8px; font-size: 13px; }
+.model-consent-body p { margin: 0; overflow-wrap: anywhere; }
+.model-consent-body code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; user-select: text; }
+.model-consent-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 16px; }
+.model-advanced { margin-top: 16px; font-size: 12px; color: var(--gray-11, #b0b0b0); }
+.model-advanced summary { cursor: pointer; }
+.model-advanced-field { display: grid; gap: 6px; margin-top: 8px; }
+.model-advanced-field label { font-size: 12px; }
+.model-advanced-field p { margin: 0; }

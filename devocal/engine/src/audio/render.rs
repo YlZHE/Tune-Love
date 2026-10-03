@@ -10,15 +10,17 @@
 //! ([`Wake`]). Every wake writes the ring B frames it has, up to the target ([`plan_fill`]),
 //! so a block reaches the device as soon as it is processed (O2). Silence is padded only at
 //! a check: the read deadline [`DEADLINE_GUARD_US`] before the device's next read (the timer,
-//! armed on each device wake), or a 20 ms wait with no wake at all. Without a timer, or with a
-//! period of at most two guards, every device wake is a check, as before O2. If a check finds
-//! less than one period queued the device would starve at its next read, so the shortfall up
-//! to the target is written as silence: the real frames before it fade out (`fade_edges`),
-//! the audio after it fades in, and one underrun is counted per gap if input kept flowing
-//! (`UnderrunJudge`; a gap ends once a check finds no shortfall after real frames were
-//! written); a short queue at any other wake is not a starvation. Trim watches the queue,
-//! and the latency estimate is published, on device and timeout wakes only. Pre-roll,
-//! headroom release and decay, fades and the underrun judge run on every wake.
+//! armed on each device wake), or a 20 ms wait with no wake at all. A device wake that comes
+//! while its deadline is still armed (the deadline never fired: the wake before was handled
+//! late, or the timer was) is a check too, so a read is never left unchecked. Without a
+//! timer, or with a period of at most two guards, every device wake is a check, as before O2.
+//! If a check finds less than one period queued the device would starve at its next read, so
+//! the shortfall up to the target is written as silence: the real frames before it fade out
+//! (`fade_edges`), the audio after it fades in, and one underrun is counted per gap if input
+//! kept flowing (`UnderrunJudge`; a gap ends once a check finds no shortfall after real
+//! frames were written); a short queue at any other wake is not a starvation. Trim watches
+//! the queue, and the latency estimate is published, on device and timeout wakes only.
+//! Pre-roll, headroom release and decay, fades and the underrun judge run on every wake.
 //!
 //! Ruling 18: an underrun while the processing thread was not behind is jitter and raises the
 //! target by one hop (at most one capture packet in total); when a user "on" is accepted the
@@ -40,7 +42,7 @@ use wasapi::{
     AudioClient, AudioRenderClient, Device, Direction, Handle, SampleType, StreamMode, WaveFormat,
 };
 use windows::core::{GUID, HSTRING};
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     IAudioClient3, IAudioRenderClient, IAudioSessionControl, IMMDevice,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -859,6 +861,9 @@ struct Renderer {
     timer: Option<HiResTimer>,
     /// Pad only at the read deadline (O2); set each wait from the timer and the period.
     deadline_mode: bool,
+    /// The deadline was armed by a device wake and has not fired (been handled) since. A
+    /// device wake that finds it still armed checks the queue itself (ruling 8).
+    deadline_armed: bool,
 }
 
 impl Renderer {
@@ -889,6 +894,7 @@ impl Renderer {
             last_gain: 0.0,
             timer: None,
             deadline_mode: false,
+            deadline_armed: false,
         }
     }
 
@@ -981,6 +987,11 @@ impl Renderer {
         // kept (see above).
         self.headroom.reset();
         self.end_decay();
+        // No deadline from the old stream may fire into the new one.
+        self.deadline_armed = false;
+        if let Some(t) = &self.timer {
+            t.cancel();
+        }
         self.drop_is_decay = false;
         self.recent_ms = 0.0;
         self.ctx.stats.headroom_frames.store(0, Ordering::Relaxed);
@@ -1057,8 +1068,9 @@ impl Renderer {
     }
 
     /// One wake: waits (at most [`WAIT_MS`]) for the device event, ring B's data event and,
-    /// in deadline mode, the deadline timer; re-arms the timer after a device wake; then
-    /// [`Self::fill_at`] the current time. The latency estimate is published on device and
+    /// in deadline mode, the deadline timer; then [`Self::fill_at`] the current time (which
+    /// re-arms the timer on a device wake). A failed wait sleeps [`FAILED_POLL`] first, so an
+    /// invalid handle cannot spin the thread. The latency estimate is published on device and
     /// timeout wakes only.
     fn fill(&mut self) -> Result<(), String> {
         let Some(sink) = self.sink.as_ref() else {
@@ -1074,12 +1086,10 @@ impl Renderer {
         let n = if self.deadline_mode { 3 } else { 2 };
         // SAFETY: the handles are owned by the sink, `Shared` and `self.timer`, all alive.
         let result = unsafe { WaitForMultipleObjects(&handles[..n], false, WAIT_MS) };
-        let wake = wake_from_wait(result.0, self.deadline_mode);
-        if wake == Wake::Device && self.deadline_mode {
-            if let Some(t) = &self.timer {
-                t.arm_in_us(frames_us(period).saturating_sub(DEADLINE_GUARD_US));
-            }
+        if result == WAIT_FAILED {
+            std::thread::sleep(FAILED_POLL);
         }
+        let wake = wake_from_wait(result.0, self.deadline_mode);
         let padding = self.fill_at(wake, now_us())?;
         if matches!(wake, Wake::Device | Wake::Timeout) {
             self.publish(padding);
@@ -1098,10 +1108,30 @@ impl Renderer {
         match wake {
             Wake::Data => diag.render_data_wakes.fetch_add(1, Ordering::Relaxed),
             Wake::Deadline => diag.render_deadline_wakes.fetch_add(1, Ordering::Relaxed),
-            Wake::Device | Wake::Timeout => 0,
+            Wake::Timeout => diag.render_timeout_wakes.fetch_add(1, Ordering::Relaxed),
+            Wake::Device => 0,
         };
-        let padding = sink.padding()?;
         let period = sink.period_frames();
+        // Ruling 8: the deadline belongs to the read after the device wake that armed it. A
+        // device wake that finds it still armed had a read with no check before it (the wake
+        // was handled late, so the next one cancelled the deadline, or the timer was late):
+        // this wake checks the queue as before O2. Every device wake then arms the next one.
+        let mut deadline_mode = self.deadline_mode;
+        match wake {
+            Wake::Device if deadline_mode => {
+                if self.deadline_armed {
+                    diag.render_missed_deadlines.fetch_add(1, Ordering::Relaxed);
+                    deadline_mode = false;
+                }
+                if let Some(t) = &self.timer {
+                    t.arm_in_us(frames_us(period).saturating_sub(DEADLINE_GUARD_US));
+                }
+                self.deadline_armed = true;
+            }
+            Wake::Deadline => self.deadline_armed = false,
+            _ => {}
+        }
+        let padding = sink.padding()?;
         let buffer = sink.buffer_frames().min(self.staging.len() / 2);
         let hop = self.ctx.shared.proc_hop.load(Ordering::Relaxed) as usize;
         let last_input = self.ctx.shared.last_input_us.load(Ordering::Acquire);
@@ -1178,7 +1208,7 @@ impl Renderer {
         }
         let room = buffer.saturating_sub(padding);
         let need = target.saturating_sub(padding).min(room);
-        let check = checks_padding(wake, self.deadline_mode);
+        let check = checks_padding(wake, deadline_mode);
         if need == 0 {
             // A check with the device already at the target finds no shortfall.
             if check && self.fed {
@@ -1274,7 +1304,7 @@ impl Renderer {
         // queue being at the target, nothing is padded.
         let plan = plan_fill(
             wake,
-            self.deadline_mode,
+            deadline_mode,
             padding,
             w + avail,
             room,
@@ -1700,8 +1730,9 @@ mod tests {
     /// that many frames of `value` arrive in ring B (marked as fresh input, so underruns are
     /// judged); then the device plays one 441-frame period every 10 ms; then `fill_at` runs
     /// as a device wake (the renderer is not in deadline mode, so it pads as before), every
-    /// step or, with `period_wakes`, only on the device period (as the real event wakes it). Calls `each(r, now, first)` after every fill, `first` being the index in
-    /// `out` of the first sample that fill wrote.
+    /// step or, with `period_wakes`, only on the device period (as the real event wakes it).
+    /// Calls `each(r, now, first)` after every fill, `first` being the index in `out` of the
+    /// first sample that fill wrote.
     #[allow(clippy::too_many_arguments)]
     fn simulate(
         r: &mut Renderer,
@@ -2134,9 +2165,9 @@ mod tests {
         arrive(&r, &mut tx, 172, t + 11 * MS);
         r.fill_at(Wake::Data, t + 11 * MS).unwrap();
         assert_eq!(padding.load(Ordering::Relaxed), 300, "written on arrival");
-        // Nothing new: data and device wakes write nothing and pad nothing.
+        // Nothing new: a data wake writes nothing and pads nothing (nor did the device wake
+        // at 10 ms, whose deadline is still to come).
         r.fill_at(Wake::Data, t + 12 * MS).unwrap();
-        r.fill_at(Wake::Device, t + 13 * MS).unwrap();
         assert_eq!(padding.load(Ordering::Relaxed), 300);
         assert_eq!(pad_events(&r), 0);
         assert!(r.underruns.starved_at.is_none(), "not judged a starvation");
@@ -2206,6 +2237,86 @@ mod tests {
         assert!(r.underruns.starved_at.is_some());
     }
 
+    fn missed_deadlines(r: &Renderer) -> u64 {
+        r.ctx
+            .stats
+            .diag
+            .render_missed_deadlines
+            .load(Ordering::Relaxed)
+    }
+
+    /// Ruling 8: two device wakes with no deadline between them (the first was handled late,
+    /// so the second cancelled its deadline) left a read unchecked; the second device wake
+    /// checks as before O2: pads to the target and arms the underrun judge.
+    #[test]
+    fn a_missed_deadline_falls_back_to_a_device_wake_check() {
+        let sink = FakeSink::new(0);
+        let padding = sink.padding.clone();
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let t = 10 * SEC;
+        arrive(&r, &mut tx, 569, t);
+        r.fill_at(Wake::Data, t).unwrap();
+        r.fill_at(Wake::Deadline, t + 8 * MS).unwrap();
+        assert!(r.primed);
+        read_period(&padding);
+        r.fill_at(Wake::Device, t + 10 * MS).unwrap();
+        assert!(r.deadline_armed);
+        assert_eq!((pad_events(&r), missed_deadlines(&r)), (0, 0));
+        // Its deadline never fires; the device reads again (128 -> 0) and wakes.
+        read_period(&padding);
+        r.ctx
+            .shared
+            .last_input_us
+            .store(t + 15 * MS, Ordering::Release);
+        r.fill_at(Wake::Device, t + 20 * MS).unwrap();
+        assert_eq!(missed_deadlines(&r), 1);
+        assert_eq!(pad_events(&r), 1);
+        assert_eq!(padding.load(Ordering::Relaxed), 569, "padded to the target");
+        assert!(r.underruns.starved_at.is_some());
+        assert!(r.deadline_armed, "re-armed for the next read");
+        // Input kept flowing: the gap counts.
+        arrive(&r, &mut tx, 128, t + 22 * MS);
+        r.fill_at(Wake::Data, t + 22 * MS).unwrap();
+        assert_eq!(underruns(&r), 1);
+    }
+
+    /// The normal order (device, its deadline, the next device wake) never falls back; a new
+    /// stream forgets a deadline the old one armed.
+    #[test]
+    fn a_deadline_between_device_wakes_is_no_fallback() {
+        let sink = FakeSink::new(0);
+        let padding = sink.padding.clone();
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let t = 10 * SEC;
+        for p in 0..5u64 {
+            let at = t + p * 10 * MS;
+            read_period(&padding);
+            r.fill_at(Wake::Device, at).unwrap();
+            assert!(r.deadline_armed);
+            arrive(&r, &mut tx, 441, at + MS);
+            r.fill_at(Wake::Data, at + MS).unwrap();
+            r.fill_at(Wake::Deadline, at + 8 * MS).unwrap();
+            assert!(!r.deadline_armed);
+        }
+        assert_eq!(missed_deadlines(&r), 0);
+        // Every deadline found a full period queued.
+        assert_eq!(pad_events(&r), 0);
+        r.fill_at(Wake::Device, t + 50 * MS).unwrap();
+        assert!(r.deadline_armed);
+        r.after_open();
+        assert!(
+            !r.deadline_armed,
+            "a new stream starts without a pending deadline"
+        );
+        r.deadline_mode = true;
+        r.fill_at(Wake::Device, t + 60 * MS).unwrap();
+        assert_eq!(missed_deadlines(&r), 0);
+    }
+
     /// Trim watches the queue only on device and timeout wakes (a data wake sees the queue
     /// at a burst peak).
     #[test]
@@ -2246,6 +2357,11 @@ mod tests {
             1
         );
         assert!(r.ctx.stats.latency_ms_milli.load(Ordering::Relaxed) > 0);
+        // Nothing signalled: a timeout after 20 ms.
+        r.fill().unwrap();
+        let diag = &r.ctx.stats.diag;
+        assert_eq!(diag.render_timeout_wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(diag.render_wakes.load(Ordering::Relaxed), 3);
     }
 
     /// Integer-time model of the render path for one capture phase (brief, Task 7).
@@ -2383,7 +2499,8 @@ mod tests {
             assert!(s.pads_after_start <= 1, "phase {phase}: {s:?}");
             let j = simulate_wakes(phase, true, Some(0x5eed_0002));
             eprintln!(
-                "O2 phase {phase:>5} us: starved {} pads {} (after 20 ms {}); jitter starved {} pads {}",
+                "O2 phase {phase:>5} us: starved {} pads {} (after 20 ms {}); \
+                 jitter starved {} pads {}",
                 s.starved_reads, s.pads, s.pads_after_start, j.starved_reads, j.pads
             );
             assert_eq!(j.starved_reads, 0, "phase {phase} with jitter: {j:?}");
@@ -2398,7 +2515,8 @@ mod tests {
             let new = simulate_wakes(phase, true, None);
             let old = simulate_wakes(phase, false, None);
             eprintln!(
-                "phase {phase:>5} us: mean queue old {:.1} new {:.1} (drop {:.1}); starved old {} new {}",
+                "phase {phase:>5} us: mean queue old {:.1} new {:.1} (drop {:.1}); \
+                 starved old {} new {}",
                 old.mean_queue,
                 new.mean_queue,
                 old.mean_queue - new.mean_queue,

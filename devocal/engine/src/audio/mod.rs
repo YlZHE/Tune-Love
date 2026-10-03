@@ -45,8 +45,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
-    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
-    CreateWaitableTimerExW, SetEvent, SetWaitableTimer, WaitForSingleObject,
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CancelWaitableTimer,
+    CreateEventW, CreateWaitableTimerExW, SetEvent, SetWaitableTimer, WaitForSingleObject,
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
 };
 
@@ -138,6 +138,12 @@ pub struct DiagCounters {
     pub render_data_wakes: AtomicU64,
     /// Render wakes at the read deadline, just before the device reads (O2).
     pub render_deadline_wakes: AtomicU64,
+    /// Render wakes after 20 ms with nothing signalled. Device wakes are `render_wakes`
+    /// minus data, deadline and timeout wakes.
+    pub render_timeout_wakes: AtomicU64,
+    /// Device wakes that found their deadline still armed (it never fired) and checked the
+    /// queue themselves (ruling 8). Close to the device wakes: deadlines are being missed.
+    pub render_missed_deadlines: AtomicU64,
     pub render_real_frames: AtomicU64,
     pub render_pad_events: AtomicU64,
     pub render_pad_frames: AtomicU64,
@@ -223,6 +229,8 @@ pub(crate) fn diag_loop_with(
             &d.render_wakes,
             &d.render_data_wakes,
             &d.render_deadline_wakes,
+            &d.render_timeout_wakes,
+            &d.render_missed_deadlines,
             &d.render_real_frames,
             &d.render_pad_events,
             &d.render_pad_frames,
@@ -246,6 +254,8 @@ pub(crate) fn diag_loop_with(
         "r_wakes",
         "r_data",
         "r_deadline",
+        "r_timeout",
+        "r_missed",
         "r_real",
         "r_pad_ev",
         "r_pad_fr",
@@ -265,8 +275,8 @@ pub(crate) fn diag_loop_with(
         "devocal diag: run={run} start t={:.6} unix_ms={unix_ms}",
         last_us as f64 / 1e6
     ));
-    let line = |last: &[u64; 19], now: [u64; 19], t_us: u64, span_us: u64, partial: bool| {
-        let mut fields = [("", 0u64); 19];
+    let line = |last: &[u64; 21], now: [u64; 21], t_us: u64, span_us: u64, partial: bool| {
+        let mut fields = [("", 0u64); 21];
         for (i, f) in fields.iter_mut().enumerate() {
             *f = (names[i], now[i].wrapping_sub(last[i]));
         }
@@ -1027,6 +1037,14 @@ impl HiResTimer {
         let _ = unsafe { SetWaitableTimer(self.0, &due, 0, None, None, false) };
     }
 
+    /// Stops a pending due time and clears a signal not yet waited on, so nothing armed
+    /// before fires afterwards. Not on the per-block path (a new stream).
+    pub fn cancel(&self) {
+        let _ = unsafe { CancelWaitableTimer(self.0) };
+        // An auto-reset timer that already fired stays signalled until a wait takes it.
+        let _ = unsafe { WaitForSingleObject(self.0, 0) };
+    }
+
     pub fn raw(&self) -> HANDLE {
         self.0
     }
@@ -1184,6 +1202,30 @@ mod tests {
         let elapsed = now_us() - t0;
         assert_eq!(r, WAIT_OBJECT_0, "signalled within 50 ms");
         assert!(elapsed >= 1_500, "{elapsed} us");
+    }
+
+    /// `cancel` drops both a pending due time and a signal that already fired.
+    #[test]
+    fn hires_timer_cancel_clears_pending_and_fired() {
+        let Some(timer) = HiResTimer::new() else {
+            eprintln!("skipped: CreateWaitableTimerExW(HIGH_RESOLUTION) failed on this system");
+            return;
+        };
+        timer.arm_in_us(2_000);
+        timer.cancel();
+        assert_ne!(
+            unsafe { WaitForSingleObject(timer.raw(), 20) },
+            WAIT_OBJECT_0,
+            "pending due time cancelled"
+        );
+        timer.arm_in_us(500);
+        thread::sleep(Duration::from_millis(10));
+        timer.cancel();
+        assert_ne!(
+            unsafe { WaitForSingleObject(timer.raw(), 0) },
+            WAIT_OBJECT_0,
+            "fired signal cleared"
+        );
     }
 
     /// Ruling 5: the per-block helpers used by the audio threads never allocate.

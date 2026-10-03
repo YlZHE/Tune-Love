@@ -22,13 +22,18 @@
 //!
 //! Attach order: `attach` stages the model (or starts that background reload), starts the
 //! audio threads (process loopback of the player tree, output on the player's endpoint) and
-//! only then, on the next tick, calls `Holder::begin_attach` with that tick's time, so the
+//! only then, on a later tick, calls `Holder::begin_attach` with that tick's time, so the
 //! 30 ms volume ramp is not compressed by the audio start-up and nothing is lowered when the
-//! audio cannot start.
+//! audio cannot start. The first tick after the start stamps the start time; `begin_attach`
+//! waits until the capture has delivered [`ATTACH_REF_FRAMES`] (20 ms recorded at the
+//! player's original volume, the reference for R2's level check) or [`ATTACH_REF_WAIT_US`]
+//! (100 ms) have passed since that stamp, whichever comes first. During the wait the player
+//! plays at its own volume and the engine's output gain is still 0, so nothing is audible
+//! twice.
 //!
 //! Every tick (1 ms in [`run`]):
 //! 1. a finished model load (installed or reported);
-//! 2. a pending `begin_attach` (see above);
+//! 2. a pending `begin_attach` once its reference audio is in (see above);
 //! 3. audio thread failure (`capture_failed` -> `CaptureFailed`, other `failed` ->
 //!    `RenderFailed`) while attaching/active: release first, then report;
 //! 4. `Holder::tick`: `Held` while attaching -> `AttachDone`; `Failed` while attaching ->
@@ -42,7 +47,8 @@
 //!    turned active counts as a notification; [`run`] keeps the watches on exactly the
 //!    Holder's parked sessions;
 //! 6. `SharedGains` from the Holder (after the tick and follow, so the audio threads see the
-//!    gain that matches the volumes just set);
+//!    gain that matches the volumes just set), then the attach ramp steps issued so far
+//!    (`Holder::attach_ramp`, `None` outside the clean 150 ms window);
 //! 7. `Metrics` once per second;
 //! 8. a `State` event whenever phase, mode, fallback reason or attached pid changed.
 //!
@@ -106,6 +112,12 @@ pub const EXIT_RELEASE_TIMEOUT_US: u64 = 2_000_000;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the writer may take to flush the last events at exit.
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
+/// R2: captured frames (20 ms) the engine waits for before `begin_attach`, so the level check
+/// has a reference recorded at the player's original volume.
+pub const ATTACH_REF_FRAMES: u64 = 882;
+/// R2: longest wait for [`ATTACH_REF_FRAMES`] after the audio started (a paused player sends
+/// nothing); the attach then proceeds without a reference.
+pub const ATTACH_REF_WAIT_US: u64 = 100_000;
 
 /// Audio statistics as plain values.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -142,6 +154,8 @@ pub trait AudioPort {
     /// The safety guard asks for an immediate `Holder::follow` (cleared by the call).
     fn take_follow_request(&self) -> bool;
     fn stats(&self) -> AudioSnapshot;
+    /// Frames captured from the player since the audio started (0 while stopped).
+    fn input_frames(&self) -> u64;
     /// Stops the audio and returns the model it held (if it came back).
     fn stop(&mut self) -> Option<Box<dyn Separator>>;
 }
@@ -226,6 +240,16 @@ struct PendingLoad {
 
 type StateKey = (Phase, Option<Mode>, Option<FallbackReason>, Option<u32>);
 
+/// An attach whose audio is running and whose `begin_attach` has not run yet.
+#[derive(Debug, Clone, Copy)]
+struct PendingAttach {
+    pid: u32,
+    created_at: u64,
+    /// When the audio was running: the time of the first tick after the start (the attach
+    /// command's own time predates a start that may block for tens of milliseconds).
+    started_us: Option<u64>,
+}
+
 pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     holder: Holder<S>,
     audio: A,
@@ -245,8 +269,9 @@ pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     pending_load: Option<PendingLoad>,
     phase: Phase,
     pid: Option<u32>,
-    /// `begin_attach` runs on the next tick (after the audio started).
-    pending_attach: Option<(u32, u64)>,
+    /// `begin_attach` runs on a later tick, once reference audio was captured (see the
+    /// module docs).
+    pending_attach: Option<PendingAttach>,
     /// The user's last requested toggle.
     user_devocal: bool,
     /// (stage before the last forwarded toggle, until when the requested mode is reported).
@@ -404,6 +429,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         self.periodic(now_us, &mut ev);
         self.gains
             .set(self.holder.capture_gain(now_us), self.holder.output_gain());
+        self.gains.set_attach(self.holder.attach_ramp(now_us));
         if self.audio_stop_at.is_some_and(|t| now_us >= t) {
             self.stop_audio();
         }
@@ -499,7 +525,11 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
                 self.audio_model = with_model;
                 self.audio_toggle = false;
                 self.bound_endpoint = endpoint;
-                self.pending_attach = Some((pid, created_at));
+                self.pending_attach = Some(PendingAttach {
+                    pid,
+                    created_at,
+                    started_us: None,
+                });
                 // A fresh processor: apply the user's current toggle once.
                 self.sync_toggle(now_us);
             }
@@ -673,9 +703,22 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         if self.phase != Phase::Attaching {
             return;
         }
-        let Some((pid, created_at)) = self.pending_attach.take() else {
+        let Some(pending) = self.pending_attach.as_mut() else {
             return;
         };
+        // R2: wait for 20 ms of audio captured at the player's own volume (the level check's
+        // reference), at most ATTACH_REF_WAIT_US. Meanwhile the player plays at its original
+        // volume and our output gain is 0, so nothing is heard twice or louder.
+        let started_us = *pending.started_us.get_or_insert(now_us);
+        if self.audio.input_frames() < ATTACH_REF_FRAMES
+            && now_us < started_us.saturating_add(ATTACH_REF_WAIT_US)
+        {
+            return;
+        }
+        let PendingAttach {
+            pid, created_at, ..
+        } = *pending;
+        self.pending_attach = None;
         match self.holder.begin_attach(pid, created_at, now_us) {
             Ok(report) => {
                 if report.restore_failed > 0 || report.restore_corrupt {
@@ -992,6 +1035,12 @@ impl AudioPort for RealAudio {
             unattenuated_blocks: s.unattenuated_blocks.load(Ordering::Relaxed),
             headroom_frames: s.headroom_frames.load(Ordering::Relaxed),
         }
+    }
+
+    fn input_frames(&self) -> u64 {
+        self.handle
+            .as_ref()
+            .map_or(0, |h| h.stats.diag.capture_frames.load(Ordering::Relaxed))
     }
 
     fn stop(&mut self) -> Option<Box<dyn Separator>> {
@@ -1357,6 +1406,9 @@ mod tests {
         /// `start` advances this clock by `start_delay_us` (a slow audio start).
         clock: Option<Rc<Cell<u64>>>,
         start_delay_us: u64,
+        /// Captured frames reported by `input_frames`; `None` = `u64::MAX` (plenty of
+        /// reference audio, so `begin_attach` runs on the first tick as before).
+        input_frames: Option<u64>,
     }
 
     /// Audio double: records every call; the test sets stage, failures and stats.
@@ -1394,6 +1446,9 @@ mod tests {
         }
         fn set_stats(&self, stats: AudioSnapshot) {
             self.0.borrow_mut().stats = stats;
+        }
+        fn set_input_frames(&self, frames: u64) {
+            self.0.borrow_mut().input_frames = Some(frames);
         }
     }
 
@@ -1468,6 +1523,9 @@ mod tests {
         }
         fn stats(&self) -> AudioSnapshot {
             self.st().stats
+        }
+        fn input_frames(&self) -> u64 {
+            self.st().input_frames.unwrap_or(u64::MAX)
         }
         fn stop(&mut self) -> Option<Box<dyn Separator>> {
             let mut s = self.0.borrow_mut();
@@ -2548,6 +2606,107 @@ mod tests {
         assert_eq!(r.volume(SESSION), HELD_VOLUME);
         assert_eq!(r.core.phase(), Phase::Active);
         assert!(errors(&out).is_empty(), "{out:?}");
+    }
+
+    /// Review Focus 1: the player keeps its volume until 20 ms of reference audio is captured.
+    #[test]
+    fn attach_waits_for_pre_attach_audio() {
+        let mut r = Rig::new("attach-ref-audio");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.audio().set_input_frames(0);
+        r.send(attach());
+        r.run(5);
+        assert_eq!(r.core.phase(), Phase::Attaching);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert_eq!(r.volume(SESSION), 0.8);
+        let gains = r.audio().st().gains.clone().unwrap();
+        assert_eq!(
+            gains.output_gain(),
+            0.0,
+            "our output is silent while waiting"
+        );
+        assert_eq!(gains.attach(), None);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES - 1);
+        r.run(1);
+        assert_eq!(
+            r.core.sessions().set_volume_calls(),
+            0,
+            "881 frames: not yet"
+        );
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        r.run(1);
+        assert_eq!(r.core.sessions().set_volume_calls(), 1);
+        assert!(r.volume(SESSION) < 0.8, "{}", r.volume(SESSION));
+        assert_eq!(gains.attach().map(|a| a.steps), Some(1));
+        r.run(40);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert_eq!(r.volume(SESSION), HELD_VOLUME);
+    }
+
+    #[test]
+    fn attach_proceeds_after_100ms_without_audio() {
+        let mut r = Rig::new("attach-no-audio");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.audio().set_input_frames(0);
+        r.send(attach());
+        // Ticks at T0 .. T0 + 98 ms.
+        r.run(99);
+        assert_eq!(r.now, T0 + 99 * MS);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert_eq!(r.volume(SESSION), 0.8);
+        // The tick at T0 + 99 ms still waits; the one at T0 + 100 ms starts the ramp.
+        r.run(1);
+        assert_eq!(
+            r.core.sessions().set_volume_calls(),
+            0,
+            "99 ms: still waiting"
+        );
+        assert_eq!(r.now, T0 + ATTACH_REF_WAIT_US);
+        r.run(1);
+        assert_eq!(r.core.sessions().set_volume_calls(), 1, "100 ms: lowering");
+        assert!(r.volume(SESSION) < 0.8);
+        r.run(40);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert_eq!(r.volume(SESSION), HELD_VOLUME);
+    }
+
+    #[test]
+    fn published_attach_ramp_follows_the_holder() {
+        let mut r = Rig::new("published-ramp");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.send(attach());
+        let gains = r.audio().st().gains.clone().unwrap();
+        assert_eq!(gains.attach(), None);
+        let mut epoch = None;
+        for ms in 0..200u64 {
+            r.core.tick(r.now);
+            r.now += MS;
+            let published = gains.attach();
+            let expected_steps = match ms {
+                0..=9 => Some(1),
+                10..=19 => Some(2),
+                20..=29 => Some(3),
+                30..=149 => Some(4),
+                _ => None,
+            };
+            assert_eq!(
+                published.map(|a| a.steps),
+                expected_steps,
+                "+{ms} ms: {published:?}"
+            );
+            if let Some(a) = published {
+                assert_eq!(a.original, 0.8);
+                assert_eq!(
+                    *epoch.get_or_insert(a.epoch),
+                    a.epoch,
+                    "one epoch per attach"
+                );
+            }
+        }
+        assert_eq!(r.core.phase(), Phase::Active);
     }
 
     #[test]

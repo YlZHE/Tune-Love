@@ -85,6 +85,24 @@ pub const RAMP_STEP_US: u64 = 10_000;
 pub const GAIN_WINDOW_US: u64 = 100_000;
 /// Longest the capture stays silent after a default render device change.
 pub const DEVICE_MUTE_US: u64 = 1_000_000;
+/// R2: how long after the start of the attach ramp its steps are published for the level
+/// check ([`Holder::attach_ramp`]); the design's 150 ms decision timeout.
+pub const CONFIRM_WINDOW_US: u64 = 150_000;
+
+/// The attach ramp as issued so far (R2): the audio side compares the captured level against
+/// the pre-attach reference to confirm the gain. Published only while every owned session is
+/// lowered by this ramp and nothing has disturbed it (see [`Holder::attach_ramp`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttachRamp {
+    /// Incremented by every `begin_attach`.
+    pub epoch: u32,
+    /// Ramp steps issued so far, 1..=[`RAMP_STEPS`]; step `k` set every session to
+    /// `ramp_value(its original, HELD_VOLUME, k)`.
+    pub steps: u32,
+    /// The ramp's reference original: the smallest original among the owned sessions (the
+    /// holder's gain reference), so a level check against it takes the smaller gain.
+    pub original: f32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HolderPhase {
@@ -254,6 +272,10 @@ pub struct Holder<S: SessionVolumes> {
     /// Log lines already written (`park:<id>`, `unpark:<id>`), so a repeating failure is
     /// logged once until it clears.
     logged: HashSet<String>,
+    /// Incremented by every successful `begin_attach` ([`AttachRamp::epoch`]).
+    attach_epoch: u32,
+    /// `follow` ran since the last `begin_attach`: the volumes may no longer be the ramp's.
+    ramp_disturbed: bool,
 }
 
 /// True for a volume the holder lowers: finite, above `HELD_VOLUME` and not already held.
@@ -273,7 +295,7 @@ fn active_endpoints(tree: &[SessionInfo]) -> Vec<String> {
 }
 
 /// Geometric interpolation from `from` to `to`: step 0 is `from`, step `RAMP_STEPS` exactly `to`.
-fn ramp_value(from: f32, to: f32, step: u32) -> f32 {
+pub(crate) fn ramp_value(from: f32, to: f32, step: u32) -> f32 {
     if step >= RAMP_STEPS || !from.is_finite() || from <= 0.0 || !to.is_finite() || to <= 0.0 {
         return to;
     }
@@ -358,6 +380,8 @@ impl<S: SessionVolumes> Holder<S> {
             parked_epoch: 0,
             playing: Vec::new(),
             logged: HashSet::new(),
+            attach_epoch: 0,
+            ramp_disturbed: false,
         }
     }
 
@@ -487,6 +511,8 @@ impl<S: SessionVolumes> Holder<S> {
         self.device_mute = None;
         self.playing = active_endpoints(&tree);
         self.logged.clear();
+        self.attach_epoch = self.attach_epoch.wrapping_add(1);
+        self.ramp_disturbed = false;
         Ok(report)
     }
 
@@ -537,6 +563,9 @@ impl<S: SessionVolumes> Holder<S> {
     /// detects that the player exited (then restores through `restore::restore` and goes idle).
     /// Does nothing in other phases.
     pub fn follow(&mut self, now_us: u64) -> FollowReport {
+        // A pass may lower, re-lower, park or adopt sessions: the volumes are no longer the
+        // attach ramp's alone, so it is no longer published.
+        self.ramp_disturbed = true;
         let mut r = FollowReport::default();
         if self.stage != Stage::Held {
             return r;
@@ -880,6 +909,29 @@ impl<S: SessionVolumes> Holder<S> {
     /// attach step `k`, back down to 0 over the release steps.
     pub fn output_gain(&self) -> f32 {
         self.output_gain
+    }
+
+    /// The attach ramp steps issued so far (R2), for the level check on the audio side.
+    /// `Some` only while attaching or held, at least one step issued, before
+    /// `ramp start + CONFIRM_WINDOW_US`, with every owned session lowered by this ramp (none
+    /// adopted at attach, none unreadable), no ramp failure, no default device change and no
+    /// `follow` since the attach. Anything else means the captured level no longer follows
+    /// the ramp alone, and the caller keeps the conservative gain.
+    pub fn attach_ramp(&self, now_us: u64) -> Option<AttachRamp> {
+        let clean = matches!(self.stage, Stage::Attaching | Stage::Held)
+            && self.ramp_step >= 1
+            && now_us < self.ramp_start_us.saturating_add(CONFIRM_WINDOW_US)
+            && !self.owned.is_empty()
+            && self.owned.iter().all(|o| o.ramp)
+            && self.attach_failure.is_none()
+            && !self.attach_unread
+            && self.device_mute.is_none()
+            && !self.ramp_disturbed;
+        clean.then_some(AttachRamp {
+            epoch: self.attach_epoch,
+            steps: self.ramp_step,
+            original: self.original,
+        })
     }
 
     fn due_step(&self, now_us: u64) -> u32 {
@@ -2567,5 +2619,104 @@ mod tests {
         h.begin_release(T0);
         assert_eq!(h.tick(T0), HolderPhase::Idle);
         assert_eq!(h.sessions().set_volume_calls(), 0);
+    }
+
+    #[test]
+    fn attach_ramp_reports_issued_steps_during_the_window() {
+        let dir = TempDir::new("attach-ramp");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        assert_eq!(h.attach_ramp(T0), None, "idle");
+        h.begin_attach(PID, CREATED, T0).unwrap();
+        assert_eq!(h.attach_ramp(T0), None, "no step issued yet");
+        assert_eq!(h.tick(T0), HolderPhase::Attaching);
+        let first = h.attach_ramp(T0).expect("step 1 issued");
+        assert_eq!(first.steps, 1);
+        assert_eq!(first.original, 0.5);
+        let e = first.epoch;
+        let ramp = |steps| {
+            Some(AttachRamp {
+                epoch: e,
+                steps,
+                original: 0.5,
+            })
+        };
+        h.tick(T0 + 10 * MS);
+        assert_eq!(h.attach_ramp(T0 + 10 * MS), ramp(2));
+        h.tick(T0 + 20 * MS);
+        assert_eq!(h.attach_ramp(T0 + 20 * MS), ramp(3));
+        assert_eq!(h.tick(T0 + 30 * MS), HolderPhase::Held);
+        assert_eq!(h.attach_ramp(T0 + 30 * MS), ramp(4));
+        h.tick(T0 + 100 * MS);
+        assert_eq!(h.attach_ramp(T0 + 149_999), ramp(4));
+        assert_eq!(h.attach_ramp(T0 + CONFIRM_WINDOW_US), None);
+        assert_eq!(h.attach_ramp(T0 + 150 * MS), None);
+    }
+
+    #[test]
+    fn attach_ramp_is_none_when_degraded() {
+        // A session whose volume could not be read at attach (it plays unlowered).
+        let dir = TempDir::new("attach-ramp-unread");
+        let mut h = holder(&dir, &[("a", 0.5), ("u", 0.7)]);
+        h.sessions().fail_volume("u");
+        h.begin_attach(PID, CREATED, T0).unwrap();
+        h.tick(T0);
+        assert_eq!(h.attach_ramp(T0), None, "unread session");
+
+        // A session adopted at attach (already held, not part of the ramp).
+        let dir = TempDir::new("attach-ramp-adopted");
+        write_file(&dir, vec![kept_entry(10, "old", "ident:player", 0.7)]);
+        let f = fake(&[("a", 0.5)]);
+        let mut s = info("new", PID);
+        s.session_identifier = "ident:player".into();
+        f.add_session(s, HELD_VOLUME, false);
+        f.fail_set_volume("new");
+        let mut h = Holder::new(f, dir.file());
+        assert_eq!(h.begin_attach(PID, CREATED, T0).unwrap().adopted, 1);
+        h.tick(T0);
+        assert_eq!(h.attach_ramp(T0), None, "adopted session");
+
+        // `set_volume` fails during the ramp.
+        let dir = TempDir::new("attach-ramp-set-fail");
+        let mut h = holder(&dir, &[("a", 0.5), ("b", 0.8)]);
+        h.begin_attach(PID, CREATED, T0).unwrap();
+        h.tick(T0);
+        assert!(h.attach_ramp(T0).is_some());
+        h.sessions().fail_set_volume("b");
+        assert!(matches!(h.tick(T0 + 10 * MS), HolderPhase::Failed(_)));
+        assert_eq!(h.attach_ramp(T0 + 10 * MS), None, "ramp failed");
+
+        // A default render device change in the window.
+        let dir = TempDir::new("attach-ramp-device");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        h.begin_attach(PID, CREATED, T0).unwrap();
+        h.tick(T0);
+        assert!(h.attach_ramp(T0).is_some());
+        h.default_device_changed(T0 + 5 * MS, Some("ep2".into()));
+        assert_eq!(h.attach_ramp(T0 + 5 * MS), None, "device changed");
+        h.tick(T0 + 10 * MS);
+        assert_eq!(h.attach_ramp(T0 + 10 * MS), None);
+
+        // A `follow` pass in the window.
+        let dir = TempDir::new("attach-ramp-follow");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        assert!(h.attach_ramp(T0 + 30 * MS).is_some());
+        assert_eq!(h.follow(T0 + 40 * MS), FollowReport::default());
+        assert_eq!(h.attach_ramp(T0 + 40 * MS), None, "followed");
+    }
+
+    #[test]
+    fn attach_ramp_epoch_increments_per_attach() {
+        let dir = TempDir::new("attach-ramp-epoch");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let e1 = h.attach_ramp(T0 + 30 * MS).unwrap().epoch;
+        assert_eq!(release(&mut h, T0 + 500 * MS), HolderPhase::Idle);
+        assert_eq!(h.attach_ramp(T0 + 530 * MS), None);
+        let t2 = T0 + 1_000 * MS;
+        assert_eq!(attach(&mut h, t2), HolderPhase::Held);
+        let r2 = h.attach_ramp(t2 + 30 * MS).unwrap();
+        assert_eq!(r2.epoch, e1 + 1);
+        assert_eq!(r2.steps, 4);
     }
 }

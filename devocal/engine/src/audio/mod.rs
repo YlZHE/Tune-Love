@@ -33,7 +33,7 @@ pub mod endpoint;
 mod processing;
 pub mod render;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -53,6 +53,7 @@ use windows::Win32::System::Threading::{
 use devocal_core::protocol::FallbackReason;
 
 use crate::dsp::{frames_for_ms, SAMPLE_RATE};
+use crate::holder::AttachRamp;
 use crate::processor::{Processor, Stage};
 use crate::separator::Separator;
 
@@ -412,14 +413,69 @@ pub const LATENCY_BUDGET_FRAMES: usize = 2_205;
 pub struct SharedGains {
     pub capture_gain_bits: AtomicU32,
     pub output_gain_bits: AtomicU32,
+    /// The Holder's [`AttachRamp`] (R2) packed as [`ATTACH_VALID`] | epoch << 16 | steps;
+    /// 0 = none. Written after `attach_original_bits` (see [`SharedGains::set_attach`]).
+    attach_word: AtomicU64,
+    /// [`AttachRamp::original`] as `f32` bits, valid only with the word around it.
+    attach_original_bits: AtomicU32,
 }
+
+/// Set in a published [`SharedGains::attach_word`].
+const ATTACH_VALID: u64 = 1 << 63;
+/// Low bits of the attach word holding [`AttachRamp::steps`] (at most `RAMP_STEPS`).
+const ATTACH_STEPS_MASK: u64 = 0xFFFF;
+const ATTACH_EPOCH_SHIFT: u32 = 16;
 
 impl SharedGains {
     pub fn new(capture_gain: f32, output_gain: f32) -> Self {
         Self {
             capture_gain_bits: AtomicU32::new(capture_gain.to_bits()),
             output_gain_bits: AtomicU32::new(output_gain.to_bits()),
+            attach_word: AtomicU64::new(0),
+            attach_original_bits: AtomicU32::new(0),
         }
+    }
+
+    /// Publishes the Holder's attach ramp (engine loop, every tick). `original` is written
+    /// first, then the word (Release), so a reader that sees the word sees its original.
+    /// When the original changes the word is cleared first, so a reader can never pair a new
+    /// original with an old word.
+    pub fn set_attach(&self, r: Option<AttachRamp>) {
+        let Some(r) = r else {
+            self.attach_word.store(0, Ordering::Release);
+            return;
+        };
+        let bits = r.original.to_bits();
+        if self.attach_original_bits.load(Ordering::Relaxed) != bits {
+            self.attach_word.store(0, Ordering::Relaxed);
+            fence(Ordering::Release);
+            self.attach_original_bits.store(bits, Ordering::Relaxed);
+        }
+        let steps = u64::from(r.steps).min(ATTACH_STEPS_MASK);
+        let word = ATTACH_VALID | (u64::from(r.epoch) << ATTACH_EPOCH_SHIFT) | steps;
+        self.attach_word.store(word, Ordering::Release);
+    }
+
+    /// The published attach ramp; lock-free and allocation-free (capture thread). Reads the
+    /// word, the original, then the word again: `None` when the two words differ (a write in
+    /// between), when nothing is published, or when the original is not finite and positive.
+    pub fn attach(&self) -> Option<AttachRamp> {
+        let word = self.attach_word.load(Ordering::Acquire);
+        if word & ATTACH_VALID == 0 {
+            return None;
+        }
+        let original = f32::from_bits(self.attach_original_bits.load(Ordering::Acquire));
+        if self.attach_word.load(Ordering::Acquire) != word {
+            return None;
+        }
+        if !original.is_finite() || original <= 0.0 {
+            return None;
+        }
+        Some(AttachRamp {
+            epoch: (word >> ATTACH_EPOCH_SHIFT) as u32,
+            steps: (word & ATTACH_STEPS_MASK) as u32,
+            original,
+        })
     }
 
     pub fn set(&self, capture_gain: f32, output_gain: f32) {
@@ -1245,6 +1301,12 @@ mod tests {
         let mut loud = vec![3.0f32; 441 * 2];
         let timer = HiResTimer::new();
         let event = OwnedEvent::new().unwrap();
+        let gains = SharedGains::new(1.0, 1.0);
+        gains.set_attach(Some(AttachRamp {
+            epoch: 1,
+            steps: 2,
+            original: 0.5,
+        }));
         let before = alloc_count::this_thread();
         for i in 0..50u64 {
             cond.condition(&mut loud, 1.0, &stats, &follow, |_| {});
@@ -1283,6 +1345,7 @@ mod tests {
                 t.arm_in_us(8_500);
             }
             event.set();
+            let _ = gains.attach();
         }
         assert_eq!(alloc_count::this_thread() - before, 0);
         assert!(power.is_finite());
@@ -1360,5 +1423,38 @@ mod tests {
         assert_eq!(g.output_gain(), 0.0);
         g.set(f32::INFINITY, 1.0);
         assert_eq!(g.capture_gain(), 0.0);
+    }
+
+    #[test]
+    fn attach_ramp_round_trips_through_shared_gains() {
+        let g = SharedGains::new(1.0, 0.0);
+        assert_eq!(g.attach(), None, "nothing published yet");
+        let r = AttachRamp {
+            epoch: 7,
+            steps: 3,
+            original: 0.5,
+        };
+        g.set_attach(Some(r));
+        assert_eq!(g.attach(), Some(r));
+        let r2 = AttachRamp {
+            epoch: u32::MAX,
+            steps: 4,
+            original: 0.25,
+        };
+        g.set_attach(Some(r2));
+        assert_eq!(g.attach(), Some(r2));
+        g.set_attach(None);
+        assert_eq!(g.attach(), None);
+        g.set_attach(Some(AttachRamp {
+            original: f32::NAN,
+            ..r
+        }));
+        assert_eq!(g.attach(), None, "NaN original");
+        g.set_attach(Some(AttachRamp { original: 0.0, ..r }));
+        assert_eq!(g.attach(), None, "zero original");
+        g.set_attach(Some(r));
+        assert_eq!(g.attach(), Some(r));
+        // The gains themselves are untouched.
+        assert_eq!((g.capture_gain(), g.output_gain()), (1.0, 0.0));
     }
 }

@@ -145,14 +145,23 @@ fn enable_devocal(app: &AppHandle) {
     });
 }
 
-/// What a finished install does: enable de-vocal if the request asked for it, else nothing.
+/// What a finished install does, on a blocking thread: always clear a de-vocal `unavailable`
+/// caused by the missing model (so the main-window hint does not go stale), then enable de-vocal
+/// if the request asked for it.
 fn on_installed(app: &AppHandle, req: &ModelRequest) -> Box<dyn FnOnce() + Send> {
-    if wants_auto_enable(req) {
-        let app = app.clone();
-        Box::new(move || enable_devocal(&app))
-    } else {
-        Box::new(|| {})
-    }
+    let app = app.clone();
+    let enable = wants_auto_enable(req);
+    Box::new(move || {
+        tauri::async_runtime::spawn_blocking(move || {
+            let devocal = app.state::<super::DevocalState>();
+            devocal.model_installed();
+            if enable {
+                if let Err(e) = devocal.command("enable") {
+                    eprintln!("models: auto-enable de-vocal failed: {e}");
+                }
+            }
+        });
+    })
 }
 
 /// May hash (cached).

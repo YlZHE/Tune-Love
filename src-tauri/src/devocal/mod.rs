@@ -16,6 +16,7 @@ pub mod supervisor;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -131,6 +132,8 @@ struct Shared {
     data_dir: Mutex<Option<PathBuf>>,
     stop: Mutex<Option<Sender<()>>>,
     done: Mutex<Option<Receiver<()>>>,
+    /// Model installs so far (see `resolve_then_lock`).
+    installs: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -153,6 +156,7 @@ impl DevocalState {
                 data_dir: Mutex::new(None),
                 stop: Mutex::new(None),
                 done: Mutex::new(None),
+                installs: AtomicU64::new(0),
             }),
         }
     }
@@ -193,12 +197,13 @@ impl DevocalState {
     pub fn command(&self, action: &str) -> Result<DevocalStatus, String> {
         let data_dir = lock(&self.shared.data_dir).clone();
         // Worked out before taking the supervisor lock: the first check hashes the model file.
-        let model = if action == "enable" {
-            data_dir.as_deref().and_then(model_path)
+        let (model, mut slot) = if action == "enable" {
+            resolve_then_lock(&self.shared.installs, &self.shared.supervisor, || {
+                data_dir.as_deref().and_then(model_path)
+            })
         } else {
-            None
+            (None, lock(&self.shared.supervisor))
         };
-        let mut slot = lock(&self.shared.supervisor);
         let Some(sup) = slot.as_mut() else {
             return Err("devocal is not started yet".into());
         };
@@ -206,6 +211,20 @@ impl DevocalState {
         let status = sup.status();
         *lock(&self.shared.status) = status.clone();
         Ok(status)
+    }
+
+    /// A model install finished (any install, whether or not it auto-enables): clears an
+    /// `unavailable` caused only by the missing model, so the main window stops offering the
+    /// download. Does not enable devocal. Call it after the file is in place.
+    pub fn model_installed(&self) {
+        // Counted before the lock: an enable that looked for the model before the file landed
+        // and takes the lock after this point looks again (see `resolve_then_lock`).
+        self.shared.installs.fetch_add(1, Ordering::SeqCst);
+        let mut slot = lock(&self.shared.supervisor);
+        if let Some(sup) = slot.as_mut() {
+            sup.model_installed();
+            *lock(&self.shared.status) = sup.status();
+        }
     }
 
     /// App exit: the supervisor thread shuts the engine down (and restores); waits up to 3 s.
@@ -220,6 +239,26 @@ impl DevocalState {
             }
         }
     }
+}
+
+/// Looks up the model for an enable (may hash, so outside the lock), then takes the supervisor
+/// lock. If the lookup found nothing but an install finished meanwhile, it looks once more:
+/// otherwise this stale enable would mark devocal `unavailable` (model_not_found) right after
+/// [`DevocalState::model_installed`] cleared it.
+fn resolve_then_lock<'a, T>(
+    installs: &AtomicU64,
+    slot: &'a Mutex<T>,
+    resolve: impl Fn() -> Option<PathBuf>,
+) -> (Option<PathBuf>, MutexGuard<'a, T>) {
+    let seen = installs.load(Ordering::SeqCst);
+    let model = resolve();
+    let guard = lock(slot);
+    if model.is_some() || installs.load(Ordering::SeqCst) == seen {
+        return (model, guard);
+    }
+    drop(guard);
+    let model = resolve();
+    (model, lock(slot))
 }
 
 /// One user action on the supervisor.
@@ -373,7 +412,7 @@ pub(crate) mod tests {
     use devocal_core::protocol::Command;
     use devocal_core::restore::{write_atomic, RestoreEntry, RestoreRecord, RESTORE_VERSION};
     use devocal_core::sessions::{FakeSessions, SessionInfo, HELD_VOLUME};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     /// A fresh, empty directory under the system temp dir.
     pub fn temp_dir(tag: &str) -> PathBuf {
@@ -530,7 +569,51 @@ pub(crate) mod tests {
         let state = DevocalState::new(Arc::new(AttenuationGate::new()));
         assert_eq!(state.status(), DevocalStatus::off());
         assert!(state.command("enable").is_err());
+        state.model_installed(); // no supervisor: nothing to clear
+        assert_eq!(state.status(), DevocalStatus::off());
         state.shutdown(); // no thread: returns at once
+    }
+
+    #[test]
+    fn an_enable_that_found_no_model_looks_again_after_an_install_landed() {
+        let installs = AtomicU64::new(0);
+        let slot = Mutex::new(());
+        let calls = AtomicUsize::new(0);
+        // The install lands between the lookup and the lock.
+        let (model, guard) = resolve_then_lock(&installs, &slot, || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                installs.fetch_add(1, Ordering::SeqCst);
+                None
+            } else {
+                Some(PathBuf::from("model.onnx"))
+            }
+        });
+        drop(guard);
+        assert_eq!(model, Some(PathBuf::from("model.onnx")));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // No install meanwhile: one lookup, its answer kept.
+        let calls = AtomicUsize::new(0);
+        let (model, _guard) = resolve_then_lock(&installs, &slot, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        assert_eq!(model, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_enable_that_found_the_model_does_not_look_again() {
+        let installs = AtomicU64::new(0);
+        let slot = Mutex::new(());
+        let calls = AtomicUsize::new(0);
+        let (model, _guard) = resolve_then_lock(&installs, &slot, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            installs.fetch_add(1, Ordering::SeqCst);
+            Some(PathBuf::from("model.onnx"))
+        });
+        assert_eq!(model, Some(PathBuf::from("model.onnx")));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

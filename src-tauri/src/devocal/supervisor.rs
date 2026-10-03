@@ -415,6 +415,15 @@ impl<L: EngineLink> Supervisor<L> {
         }
     }
 
+    /// A model was installed (downloaded or imported): an `unavailable` caused only by the missing
+    /// model no longer applies. Does not enable devocal; any other condition is left as it is.
+    pub fn model_installed(&mut self) {
+        if self.unavailable && self.error.as_deref() == Some("model_not_found") {
+            self.unavailable = false;
+            self.error = None;
+        }
+    }
+
     /// User action: devocal off; the player stays held (passthrough).
     pub fn disable(&mut self) {
         if self.shut_down {
@@ -1596,6 +1605,46 @@ mod tests {
         r.sup.tick(0, Some(player(7)), true);
         assert_eq!(r.spawns(), 0);
         assert_eq!(r.phase(), "unavailable");
+    }
+
+    #[test]
+    fn an_installed_model_clears_model_not_found_without_enabling() {
+        let mut r = rig();
+        r.sup.enable(None);
+        assert_eq!(r.phase(), "unavailable");
+        r.sup.model_installed();
+        let s = r.sup.status();
+        assert_eq!(s.phase, "off");
+        assert_eq!(s.error, None);
+        // Not enabled: a player appearing spawns no engine.
+        r.sup.tick(0, Some(player(7)), true);
+        assert_eq!(r.spawns(), 0);
+        assert_eq!(r.phase(), "off");
+        // A later enable with the model goes ahead as usual.
+        r.sup.enable(Some(model()));
+        r.sup.tick(100, Some(player(7)), true);
+        assert_eq!(r.spawns(), 1);
+    }
+
+    #[test]
+    fn an_installed_model_leaves_other_conditions_alone() {
+        // Another unavailable reason stays.
+        let mut r = rig();
+        *r.spawn_error.lock().unwrap() = Some("devocal-engine.exe not found".into());
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, Some(player(7)), true);
+        r.sup.model_installed();
+        let s = r.sup.status();
+        assert_eq!(s.phase, "unavailable");
+        assert!(s.error.unwrap().contains("devocal-engine.exe not found"));
+        // A running devocal is not touched.
+        let mut r = rig();
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, Some(player(7)), true);
+        let before = r.sup.status();
+        r.sup.model_installed();
+        assert_eq!(r.sup.status(), before);
+        assert_eq!(r.spawns(), 1);
     }
 
     #[test]

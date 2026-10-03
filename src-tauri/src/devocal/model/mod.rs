@@ -14,7 +14,7 @@ pub mod verify;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
@@ -119,17 +119,19 @@ fn break_origin() -> bool {
     }
 }
 
-/// One HTTP client for the app's lifetime.
+/// A new HTTP client for each download job. reqwest reads the system and environment proxy when
+/// the client is built, so a proxy the user turns on (or off) after a failure takes effect on the
+/// next try, without restarting the app.
 fn fetcher() -> Result<Arc<ReqwestFetcher>, ModelError> {
-    static FETCHER: OnceLock<Arc<ReqwestFetcher>> = OnceLock::new();
-    if let Some(f) = FETCHER.get() {
-        return Ok(f.clone());
-    }
-    let created = ReqwestFetcher::standard().map_err(|e| {
+    new_fetcher(ReqwestFetcher::standard)
+}
+
+/// Builds a client; a build failure is logged and reported as `network_unreachable`.
+fn new_fetcher<F>(build: impl FnOnce() -> Result<F, String>) -> Result<Arc<F>, ModelError> {
+    build().map(Arc::new).map_err(|e| {
         eprintln!("models: {e}");
         ModelError::Network
-    })?;
-    Ok(FETCHER.get_or_init(|| Arc::new(created)).clone())
+    })
 }
 
 /// Takes the same path as `devocal_command("enable")`, on a blocking thread; a failure is only
@@ -395,5 +397,21 @@ mod tests {
         assert_eq!(custom_prefix(&req(STEMGENRT_ID, "download", false, Some(""))), None);
         assert_eq!(custom_prefix(&req(STEMGENRT_ID, "download", false, None)), None);
         assert_eq!(custom_prefix(&req(STEMGENRT_ID, "download", false, Some("https://p/"))), Some("https://p/"));
+    }
+
+    #[test]
+    fn each_download_job_gets_its_own_client() {
+        // reqwest reads the system/env proxy when a client is built; a shared client would ignore
+        // a proxy the user turned on after a failure until the app restarts.
+        let a = fetcher().expect("client builds");
+        let b = fetcher().expect("client builds");
+        assert!(!Arc::ptr_eq(&a, &b), "two jobs must not share one client");
+    }
+
+    #[test]
+    fn a_client_that_fails_to_build_is_network_unreachable() {
+        let r = new_fetcher(|| Err::<(), String>("tls backend unavailable".into()));
+        assert_eq!(r.map(|_| ()), Err(ModelError::Network));
+        assert_eq!(ModelError::Network.code(), "network_unreachable");
     }
 }

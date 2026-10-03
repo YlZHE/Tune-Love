@@ -82,7 +82,7 @@ describe("targetTooltip", () => {
   test("evidence and write status for a Major/Minor target", () => {
     expect(targetTooltip(minor, null, true)).toBe("已分析 12 秒。连接 Auto-Tune 后自动写入。");
     expect(targetTooltip(minor, written(), true)).toBe("已分析 12 秒。已写入当前连接的插件。");
-    expect(targetTooltip(minor, written({ status: "pending" }), true)).toBe("已分析 12 秒。连接 Auto-Tune 后自动写入。");
+    expect(targetTooltip(minor, written({ status: "pending" }), true)).toBe("已分析 12 秒。正在写入当前连接的插件。");
     expect(targetTooltip(minor, written({ status: "failed" }), true)).toBe("已分析 12 秒。写入失败，不会自动重试。");
     expect(targetTooltip(minor, written(), false)).toBe("已分析 12 秒。自动写入已关闭，可在设置中开启。");
     expect(targetTooltip({ ...minor, source: "cache", evidenceSeconds: 2.4 }, null, true))

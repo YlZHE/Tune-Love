@@ -1,9 +1,8 @@
 export type DetectedKey = { pitchClass: number; mode: "major" | "minor" };
 
 // Scale-match recommendation. Chromatic means the song's key is not settled:
-// key may be null, candidate is the best Major/Minor guess (shown, and used for
-// plugins without Chromatic), uncoveredNotes are pitch classes the candidate
-// scale would not cover. source "cache": remembered from an earlier play of this
+// key may be null, candidate is the best Major/Minor guess (named in the
+// tooltip), uncoveredNotes are pitch classes the candidate scale would not cover. source "cache": remembered from an earlier play of this
 // song, held until this play has enough evidence to overrule it.
 export type TargetScale = "major" | "minor" | "chromatic";
 export type Candidate = { key: number; scale: "major" | "minor" };

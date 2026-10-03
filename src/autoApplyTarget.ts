@@ -55,6 +55,7 @@ export function targetTooltip(target: AutoTuneTarget, prev: WrittenPair | null, 
   const status = state === "off" ? "自动写入已关闭，可在设置中开启。"
     : state === "failed" ? "写入失败，不会自动重试。"
     : state === "written" ? "已写入当前连接的插件。"
+    : state === "pending" ? "正在写入当前连接的插件。"
     : "连接 Auto-Tune 后自动写入。";
   return `${evidence}${uncertainty(target)}${status}`;
 }

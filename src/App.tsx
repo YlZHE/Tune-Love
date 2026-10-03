@@ -77,7 +77,7 @@ export function App() {
   const track = status === "ready" ? snapshot.track : null;
   // Progress, playback state and delayed artwork do not identify a new song.
   const songKey = track ? JSON.stringify([track.sourceId ?? track.source, track.title, track.artist, track.album]) : "empty";
-  const { target } = useAutoTuneTarget(track?.sourceId ?? null, songKey,
+  const { target, evidenceSeconds } = useAutoTuneTarget(track?.sourceId ?? null, songKey,
     track ? snapshot.targetGeneration : undefined);
   const autoApplyEnabled = useAutoApplyEnabled();
   const written = useAutoApplyTarget(target, track ? songKey : "", autoApplyEnabled, setNotice);
@@ -134,7 +134,7 @@ export function App() {
       <header className="titlebar">
         <div className="brand" data-tauri-drag-region>
           <MusicNotes size={17} weight="bold" aria-hidden="true" />
-          <KeyTitle target={target} written={written} enabled={autoApplyEnabled} />
+          <KeyTitle target={target} evidenceSeconds={evidenceSeconds} written={written} enabled={autoApplyEnabled} />
         </div>
         <div className="window-actions">
           <WindowButton label={pinned ? "取消置顶" : "窗口置顶"} active={pinned} onClick={() => void togglePin()}>

@@ -90,6 +90,10 @@ test("the switch defaults off, persists across windows and reloads, and writes e
   await expect.poll(() => applies(page)).toEqual([{ key: "F#", scale: "Minor" }]);
   await expect(await tooltip(page)).toHaveText("已分析 12 秒。已写入当前连接的插件。");
   await expect(page.locator('[aria-label="写入失败"]')).toHaveCount(0);
+  // The seconds in the open tooltip follow the analysis while the pair stays the same, and the
+  // unchanged pair is not written again (the applies assertion below).
+  await setTarget(page, { key: 6, scale: "minor", evidenceSeconds: 15, source: "analysis" });
+  await expect(page.locator(".warm-tooltip")).toHaveText("已分析 15 秒。已写入当前连接的插件。", { timeout: 2500 });
   await page.screenshot({ path: "artifacts/auto-apply-status.png" });
   await panel.locator(".auto-apply-settings").evaluate(el => el.scrollIntoView({ block: "center" }));
   await panel.screenshot({ path: "artifacts/auto-apply-settings.png" });

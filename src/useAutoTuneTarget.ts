@@ -70,7 +70,7 @@ export function useKeyDetectionSnapshot(sourceId: string | null, trackKey: strin
 
 /** The Key/Scale recommendation for the current track. */
 export function useAutoTuneTarget(sourceId: string | null, trackKey: string,
-  targetGeneration: number | undefined): { target: AutoTuneTarget | null } {
+  targetGeneration: number | undefined): { target: AutoTuneTarget | null; evidenceSeconds: number } {
   const snapshot = useKeyDetectionSnapshot(sourceId, trackKey, targetGeneration);
   const target = autotuneTarget(snapshot, sourceId, trackKey, targetGeneration);
   // Keep one object per distinct target (see sameTarget) so effects keyed on it do not
@@ -78,5 +78,6 @@ export function useAutoTuneTarget(sourceId: string | null, trackKey: string,
   const stable = useRef<AutoTuneTarget | null>(null);
   if (!target) stable.current = null;
   else if (!stable.current || !sameTarget(stable.current, target)) stable.current = target;
-  return { target: stable.current };
+  // The live seconds are for display only; the write effect must keep using the stable target.
+  return { target: stable.current, evidenceSeconds: target?.evidenceSeconds ?? 0 };
 }

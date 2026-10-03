@@ -16,9 +16,10 @@ function KeyTitleFrame({ displayed, detected }: { displayed: string; detected: b
 
 // The one Key/Scale title: the plugin pair being (or about to be) written, e.g. "F Minor",
 // "F Chromatic" or "Chromatic". Evidence, uncertainty and write status live in its tooltip.
-// Without a valid target it shows the brand.
-export function KeyTitle({ target, written, enabled }: {
-  target: AutoTuneTarget | null; written: WrittenPair | null; enabled: boolean;
+// Without a valid target it shows the brand. `target` is the stable one (title, write status);
+// evidenceSeconds is the live count, for the tooltip only.
+export function KeyTitle({ target, evidenceSeconds, written, enabled }: {
+  target: AutoTuneTarget | null; evidenceSeconds: number; written: WrittenPair | null; enabled: boolean;
 }) {
   const label = target && titleLabel(target);
   const displayed = label ?? "Tune Love";
@@ -32,7 +33,7 @@ export function KeyTitle({ target, written, enabled }: {
   </span>;
   // One constant tree, so the brand-to-key change animates inside the same AnimatePresence;
   // without a target the tooltip is disabled and the title stays part of the drag region.
-  return <AppTooltip disabled={!target} content={target ? targetTooltip(target, written, enabled) : ""}
+  return <AppTooltip disabled={!target} content={target ? targetTooltip({ ...target, evidenceSeconds }, written, enabled) : ""}
     className={target ? "key-title-trigger" : undefined}>
     <span className="key-title-hit" tabIndex={target ? 0 : undefined}>
       {stage}

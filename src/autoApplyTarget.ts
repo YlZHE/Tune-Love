@@ -1,25 +1,31 @@
 import type { ControlState } from "./autotuneControl";
-import { targetLabel, targetOptionLabels, type AutoTuneTarget } from "./keyDetection";
+import { targetLabel, targetOptionLabels, type AutoTuneTarget, type OptionPair } from "./keyDetection";
 
-export type OptionPair = { key: string; scale: "Major" | "Minor" };
+export type { OptionPair };
 // The last pair handed to the bridge for one (connection, track). A failed
 // write stays remembered so the same pair is never retried automatically.
 export type WrittenPair = OptionPair & {
   connectionId: string; trackKey: string; status: "pending" | "written" | "failed";
 };
 
+/** What the plugin should be set to: a target (or no evidence yet) as an option pair. Chromatic
+ * degrades to the Major/Minor candidate when the plugin has no Chromatic option. */
+function effectivePair(target: AutoTuneTarget | null, chromaticSupported: boolean): OptionPair | null {
+  if (!target) return chromaticSupported ? { key: null, scale: "Chromatic" } : null;
+  if (target.scale !== "chromatic" || chromaticSupported) return targetOptionLabels(target);
+  return target.candidate ? targetOptionLabels({ ...target, ...target.candidate }) : null;
+}
+
 /** The pair to send now, or null when nothing should be written. */
 export function nextWrite(prev: WrittenPair | null, target: AutoTuneTarget | null,
-  state: ControlState, trackKey: string): OptionPair | null {
+  state: ControlState, trackKey: string, chromaticSupported: boolean): OptionPair | null {
   if (!trackKey || state.phase !== "ready" || !state.connectionId
-    || !state.capabilities.includes("key") || !state.capabilities.includes("scale")) return null;
-  // No target means the song has no evidence yet; nothing is written. Chromatic
-  // is never recommended (it barely corrects a voice in practice).
-  const labels = target && targetOptionLabels(target);
-  if (!labels) return null;
+    || !state.capabilities.includes("scale")) return null;
+  const pair = effectivePair(target, chromaticSupported);
+  if (!pair || (pair.key !== null && !state.capabilities.includes("key"))) return null;
   if (prev && prev.connectionId === state.connectionId && prev.trackKey === trackKey
-    && prev.key === labels.key && prev.scale === labels.scale) return null;
-  return labels;
+    && prev.key === pair.key && prev.scale === pair.scale) return null;
+  return pair;
 }
 
 export function matchesTarget(prev: WrittenPair | null, target: AutoTuneTarget): prev is WrittenPair {

@@ -86,6 +86,8 @@ export class AutoTuneControl {
   private tail: Promise<unknown> = Promise.resolve();
   private sequence = Date.now() * 1000;
   private epoch = 0;
+  private candidateId: string | null = null;
+  private chromatic: { connectionId: string; supported: Promise<boolean> } | null = null;
   private batch: { connectionId: string; epoch: number; values: ApplyValues; done: Promise<void> } | null = null;
   constructor(private invoke: (request: BridgeRequest) => Promise<BridgeResponse>) {}
   getSnapshot = () => this.state;
@@ -122,11 +124,13 @@ export class AutoTuneControl {
   };
   connect = (candidateId: string) => {
     const epoch = ++this.epoch;
+    this.candidateId = candidateId;
     this.publish(initialControlState);
     return this.enqueue(() => this.call({ op: "connect", candidateId }, epoch));
   };
   disconnect = () => {
     const epoch = ++this.epoch;
+    this.candidateId = null;
     this.publish(initialControlState);
     return this.enqueue(() => this.call({ op: "disconnect" }, epoch));
   };
@@ -149,6 +153,17 @@ export class AutoTuneControl {
     if (!response.options) throw new Error("未返回配置选项");
     return response.options;
   };
+  /** Whether the connected plugin's Scale list has Chromatic; asked once per connection,
+   * and any failure (or an unknown candidate) counts as not supported. */
+  supportsChromatic(): Promise<boolean> {
+    const { connectionId } = this.state;
+    if (!connectionId || !this.candidateId) return Promise.resolve(false);
+    if (this.chromatic?.connectionId !== connectionId) {
+      this.chromatic = { connectionId, supported: this.getOptions(this.candidateId, "scale")
+        .then(options => options.options.some(option => option.label === "Chromatic"), () => false) };
+    }
+    return this.chromatic.supported;
+  }
   setValue(role: ControlRole, value: number) {
     return this.setConvertedValue(role, value, normalizeControlValue);
   }

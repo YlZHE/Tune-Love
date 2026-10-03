@@ -291,14 +291,22 @@ pub async fn download_file<F: Fetcher>(
     if let Some(dir) = final_path.parent() {
         local(fs::create_dir_all(dir))?;
     }
-    let mut mismatched_before = false;
+    // After a hash mismatch: the source that served the bad file, left out of the one restart.
+    let mut bad_source: Option<String> = None;
     loop {
         let mut part = Part::open(file, final_path, progress)?;
         if part.written < file.bytes {
-            fetch_into(fetcher, file, candidates, policy, cancel, progress, &mut part).await?;
+            let sources: Vec<Candidate> = candidates
+                .iter()
+                .filter(|c| bad_source.as_ref() != Some(&c.kind.label()))
+                .cloned()
+                .collect();
+            fetch_into(fetcher, file, &sources, policy, cancel, progress, &mut part).await?;
         }
         progress(Update::Verifying);
         let (part_file, meta_file) = (part.path.clone(), part.meta_path.clone());
+        // The source the latest bytes came from (for a resumed `.part`, as `.part.json` recorded).
+        let served_by = part.source.clone();
         let sha256 = part.finish();
         if sha256 == file.sha256 {
             install(&part_file, final_path, &sha256)?;
@@ -310,11 +318,12 @@ pub async fn download_file<F: Fetcher>(
         eprintln!("model download: {} SHA-256 mismatch (got {sha256})", file.file);
         remove_if_present(&part_file)?;
         remove_if_present(&meta_file)?;
-        if mismatched_before {
+        // Once more, in full, from the first source, skipping the one that served the bad file;
+        // with no other source left there is nothing to retry.
+        if bad_source.is_some() || candidates.iter().all(|c| c.kind.label() == served_by) {
             return Err(ModelError::Sha256Mismatch);
         }
-        // Once more, in full, from the first source.
-        mismatched_before = true;
+        bad_source = Some(served_by);
     }
 }
 
@@ -928,28 +937,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sha_mismatch_redownloads_once_from_the_first_source() {
+    async fn sha_mismatch_redownloads_once_skipping_the_source_that_served_it() {
         let t = T::new("dl-sha-once");
         let mut bad = t.data.clone();
         bad[1234] ^= 1;
         let f = FakeFetcher::new();
+        let m1 = mirror("ghfast.top");
         f.script(ORIGIN, vec![ok200(&bad), ok200(&t.data)]);
+        f.script(&m1, vec![ok200(&t.data)]);
         assert_eq!(t.run(&f).await, Ok(()));
-        assert_eq!(f.calls(), calls(&[(ORIGIN, 0), (ORIGIN, 0)]));
+        assert_eq!(f.calls(), calls(&[(ORIGIN, 0), (&m1, 0)]));
         t.assert_installed();
     }
 
     #[tokio::test]
-    async fn sha_mismatch_restarts_from_the_first_source_even_after_a_mirror() {
+    async fn sha_mismatch_from_a_mirror_restarts_without_that_mirror() {
         let t = T::new("dl-sha-mirror");
         let mut bad = t.data.clone();
         bad[0] ^= 1;
         let f = FakeFetcher::new();
-        let m1 = mirror("ghfast.top");
-        f.script(ORIGIN, vec![FakeReply::Fail(FetchError::Status(404)), ok200(&t.data)]);
-        f.script(&m1, vec![ok200(&bad)]);
+        let (m1, m2) = (mirror("ghfast.top"), mirror("ghproxy.net"));
+        // The origin refuses every time; the first mirror serves a full-size wrong file and would
+        // serve the right one if asked again.
+        f.script(ORIGIN, vec![FakeReply::Fail(FetchError::Status(404)), FakeReply::Fail(FetchError::Status(404))]);
+        f.script(&m1, vec![ok200(&bad), ok200(&t.data)]);
+        f.script(&m2, vec![ok200(&t.data)]);
         assert_eq!(t.run(&f).await, Ok(()));
-        assert_eq!(f.calls(), calls(&[(ORIGIN, 0), (&m1, 0), (ORIGIN, 0)]));
+        // The full restart starts from the first source again, but not from the mirror that
+        // served the bad file: it goes on to the next one.
+        assert_eq!(f.calls(), calls(&[(ORIGIN, 0), (&m1, 0), (ORIGIN, 0), (&m2, 0)]));
         t.assert_installed();
     }
 
@@ -959,9 +975,25 @@ mod tests {
         let mut bad = t.data.clone();
         bad[SIZE - 1] ^= 1;
         let f = FakeFetcher::new();
-        f.script(ORIGIN, vec![ok200(&bad), ok200(&bad), ok200(&t.data)]);
+        let m1 = mirror("ghfast.top");
+        f.script(ORIGIN, vec![ok200(&bad), ok200(&t.data)]);
+        f.script(&m1, vec![ok200(&bad), ok200(&t.data)]);
         assert_eq!(t.run(&f).await, Err(ModelError::Sha256Mismatch));
-        assert_eq!(f.calls().len(), 2);
+        assert_eq!(f.calls(), calls(&[(ORIGIN, 0), (&m1, 0)]));
+        assert!(!t.final_path.exists() && !t.part().exists() && !t.meta().exists());
+    }
+
+    #[tokio::test]
+    async fn sha_mismatch_from_the_only_source_fails_without_asking_it_again() {
+        let t = T::new("dl-sha-only");
+        let mut bad = t.data.clone();
+        bad[7] ^= 1;
+        let f = FakeFetcher::new();
+        f.script(ORIGIN, vec![ok200(&bad), ok200(&t.data)]);
+        let only = vec![t.cands[0].clone()];
+        let r = download_file(&f, &t.spec, &t.final_path, &only, &POLICY, &AtomicBool::new(false), &|_| {}).await;
+        assert_eq!(r, Err(ModelError::Sha256Mismatch));
+        assert_eq!(f.calls(), calls(&[(ORIGIN, 0)]));
         assert!(!t.final_path.exists() && !t.part().exists() && !t.meta().exists());
     }
 

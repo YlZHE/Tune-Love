@@ -35,7 +35,7 @@ pub const CONFIRM_FRAMES: usize = 110;
 pub const CONFIRM_TOLERANCE_DB: f32 = 6.0;
 /// Longest a confirmation window stays open after it opened.
 pub const CONFIRM_TIMEOUT_US: u64 = 150_000;
-/// Reference: the latest 20 chunks (about 50 ms) recorded before the attach.
+/// Reference: the latest 20 judged-size chunks (about 50 ms) recorded before the attach.
 pub const CONFIRM_REF_CHUNKS: usize = 20;
 /// At least this many chunks' worth of reference (about 20 ms), counted in frames.
 pub const CONFIRM_MIN_REF_CHUNKS: usize = 8;
@@ -44,8 +44,12 @@ pub const CONFIRM_SILENCE_RMS: f32 = 1.0e-3;
 
 /// A chunk shorter than this (a packet's remainder, e.g. the 1 frame of 441 = 4 x 110 + 1)
 /// is too short to judge: a frame near a zero crossing reads as a deeper step. It keeps the
-/// step of the chunk before it in the window (still capped), or the conservative gain.
+/// step of the chunk before it in the window (still capped), or the conservative gain, and
+/// it is not recorded as reference (it would take a whole ring slot).
 const MIN_JUDGED_FRAMES: usize = CONFIRM_FRAMES / 2;
+
+/// Relative margin below the RMS and peak caps (about -0.00001 dB).
+const CAP_MARGIN: f32 = 1.0e-6;
 
 /// The smallest issued step `j` in `0..=issued` (0 = not lowered yet) whose attenuation
 /// `20 log10(ramp_value(original, HELD_VOLUME, j) / original)` is within `tol_db` of
@@ -78,7 +82,8 @@ struct Window {
 
 /// Per-chunk R2 decision state (see the module docs). Owned by the capture thread.
 pub(crate) struct LevelConfirm {
-    /// Ring of reference chunks: sum of squares, samples, peak.
+    /// Ring of reference chunks (at least [`MIN_JUDGED_FRAMES`] each): sum of squares,
+    /// samples, peak.
     ref_sum_sq: [f64; CONFIRM_REF_CHUNKS],
     ref_samples: [usize; CONFIRM_REF_CHUNKS],
     ref_peak: [f32; CONFIRM_REF_CHUNKS],
@@ -151,7 +156,7 @@ impl LevelConfirm {
     pub fn chunk_gain(&mut self, raw: &[f32], conservative: f32) -> f32 {
         let (sum_sq, peak) = level(raw);
         let Some(w) = self.window.as_mut() else {
-            if self.recording && !raw.is_empty() {
+            if self.recording && raw.len() / 2 >= MIN_JUDGED_FRAMES {
                 self.push_reference(sum_sq, raw.len(), peak);
             }
             return conservative;
@@ -184,15 +189,23 @@ impl LevelConfirm {
             self.fallback += 1;
             return conservative;
         };
-        self.confirmed += 1;
         let step_gain = w.original / ramp_value(w.original, HELD_VOLUME, j);
         let rms_cap = (reference.energy / e).sqrt() as f32;
         let peak_cap = reference.peak / peak;
-        conservative.max(step_gain.min(rms_cap).min(peak_cap))
+        // The margin absorbs f32 rounding, so a raised chunk is never above the reference.
+        let raised = step_gain.min(rms_cap).min(peak_cap) * (1.0 - CAP_MARGIN);
+        if raised > conservative {
+            self.confirmed += 1;
+            raised
+        } else {
+            conservative
+        }
     }
 
-    /// Chunks confirmed (step gain applied) and fallen back (conservative inside a window)
-    /// since the last call.
+    /// Chunks confirmed (raised above the conservative gain by a matched step) and fallen
+    /// back (conservative inside a window: no usable reference, no match, non-finite) since
+    /// the last call. A match whose capped gain is not above the conservative gain is
+    /// neither.
     pub fn take_counts(&mut self) -> (u64, u64) {
         let counts = (self.confirmed, self.fallback);
         self.confirmed = 0;
@@ -354,11 +367,7 @@ mod tests {
         let g = c.chunk_gain(&chunk, 1.0);
         assert!(g > 1.0, "confirmed: {g}");
         for &i in &loud {
-            assert!(
-                (chunk[i] * g).abs() <= 0.1 * (1.0 + 1e-6),
-                "{}",
-                chunk[i] * g
-            );
+            assert!((chunk[i] * g).abs() <= 0.1, "{}", chunk[i] * g);
         }
         assert_eq!(c.take_counts(), (1, 0));
     }
@@ -421,6 +430,41 @@ mod tests {
         let g = c.chunk_gain(&alt(step_amp(0.1, 0.5, 2), CONFIRM_FRAMES), 1.5);
         assert!(g > 1.5, "{g}");
         assert_eq!(c.take_counts(), (1, 1));
+    }
+
+    /// `r2_ok` counts only chunks R2 actually raised: a match whose capped gain is not above
+    /// the conservative gain returns the conservative gain and is neither count.
+    #[test]
+    fn a_match_that_is_not_raised_is_not_counted() {
+        let mut c = confirm_with_reference(0.1, 20, 2, 0.5);
+        // Not lowered yet (step 0, gain 1).
+        assert_eq!(c.chunk_gain(&alt(0.1, CONFIRM_FRAMES), 1.0), 1.0);
+        // Step 2 matched, but the conservative gain is already higher.
+        let chunk = alt(step_amp(0.1, 0.5, 2), CONFIRM_FRAMES);
+        assert_eq!(c.chunk_gain(&chunk, 100.0), 100.0);
+        assert_eq!(c.take_counts(), (0, 0));
+        assert!(c.chunk_gain(&chunk, 1.0) > 1.0);
+        assert_eq!(c.take_counts(), (1, 0));
+    }
+
+    /// Packet remainders (1 frame of 441) are not recorded, so they cannot push the full
+    /// chunks out of the 20-slot ring.
+    #[test]
+    fn short_chunks_stay_out_of_the_reference() {
+        let mut c = LevelConfirm::new();
+        c.observe(None, T0 - 60_000);
+        let full = alt(0.1, CONFIRM_FRAMES);
+        let tail = alt(0.5, 1);
+        for _ in 0..CONFIRM_REF_CHUNKS {
+            c.chunk_gain(&full, 1.0);
+        }
+        for _ in 0..CONFIRM_REF_CHUNKS {
+            c.chunk_gain(&tail, 1.0);
+        }
+        c.observe(ramp(2, 0.5), T0);
+        let g = c.chunk_gain(&alt(step_amp(0.1, 0.5, 2), CONFIRM_FRAMES), 1.0);
+        let step_gain = 0.5 / ramp_value(0.5, HELD_VOLUME, 2);
+        assert!(close(g, step_gain), "reference kept: {g} vs {step_gain}");
     }
 
     /// Review Focus 2: a device change silences the capture; R2 never lifts it.
@@ -662,6 +706,9 @@ mod tests {
                 .enumerate()
             {
                 if !window_seen {
+                    if rc.len() / 2 < MIN_JUDGED_FRAMES {
+                        continue; // not recorded as reference
+                    }
                     let sum: f64 = rc.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
                     let peak = rc.iter().fold(0.0f32, |m, s| m.max(s.abs()));
                     pre.push((sum, rc.len(), peak));
@@ -710,7 +757,7 @@ mod tests {
                 for phi in (0..10).map(|k| k * 1_000) {
                     let r = simulate(source, original, d, phi, true);
                     assert!(
-                        r.worst_rms <= 1.0001 && r.worst_peak <= 1.0001,
+                        r.worst_rms <= 1.0 && r.worst_peak <= 1.0,
                         "{source:?} original {original} d {d} phi {phi}: {r:?}"
                     );
                     worst.worst_rms = worst.worst_rms.max(r.worst_rms);

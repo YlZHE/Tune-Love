@@ -131,7 +131,8 @@ pub struct DiagCounters {
     pub capture_flag_discontinuity: AtomicU64,
     pub capture_flag_timestamp: AtomicU64,
     pub capture_ring_overflow_frames: AtomicU64,
-    /// R2: capture chunks (about 2.5 ms) whose level confirmed an attach step's gain.
+    /// R2: capture chunks (about 2.5 ms) raised above the conservative gain because their
+    /// level matched an issued attach step.
     pub capture_confirm_chunks: AtomicU64,
     /// R2: capture chunks inside a confirmation window that kept the conservative gain (no
     /// usable reference, or the level matched no issued step).
@@ -1318,8 +1319,10 @@ mod tests {
             original: 0.5,
         }));
         let mut confirm = confirm::LevelConfirm::new();
-        let quiet = vec![0.002f32; 441 * 2];
-        let mut lowered = vec![0.002f32; 441 * 2];
+        // Reference at 0.1; the lowered packet at step 1 of original 0.5 (about -18.5 dB).
+        let reference = vec![0.1f32; 441 * 2];
+        let mut lowered = vec![0.0f32; 441 * 2];
+        let mut confirmed = 0u64;
         let before = alloc_count::this_thread();
         for i in 0..50u64 {
             cond.condition(&mut loud, 1.0, &stats, &follow, |_| {});
@@ -1330,9 +1333,13 @@ mod tests {
                 steps: 2,
                 original: 0.5,
             });
+            let in_window = ramp.is_some();
             confirm.observe(ramp, i * 10_000);
-            let _ = confirm.chunk_gain(&quiet[..110 * 2], 1.0);
-            lowered.fill(0.00024); // about step 1 of original 0.5
+            if in_window {
+                lowered.fill(0.0119);
+            } else {
+                lowered.copy_from_slice(&reference);
+            }
             cond.condition_with(
                 &mut lowered,
                 |raw| confirm.chunk_gain(raw, 1.0),
@@ -1340,7 +1347,7 @@ mod tests {
                 &follow,
                 |_| {},
             );
-            let _ = confirm.take_counts();
+            confirmed += confirm.take_counts().0;
             fade.start(10);
             fade.apply(&mut block);
             let _ = mk_tx.push(i * 441 + 300);
@@ -1379,6 +1386,7 @@ mod tests {
         }
         assert_eq!(alloc_count::this_thread() - before, 0);
         assert!(power.is_finite());
+        assert!(confirmed > 0, "the confirmed branch ran");
     }
 
     #[test]

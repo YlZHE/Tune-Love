@@ -165,6 +165,10 @@ pub trait AudioPort {
     fn fallback_reason(&self) -> Option<FallbackReason>;
     /// The safety guard asks for an immediate `Holder::follow` (cleared by the call).
     fn take_follow_request(&self) -> bool;
+    /// The next log line about a forced fallback or an overload retry (ruling 24).
+    fn take_fallback_log(&self) -> Option<String> {
+        None
+    }
     fn stats(&self) -> AudioSnapshot;
     /// Frames captured from the player since the audio started (0 while stopped).
     fn input_frames(&self) -> u64;
@@ -463,6 +467,9 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             if !self.audio_live() || self.audio.stage() != before || now_us >= until {
                 self.toggle_settle = None;
             }
+        }
+        while let Some(line) = self.audio.take_fallback_log() {
+            eprintln!("{line}");
         }
         self.metrics(now_us, &mut ev);
         self.sync_state(now_us, &mut ev);
@@ -1103,6 +1110,10 @@ impl AudioPort for RealAudio {
         self.handle
             .as_ref()
             .is_some_and(|h| h.take_follow_request())
+    }
+
+    fn take_fallback_log(&self) -> Option<String> {
+        self.handle.as_ref().and_then(|h| h.take_fallback_log())
     }
 
     fn stats(&self) -> AudioSnapshot {

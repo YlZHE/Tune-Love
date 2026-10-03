@@ -17,8 +17,8 @@ use devocal_core::protocol::FallbackReason;
 use rtrb::{Consumer, Producer};
 
 use super::{
-    edge_fade_frames, is_backlogged, now_us, reason_code, stage_code, unpack_starvation,
-    AudioStats, FadeIn, InputMarker, Mmcss, ProcCommand, Shared, Starvation,
+    edge_fade_frames, now_us, reason_code, stage_code, unpack_starvation, AudioStats, FadeIn,
+    InputMarker, Mmcss, ProcCommand, Shared, Starvation,
 };
 use crate::dsp::SAMPLE_RATE;
 use crate::load::LoadMonitor;
@@ -43,21 +43,89 @@ pub(crate) struct ProcessingCtx {
     pub stats: Arc<AudioStats>,
 }
 
-/// Ruling 18 overload decision for one processed block. Never while the user toggle is off
-/// or the model is not running. LoadMonitor overload always forces the fallback; a counted
-/// underrun only when, at that starvation, the model ran and ring A held at least one hop
-/// (processing was behind). Any other underrun is jitter, absorbed by render headroom.
+/// Overload decision for one processed block (rulings 18 and 24). Never while the user
+/// toggle is off, the model is not running, or the processor is warming up (its output is
+/// the passthrough). LoadMonitor overload forces the fallback; a counted underrun only when
+/// the render thread judged it forcing (`Starvation::force`: processing behind again within
+/// `render::OVERLOAD_REPEAT_US`, or with the jitter headroom at its cap). Any other underrun
+/// is absorbed by render headroom.
 pub fn should_force_fallback(
     underrun: Option<Starvation>,
-    hop: usize,
     user_on: bool,
     ran_model: bool,
     overloaded: bool,
+    stage: Stage,
 ) -> bool {
-    if !user_on || !ran_model {
+    if !user_on || !ran_model || stage == Stage::WarmingUp {
         return false;
     }
-    overloaded || underrun.is_some_and(|u| is_backlogged(u.ran_model, u.backlog_frames, hop))
+    overloaded || underrun.is_some_and(|u| u.force)
+}
+
+/// Ruling 24: an overload fallback is retried (devocal on again, with a pre-roll) this long
+/// after it was forced...
+pub const OVERLOAD_RETRY_DELAY_US: u64 = 5_000_000;
+/// ...at most this many times per user "on"; once spent, the fallback stays.
+pub const OVERLOAD_RETRIES: u32 = 1;
+
+/// Ruling 24: when to retry devocal after a forced overload fallback. Pure; times in us.
+#[derive(Debug)]
+pub(crate) struct OverloadRetry {
+    due_us: Option<u64>,
+    left: u32,
+}
+
+impl OverloadRetry {
+    pub fn new() -> Self {
+        Self {
+            due_us: None,
+            left: OVERLOAD_RETRIES,
+        }
+    }
+
+    /// A user "on": a fresh retry budget, nothing scheduled.
+    pub fn user_on(&mut self) {
+        *self = Self::new();
+    }
+
+    /// A user "off": nothing scheduled.
+    pub fn user_off(&mut self) {
+        self.due_us = None;
+    }
+
+    /// An overload fallback was forced at `now_us`; true if a retry is scheduled.
+    pub fn forced(&mut self, now_us: u64) -> bool {
+        self.due_us = (self.left > 0).then_some(now_us + OVERLOAD_RETRY_DELAY_US);
+        self.due_us.is_some()
+    }
+
+    pub fn pending(&self) -> bool {
+        self.due_us.is_some()
+    }
+
+    /// True once when the scheduled retry is due and the processor is still in the overload
+    /// fallback with the user toggle on (spends one retry). Anything else at the due time
+    /// drops the schedule.
+    pub fn poll(
+        &mut self,
+        now_us: u64,
+        stage: Stage,
+        reason: Option<FallbackReason>,
+        user_on: bool,
+    ) -> bool {
+        let Some(due) = self.due_us else {
+            return false;
+        };
+        if now_us < due {
+            return false;
+        }
+        self.due_us = None;
+        if user_on && stage == Stage::Fallback && reason == Some(FallbackReason::Overload) {
+            self.left -= 1;
+            return true;
+        }
+        false
+    }
 }
 
 /// Pops one block from ring A into `block` and publishes the input still waiting behind it.
@@ -92,6 +160,8 @@ struct State {
     /// Fades the output in after a reset (skips the cleared delay line first).
     fade_in: FadeIn,
     last_block_us: u64,
+    /// Ruling 24: retry after a forced overload fallback.
+    retry: OverloadRetry,
 }
 
 /// Runs until the stop flag; returns the model (the newest one handed over: a pending swap
@@ -112,6 +182,7 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
         underrun_base: 0,
         fade_in: FadeIn::new(edge_fade_frames()),
         last_block_us: now_us(),
+        retry: OverloadRetry::new(),
     };
     st.underrun_base = ctx.stats.underruns.load(Ordering::Acquire);
     publish_config(&ctx, &st);
@@ -123,6 +194,9 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
             publish_state(&ctx);
         }
         if try_swap(&mut ctx, &mut st) {
+            publish_state(&ctx);
+        }
+        if st.retry.pending() && retry_overload(&mut ctx, &mut st, now_us()) {
             publish_state(&ctx);
         }
 
@@ -181,9 +255,11 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
         ctx.stats.diag.proc_blocks.fetch_add(1, Ordering::Relaxed);
 
         let t0 = now_us();
+        ctx.shared.block_start_us.store(t0, Ordering::Relaxed);
         let report = ctx.processor.process_block(&st.in_block, &mut st.out_block);
         let t1 = now_us();
         st.last_block_us = t1;
+        ctx.stats.diag.note_block_time(t1 - t0);
         st.fade_in.apply(&mut st.out_block);
 
         // Load: only blocks that ran the model count; otherwise start a fresh window
@@ -198,11 +274,14 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
         let underrun = (underruns > st.underrun_base)
             .then(|| unpack_starvation(ctx.shared.underrun_snapshot.load(Ordering::Acquire)));
         let overloaded = report.ran_model && st.load.overloaded();
-        if should_force_fallback(underrun, st.hop, st.user_on, report.ran_model, overloaded) {
-            ctx.processor.force_fallback(FallbackReason::Overload);
-            if overloaded {
-                st.load.reset();
-            }
+        if should_force_fallback(
+            underrun,
+            st.user_on,
+            report.ran_model,
+            overloaded,
+            ctx.processor.stage(),
+        ) {
+            force_overload(&mut ctx, &mut st, overloaded, t1);
         }
         st.underrun_base = underruns;
         publish_state(&ctx);
@@ -220,12 +299,15 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
             // Cleared only once the block is in ring B: for a moment it counts twice (never
             // zero times) in the latency estimate (ruling 23).
             ctx.shared.proc_in_flight_frames.store(0, Ordering::Relaxed);
+            ctx.shared.last_push_us.store(t1, Ordering::Relaxed);
+            ctx.shared.block_start_us.store(0, Ordering::Relaxed);
             st.out_pos += st.hop as u64;
             // O2: the render thread writes the block to the device on arrival.
             ctx.shared.render_wake.set();
         } else {
             // Ring B full (render stalled): drop the block, fade around the jump.
             ctx.shared.proc_in_flight_frames.store(0, Ordering::Relaxed);
+            ctx.shared.block_start_us.store(0, Ordering::Relaxed);
             ctx.stats
                 .diag
                 .proc_ring_b_drops
@@ -253,10 +335,62 @@ fn begin_gap(ctx: &mut ProcessingCtx, st: &mut State) {
     st.fade_in.start(st.latency);
 }
 
+/// Forces `Fallback(Overload)` (load or underrun), records it for the engine log and
+/// schedules the ruling 24 retry. A fallback already under way is not recorded again.
+fn force_overload(ctx: &mut ProcessingCtx, st: &mut State, overloaded: bool, now: u64) {
+    let fresh = ctx.processor.fallback_reason().is_none();
+    let stage = ctx.processor.stage();
+    ctx.processor.force_fallback(FallbackReason::Overload);
+    if overloaded {
+        st.load.reset();
+    }
+    if !fresh {
+        return;
+    }
+    let log = &ctx.shared.fallback_log;
+    log.trigger
+        .store(if overloaded { 2 } else { 1 }, Ordering::Relaxed);
+    log.forced_at_us.store(now, Ordering::Relaxed);
+    log.load_milli
+        .store((st.load.ratio() * 1000.0).round() as u32, Ordering::Relaxed);
+    log.stage.store(stage_code(stage), Ordering::Relaxed);
+    log.retry_armed
+        .store(st.retry.forced(now), Ordering::Relaxed);
+    log.forced.fetch_add(1, Ordering::Release);
+}
+
+/// Ruling 24: devocal on again after an overload fallback, through the same path as a user
+/// "on" (model reset, warm-up, fade-in, render pre-roll). Not while a model swap is pending
+/// (the swap re-enables devocal itself). True if it did.
+fn retry_overload(ctx: &mut ProcessingCtx, st: &mut State, now: u64) -> bool {
+    if st.pending.is_some()
+        || !st.retry.poll(
+            now,
+            ctx.processor.stage(),
+            ctx.processor.fallback_reason(),
+            st.user_on,
+        )
+    {
+        return false;
+    }
+    ctx.processor.request_devocal(true);
+    accept_on(ctx, st);
+    ctx.shared
+        .fallback_log
+        .retries
+        .fetch_add(1, Ordering::Release);
+    true
+}
+
 fn apply_command(ctx: &mut ProcessingCtx, st: &mut State, cmd: ProcCommand) {
     match cmd {
         ProcCommand::SetDevocal(on) => {
             st.user_on = on;
+            if on {
+                st.retry.user_on();
+            } else {
+                st.retry.user_off();
+            }
             // While a model swap is pending the request is applied after the swap.
             if st.pending.is_none() {
                 ctx.processor.request_devocal(on);
@@ -349,6 +483,7 @@ fn publish_config(ctx: &ProcessingCtx, st: &State) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::is_backlogged;
     use super::*;
 
     const HOP: usize = 128;
@@ -357,6 +492,7 @@ mod tests {
         Some(Starvation {
             ran_model,
             backlog_frames,
+            ..Starvation::default()
         })
     }
 
@@ -384,79 +520,233 @@ mod tests {
         assert!(!pop_block(&mut rx, &mut block, &backlog));
     }
 
-    #[test]
-    fn jitter_underrun_does_not_force_fallback() {
-        // Model running, but ring A held less than a hop: processing kept up.
-        assert!(!should_force_fallback(
-            starved(true, 0),
-            HOP,
-            true,
-            true,
-            false
-        ));
-        assert!(!should_force_fallback(
-            starved(true, HOP - 1),
-            HOP,
-            true,
-            true,
-            false
-        ));
-        // Starved while the model was not running (passthrough).
-        assert!(!should_force_fallback(
-            starved(false, 4 * HOP),
-            HOP,
-            true,
-            true,
-            false
-        ));
-        assert!(!should_force_fallback(None, HOP, true, true, false));
+    fn forcing(backlog_frames: usize) -> Option<Starvation> {
+        Some(Starvation {
+            ran_model: true,
+            backlog_frames,
+            warming: false,
+            force: true,
+        })
     }
 
+    /// Ruling 24: an underrun forces the fallback only when the render thread judged it
+    /// forcing (`force`), whatever the backlog it saw.
     #[test]
-    fn backlogged_underrun_forces_fallback() {
-        assert!(should_force_fallback(
-            starved(true, HOP),
-            HOP,
+    fn only_a_forcing_underrun_forces_fallback() {
+        let s = Stage::Devocal;
+        assert!(!should_force_fallback(
+            starved(true, 0),
             true,
             true,
-            false
+            false,
+            s
         ));
+        assert!(
+            !should_force_fallback(starved(true, 10 * HOP), true, true, false, s),
+            "a backlogged hiccup alone is absorbed as jitter"
+        );
+        assert!(!should_force_fallback(None, true, true, false, s));
+        assert!(should_force_fallback(forcing(HOP), true, true, false, s));
         assert!(should_force_fallback(
-            starved(true, 10 * HOP),
-            HOP,
+            forcing(0),
             true,
             true,
-            false
+            false,
+            Stage::FadingIn
         ));
     }
 
     #[test]
     fn load_overload_forces_fallback() {
-        assert!(should_force_fallback(None, HOP, true, true, true));
+        assert!(should_force_fallback(
+            None,
+            true,
+            true,
+            true,
+            Stage::Devocal
+        ));
         assert!(should_force_fallback(
             starved(true, 0),
-            HOP,
             true,
             true,
-            true
+            true,
+            Stage::Devocal
         ));
     }
 
     #[test]
-    fn nothing_forced_while_user_off_or_model_idle() {
+    fn nothing_forced_while_user_off_model_idle_or_warming_up() {
+        let s = Stage::Devocal;
+        assert!(!should_force_fallback(forcing(HOP), false, true, true, s));
+        assert!(!should_force_fallback(forcing(HOP), true, false, true, s));
         assert!(!should_force_fallback(
-            starved(true, 10 * HOP),
-            HOP,
-            false,
+            forcing(HOP),
             true,
-            true
+            true,
+            true,
+            Stage::WarmingUp
         ));
-        assert!(!should_force_fallback(
-            starved(true, 10 * HOP),
-            HOP,
-            true,
-            false,
-            true
+    }
+
+    /// Ruling 24 (2): one retry, `OVERLOAD_RETRY_DELAY_US` after the forced fallback, only
+    /// while still in the overload fallback with the user on; a user "on" restores the
+    /// budget, a user "off" cancels.
+    #[test]
+    fn overload_retry_fires_once_after_the_delay() {
+        use FallbackReason::{ModelError, Overload};
+        let t = 10_000_000;
+        let fb = Stage::Fallback;
+        let mut r = OverloadRetry::new();
+        assert!(!r.poll(t, fb, Some(Overload), true), "nothing scheduled");
+        assert!(r.forced(t));
+        assert!(!r.poll(t + OVERLOAD_RETRY_DELAY_US - 1, fb, Some(Overload), true));
+        assert!(r.poll(t + OVERLOAD_RETRY_DELAY_US, fb, Some(Overload), true));
+        assert!(!r.pending());
+        // The retry fell back again: the budget is spent, the fallback stays.
+        let t2 = t + 2 * OVERLOAD_RETRY_DELAY_US;
+        assert!(!r.forced(t2));
+        assert!(!r.poll(t2 + OVERLOAD_RETRY_DELAY_US, fb, Some(Overload), true));
+        // A user "on" starts a fresh budget.
+        r.user_on();
+        assert!(r.forced(t2));
+        assert!(r.poll(t2 + OVERLOAD_RETRY_DELAY_US, fb, Some(Overload), true));
+        // Off before it is due: cancelled.
+        let mut r = OverloadRetry::new();
+        r.forced(t);
+        r.user_off();
+        assert!(!r.poll(t + OVERLOAD_RETRY_DELAY_US, fb, Some(Overload), true));
+        // Not in the overload fallback any more, a model error, or user off: dropped,
+        // nothing spent.
+        let mut r = OverloadRetry::new();
+        r.forced(t);
+        assert!(!r.poll(t + OVERLOAD_RETRY_DELAY_US, Stage::Devocal, None, true));
+        r.forced(t);
+        assert!(!r.poll(t + OVERLOAD_RETRY_DELAY_US, fb, Some(ModelError), true));
+        r.forced(t);
+        assert!(!r.poll(t + OVERLOAD_RETRY_DELAY_US, fb, Some(Overload), false));
+        assert!(r.forced(t), "budget unspent");
+    }
+
+    /// A processing context on rings only (no thread) around `processor`.
+    fn ctx_for(processor: Processor) -> (ProcessingCtx, State) {
+        use super::super::OwnedEvent;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (_in_tx, in_rx) = rtrb::RingBuffer::<f32>::new(HOP * 2 * 4);
+        let (_mk_tx, mk_rx) = rtrb::RingBuffer::<InputMarker>::new(8);
+        let (out_tx, _out_rx) = rtrb::RingBuffer::<f32>::new(HOP * 2 * 4);
+        let (omk_tx, _omk_rx) = rtrb::RingBuffer::<u64>::new(8);
+        let (_ctl_tx, ctl_rx) = rtrb::RingBuffer::<ProcCommand>::new(8);
+        let shared = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            start_us: now_us(),
+            run_id: 1,
+            last_input_us: AtomicU64::new(0),
+            capture_packet_frames: AtomicU32::new(0),
+            in_ring_frames: AtomicU32::new(0),
+            proc_in_flight_frames: AtomicU32::new(0),
+            proc_latency_frames: AtomicU32::new(0),
+            proc_hop: AtomicU32::new(0),
+            output_failed: AtomicBool::new(false),
+            preroll_request: AtomicBool::new(false),
+            underrun_snapshot: AtomicU64::new(0),
+            last_push_us: AtomicU64::new(0),
+            block_start_us: AtomicU64::new(0),
+            fallback_log: crate::audio::FallbackLog::default(),
+            wake: OwnedEvent::new().unwrap(),
+            render_wake: OwnedEvent::new().unwrap(),
+        });
+        let hop = processor.hop();
+        let st = State {
+            hop,
+            latency: processor.latency_frames(),
+            in_block: vec![0.0; hop * 2],
+            out_block: vec![0.0; hop * 2],
+            in_pos: 0,
+            out_pos: 0,
+            load: LoadMonitor::new(block_us(hop), LOAD_WINDOW_BLOCKS, LOAD_THRESHOLD),
+            user_on: false,
+            pending: None,
+            underrun_base: 0,
+            fade_in: FadeIn::new(edge_fade_frames()),
+            last_block_us: 0,
+            retry: OverloadRetry::new(),
+        };
+        let ctx = ProcessingCtx {
+            processor,
+            input: in_rx,
+            in_markers: mk_rx,
+            output: out_tx,
+            out_markers: omk_tx,
+            control: ctl_rx,
+            shared,
+            stats: Arc::new(AudioStats::default()),
+        };
+        (ctx, st)
+    }
+
+    /// Ruling 24 (2): the retry goes through the user "on" path (warm-up, fade-in, render
+    /// pre-roll request, fallback reason cleared), once; a second forced fallback stays.
+    /// The forced fallbacks and the retry are recorded for the engine log.
+    #[test]
+    fn a_forced_overload_fallback_is_retried_once_through_the_enable_path() {
+        use crate::separator::DelayOnly;
+        let (mut ctx, mut st) = ctx_for(Processor::new(Some(Box::new(DelayOnly::new(HOP)))));
+        apply_command(&mut ctx, &mut st, ProcCommand::SetDevocal(true));
+        assert_eq!(ctx.processor.stage(), Stage::WarmingUp);
+        assert!(ctx.shared.preroll_request.swap(false, Ordering::AcqRel));
+        let t = 10_000_000;
+        force_overload(&mut ctx, &mut st, false, t);
+        assert_eq!(ctx.processor.stage(), Stage::Fallback);
+        let log = &ctx.shared.fallback_log;
+        assert_eq!(log.forced.load(Ordering::Acquire), 1);
+        assert_eq!(log.trigger.load(Ordering::Relaxed), 1, "underrun");
+        assert!(log.retry_armed.load(Ordering::Relaxed));
+        // Forcing again while already falling back records nothing new.
+        force_overload(&mut ctx, &mut st, false, t + 1);
+        assert_eq!(ctx.shared.fallback_log.forced.load(Ordering::Acquire), 1);
+
+        assert!(!retry_overload(
+            &mut ctx,
+            &mut st,
+            t + OVERLOAD_RETRY_DELAY_US - 1
+        ));
+        assert!(retry_overload(
+            &mut ctx,
+            &mut st,
+            t + OVERLOAD_RETRY_DELAY_US
+        ));
+        assert_eq!(ctx.processor.stage(), Stage::WarmingUp);
+        assert_eq!(ctx.processor.fallback_reason(), None);
+        assert!(
+            ctx.shared.preroll_request.load(Ordering::Acquire),
+            "pre-roll"
+        );
+        assert_eq!(ctx.shared.fallback_log.retries.load(Ordering::Acquire), 1);
+
+        // The retry falls back again: no further retry.
+        let t2 = t + 2 * OVERLOAD_RETRY_DELAY_US;
+        force_overload(&mut ctx, &mut st, true, t2);
+        let log = &ctx.shared.fallback_log;
+        assert_eq!(log.forced.load(Ordering::Acquire), 2);
+        assert_eq!(log.trigger.load(Ordering::Relaxed), 2, "load");
+        assert!(!log.retry_armed.load(Ordering::Relaxed));
+        assert!(!retry_overload(
+            &mut ctx,
+            &mut st,
+            t2 + 10 * OVERLOAD_RETRY_DELAY_US
+        ));
+        assert_eq!(ctx.processor.stage(), Stage::Fallback);
+
+        // A user off/on leaves the fallback as before, with a fresh retry budget.
+        apply_command(&mut ctx, &mut st, ProcCommand::SetDevocal(false));
+        apply_command(&mut ctx, &mut st, ProcCommand::SetDevocal(true));
+        assert_eq!(ctx.processor.stage(), Stage::WarmingUp);
+        let t3 = t2 + 20 * OVERLOAD_RETRY_DELAY_US;
+        force_overload(&mut ctx, &mut st, false, t3);
+        assert!(retry_overload(
+            &mut ctx,
+            &mut st,
+            t3 + OVERLOAD_RETRY_DELAY_US
         ));
     }
 
@@ -485,6 +775,9 @@ mod tests {
             output_failed: AtomicBool::new(false),
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
+            last_push_us: AtomicU64::new(0),
+            block_start_us: AtomicU64::new(0),
+            fallback_log: crate::audio::FallbackLog::default(),
             wake: OwnedEvent::new().unwrap(),
             render_wake: OwnedEvent::new().unwrap(),
         });
@@ -540,6 +833,9 @@ mod tests {
             output_failed: AtomicBool::new(false),
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
+            last_push_us: AtomicU64::new(0),
+            block_start_us: AtomicU64::new(0),
+            fallback_log: crate::audio::FallbackLog::default(),
             wake: OwnedEvent::new().unwrap(),
             render_wake: OwnedEvent::new().unwrap(),
         });
@@ -622,6 +918,9 @@ mod tests {
             output_failed: AtomicBool::new(false),
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
+            last_push_us: AtomicU64::new(0),
+            block_start_us: AtomicU64::new(0),
+            fallback_log: crate::audio::FallbackLog::default(),
             wake: OwnedEvent::new().unwrap(),
             render_wake: OwnedEvent::new().unwrap(),
         });

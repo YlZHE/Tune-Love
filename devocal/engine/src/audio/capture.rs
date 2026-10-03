@@ -253,7 +253,14 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
                 break;
             }
             let now = now_us();
-            ctx.shared.last_input_us.store(now, Ordering::Release);
+            let prev = ctx.shared.last_input_us.swap(now, Ordering::AcqRel);
+            if prev != 0 {
+                // Ruling 24 diag: the longest gap between packets.
+                ctx.stats
+                    .diag
+                    .capture_gap_max_us
+                    .fetch_max(now.saturating_sub(prev), Ordering::Relaxed);
+            }
             ctx.shared
                 .capture_packet_frames
                 .store(n as u32, Ordering::Relaxed);

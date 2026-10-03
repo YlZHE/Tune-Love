@@ -165,6 +165,185 @@ pub struct DiagCounters {
     pub render_preroll_frames: AtomicU64,
     /// Ring B frames skipped when released headroom decays (O1); not in `render_trim_frames`.
     pub render_decay_frames: AtomicU64,
+    // Ruling 24 columns, appended after `lat_ms` (gauges are reset by every diag line).
+    /// Longest `process_block` since the last line, us (gauge).
+    pub proc_block_max_us: AtomicU64,
+    /// Blocks whose `process_block` took over 2, 3 and 5 ms (counters).
+    pub proc_over_2ms: AtomicU64,
+    pub proc_over_3ms: AtomicU64,
+    pub proc_over_5ms: AtomicU64,
+    /// Longest time between two capture packets, us (gauge).
+    pub capture_gap_max_us: AtomicU64,
+    /// Lowest queue a check wake found, minus a period (gauge; see
+    /// [`DiagCounters::note_check_margin`]).
+    check_margin_low: AtomicU64,
+    /// Latest a deadline wake came after its due time, us (gauge).
+    pub deadline_late_max_us: AtomicU64,
+}
+
+/// [`DiagCounters::check_margin_low`] holds `MARGIN_BIAS - margin` so `fetch_max` keeps the
+/// lowest margin; 0 means no check since the last reset.
+const MARGIN_BIAS: i64 = 1 << 32;
+
+impl DiagCounters {
+    /// A check wake found `margin` frames above one period queued (negative: short).
+    pub fn note_check_margin(&self, margin: i64) {
+        let v = (MARGIN_BIAS - margin.clamp(1 - MARGIN_BIAS, MARGIN_BIAS - 1)) as u64;
+        self.check_margin_low.fetch_max(v, Ordering::Relaxed);
+    }
+
+    /// The lowest margin noted since the last call (`None` if no check), and resets it.
+    pub fn take_check_margin(&self) -> Option<i64> {
+        match self.check_margin_low.swap(0, Ordering::Relaxed) {
+            0 => None,
+            v => Some(MARGIN_BIAS - v as i64),
+        }
+    }
+
+    /// One processed block took `us`.
+    pub fn note_block_time(&self, us: u64) {
+        self.proc_block_max_us.fetch_max(us, Ordering::Relaxed);
+        for (limit, n) in [
+            (2_000, &self.proc_over_2ms),
+            (3_000, &self.proc_over_3ms),
+            (5_000, &self.proc_over_5ms),
+        ] {
+            if us > limit {
+                n.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// What one starvation looked like beyond [`Starvation`] (ruling 24 log): written by the
+/// render thread with each counted underrun, logged by the engine with a forced fallback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StarvationDetail {
+    pub at_us: u64,
+    /// The wake that padded: 0 device, 1 data, 2 deadline, 3 timeout.
+    pub wake: u64,
+    /// Device padding and ring B frames when the check started, and how many frames short
+    /// of a period the queue was after the real frames written.
+    pub padding: u64,
+    pub ring_b: u64,
+    pub shortfall: u64,
+    pub since_capture_us: u64,
+    pub since_push_us: u64,
+    /// How long the block being processed had been running (0: none in flight).
+    pub block_busy_us: u64,
+    /// How late the deadline wake was (0 for other wakes).
+    pub check_late_us: u64,
+    pub headroom: u64,
+    /// The overload judgement (`render::Verdict::code`).
+    pub verdict: u64,
+}
+
+const DETAIL_FIELDS: usize = 11;
+
+impl StarvationDetail {
+    fn to_words(self) -> [u64; DETAIL_FIELDS] {
+        [
+            self.at_us,
+            self.wake,
+            self.padding,
+            self.ring_b,
+            self.shortfall,
+            self.since_capture_us,
+            self.since_push_us,
+            self.block_busy_us,
+            self.check_late_us,
+            self.headroom,
+            self.verdict,
+        ]
+    }
+
+    fn from_words(w: [u64; DETAIL_FIELDS]) -> Self {
+        Self {
+            at_us: w[0],
+            wake: w[1],
+            padding: w[2],
+            ring_b: w[3],
+            shortfall: w[4],
+            since_capture_us: w[5],
+            since_push_us: w[6],
+            block_busy_us: w[7],
+            check_late_us: w[8],
+            headroom: w[9],
+            verdict: w[10],
+        }
+    }
+}
+
+/// Ruling 24 log of forced fallbacks and overload retries (atomics only; the engine loop
+/// formats the line). A later underrun may overwrite the detail before the engine reads it:
+/// a diagnostic, not a protocol.
+#[derive(Debug, Default)]
+pub(crate) struct FallbackLog {
+    detail: [AtomicU64; DETAIL_FIELDS],
+    /// The fallback's trigger: 1 underrun, 2 load.
+    pub trigger: AtomicU8,
+    pub forced_at_us: AtomicU64,
+    pub load_milli: AtomicU32,
+    /// The processor's stage just before it was forced ([`stage_code`]).
+    pub stage: AtomicU8,
+    /// A retry was scheduled for this fallback.
+    pub retry_armed: AtomicBool,
+    /// Forced fallbacks so far; incremented (Release) after the fields above are written.
+    pub forced: AtomicU32,
+    /// Overload retries started so far.
+    pub retries: AtomicU32,
+}
+
+impl FallbackLog {
+    pub fn set_detail(&self, d: StarvationDetail) {
+        for (a, v) in self.detail.iter().zip(d.to_words()) {
+            a.store(v, Ordering::Relaxed);
+        }
+    }
+
+    pub fn detail(&self) -> StarvationDetail {
+        StarvationDetail::from_words(self.detail.each_ref().map(|a| a.load(Ordering::Relaxed)))
+    }
+}
+
+/// The engine log line for a forced fallback (ruling 24).
+pub(crate) fn fallback_line(run: u32, log: &FallbackLog, now_us: u64) -> String {
+    let trigger = log.trigger.load(Ordering::Acquire);
+    let at = log.forced_at_us.load(Ordering::Relaxed);
+    let mut l = format!(
+        "devocal audio: run={run} forced fallback (overload) {} ms ago: trigger={} load={:.3} \
+         stage={} retry={}",
+        now_us.saturating_sub(at) / 1000,
+        if trigger == 2 { "load" } else { "underrun" },
+        log.load_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        log.stage.load(Ordering::Relaxed),
+        if log.retry_armed.load(Ordering::Relaxed) {
+            "scheduled"
+        } else {
+            "none"
+        },
+    );
+    if trigger != 2 {
+        let d = log.detail();
+        l.push_str(&format!(
+            " | starved {} ms before: verdict={} wake={} padding={} ring_b={} shortfall={} \
+             since_capture_us={} since_push_us={} block_busy_us={} check_late_us={} headroom={}",
+            at.saturating_sub(d.at_us) / 1000,
+            render::Verdict::name(d.verdict),
+            ["device", "data", "deadline", "timeout"]
+                .get(d.wake as usize)
+                .unwrap_or(&"?"),
+            d.padding,
+            d.ring_b,
+            d.shortfall,
+            d.since_capture_us,
+            d.since_push_us,
+            d.block_busy_us,
+            d.check_late_us,
+            d.headroom,
+        ));
+    }
+    l
 }
 
 /// Process-wide run counter: tells apart the logs of successive `AudioHandle::start`s.
@@ -305,22 +484,46 @@ pub(crate) fn diag_loop_with(
         "devocal diag: run={run} start t={:.6} unix_ms={unix_ms}",
         last_us as f64 / 1e6
     ));
-    let line = |last: &[u64; 24], now: [u64; 24], t_us: u64, span_us: u64, partial: bool| {
-        let mut fields = [("", 0u64); 24];
-        for (i, f) in fields.iter_mut().enumerate() {
-            *f = (names[i], now[i].wrapping_sub(last[i]));
-        }
-        let tail = format!(
-            "stage={} in_ring={} headroom={} cap_gain={:.1} out_gain={:.3} lat_ms={:.1}",
-            stats.stage.load(Ordering::Relaxed),
-            shared.in_ring_frames.load(Ordering::Relaxed),
-            stats.headroom_frames.load(Ordering::Relaxed),
-            gains.capture_gain(),
-            gains.output_gain(),
-            stats.latency_ms_milli.load(Ordering::Relaxed) as f64 / 1000.0,
-        );
-        diag_line(run, t_us, span_us, &fields, &tail, partial)
+    // Ruling 24 columns: counters as deltas, gauges read and reset per line.
+    let over = || {
+        [&d.proc_over_2ms, &d.proc_over_3ms, &d.proc_over_5ms].map(|a| a.load(Ordering::Relaxed))
     };
+    let mut last_over = over();
+    let mut gauges = move || {
+        let now = over();
+        let margin = d
+            .take_check_margin()
+            .map_or_else(|| "-".to_string(), |m| m.to_string());
+        let s = format!(
+            " proc_max_us={} proc_over2={} proc_over3={} proc_over5={} cap_gap_max_us={} \
+             chk_margin_min={margin} dl_late_max_us={}",
+            d.proc_block_max_us.swap(0, Ordering::Relaxed),
+            now[0].wrapping_sub(last_over[0]),
+            now[1].wrapping_sub(last_over[1]),
+            now[2].wrapping_sub(last_over[2]),
+            d.capture_gap_max_us.swap(0, Ordering::Relaxed),
+            d.deadline_late_max_us.swap(0, Ordering::Relaxed),
+        );
+        last_over = now;
+        s
+    };
+    let line =
+        |last: &[u64; 24], now: [u64; 24], t_us: u64, span_us: u64, partial: bool, extra: &str| {
+            let mut fields = [("", 0u64); 24];
+            for (i, f) in fields.iter_mut().enumerate() {
+                *f = (names[i], now[i].wrapping_sub(last[i]));
+            }
+            let tail = format!(
+                "stage={} in_ring={} headroom={} cap_gain={:.1} out_gain={:.3} lat_ms={:.1}{extra}",
+                stats.stage.load(Ordering::Relaxed),
+                shared.in_ring_frames.load(Ordering::Relaxed),
+                stats.headroom_frames.load(Ordering::Relaxed),
+                gains.capture_gain(),
+                gains.output_gain(),
+                stats.latency_ms_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+            );
+            diag_line(run, t_us, span_us, &fields, &tail, partial)
+        };
     loop {
         wait();
         let stopping = shared.stop.load(Ordering::Acquire);
@@ -330,7 +533,8 @@ pub(crate) fn diag_loop_with(
             continue;
         }
         let now = read();
-        emit(line(&last, now, t, span, stopping));
+        let extra = gauges();
+        emit(line(&last, now, t, span, stopping, &extra));
         last = now;
         last_us = t;
         if stopping {
@@ -390,32 +594,48 @@ pub fn reason_from_code(code: u8) -> Option<FallbackReason> {
 }
 
 /// What the render thread saw when the output starved; carried with a counted underrun.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Starvation {
     /// The processor's stage ran the model.
     pub ran_model: bool,
     /// Unprocessed input waiting in ring A, in frames.
     pub backlog_frames: usize,
+    /// The stage was `WarmingUp` (its output is the passthrough): never forces a fallback.
+    pub warming: bool,
+    /// Set by the render thread when the underrun is counted: the overload judgement
+    /// (ruling 24, `render::OverloadJudge`) says this one forces `Fallback(Overload)`.
+    pub force: bool,
 }
 
 const SNAPSHOT_MODEL_BIT: u64 = 1 << 63;
+const SNAPSHOT_WARMING_BIT: u64 = 1 << 62;
+const SNAPSHOT_FORCE_BIT: u64 = 1 << 61;
+const SNAPSHOT_BACKLOG_MASK: u64 = SNAPSHOT_FORCE_BIT - 1;
 
-/// Packs a [`Starvation`] into one word (bit 63 = model ran, low bits = backlog frames) so
-/// the render thread publishes it atomically, without a torn pair across two underruns.
+/// Packs a [`Starvation`] into one word (bit 63 = model ran, 62 = warming, 61 = force, low
+/// bits = backlog frames) so the render thread publishes it atomically, without a torn set
+/// across two underruns.
 pub fn pack_starvation(s: Starvation) -> u64 {
-    let backlog = (s.backlog_frames as u64).min(SNAPSHOT_MODEL_BIT - 1);
-    if s.ran_model {
-        backlog | SNAPSHOT_MODEL_BIT
-    } else {
-        backlog
+    let mut w = (s.backlog_frames as u64).min(SNAPSHOT_BACKLOG_MASK);
+    for (on, bit) in [
+        (s.ran_model, SNAPSHOT_MODEL_BIT),
+        (s.warming, SNAPSHOT_WARMING_BIT),
+        (s.force, SNAPSHOT_FORCE_BIT),
+    ] {
+        if on {
+            w |= bit;
+        }
     }
+    w
 }
 
 /// Inverse of [`pack_starvation`].
 pub fn unpack_starvation(word: u64) -> Starvation {
     Starvation {
         ran_model: word & SNAPSHOT_MODEL_BIT != 0,
-        backlog_frames: (word & !SNAPSHOT_MODEL_BIT) as usize,
+        backlog_frames: (word & SNAPSHOT_BACKLOG_MASK) as usize,
+        warming: word & SNAPSHOT_WARMING_BIT != 0,
+        force: word & SNAPSHOT_FORCE_BIT != 0,
     }
 }
 
@@ -632,6 +852,13 @@ pub(crate) struct Shared {
     /// Snapshot taken when the output starved ([`pack_starvation`]), published with each
     /// counted underrun before `AudioStats::underruns` is incremented.
     pub underrun_snapshot: AtomicU64,
+    /// `now_us()` when the processing thread finished the block it last pushed to ring B
+    /// (0 before the first); ruling 24 log.
+    pub last_push_us: AtomicU64,
+    /// `now_us()` when the block being processed started, 0 when none; ruling 24 log.
+    pub block_start_us: AtomicU64,
+    /// Forced fallbacks and overload retries, for the engine log (ruling 24).
+    pub fallback_log: FallbackLog,
     /// Wakes the processing thread (capture pushed data, control message, stop).
     pub wake: OwnedEvent,
     /// Wakes the render thread: set by the processing thread after every block it pushes to
@@ -648,6 +875,9 @@ pub struct AudioHandle {
     proc_ctl: Mutex<Producer<ProcCommand>>,
     render_ctl: Mutex<Producer<RenderCommand>>,
     workers: Vec<Worker>,
+    /// Forced fallbacks and retries already logged ([`AudioHandle::take_fallback_log`]).
+    logged_forced: AtomicU32,
+    logged_retries: AtomicU32,
 }
 
 impl AudioHandle {
@@ -693,6 +923,9 @@ impl AudioHandle {
             output_failed: AtomicBool::new(false),
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
+            last_push_us: AtomicU64::new(0),
+            block_start_us: AtomicU64::new(0),
+            fallback_log: FallbackLog::default(),
             wake: OwnedEvent::new()?,
             render_wake: OwnedEvent::new()?,
         });
@@ -711,6 +944,8 @@ impl AudioHandle {
             proc_ctl: Mutex::new(proc_ctl_tx),
             render_ctl: Mutex::new(render_ctl_tx),
             workers: Vec::new(),
+            logged_forced: AtomicU32::new(0),
+            logged_retries: AtomicU32::new(0),
         };
 
         let ctx = processing::ProcessingCtx {
@@ -829,6 +1064,25 @@ impl AudioHandle {
     /// Processor fallback reason (for the status mapping, caller obligation 5).
     pub fn fallback_reason(&self) -> Option<FallbackReason> {
         reason_from_code(self.stats.fallback_reason.load(Ordering::Acquire))
+    }
+
+    /// The next engine log line about a forced fallback or an overload retry not logged yet
+    /// (ruling 24); the engine loop calls it every tick.
+    pub fn take_fallback_log(&self) -> Option<String> {
+        let log = &self.shared.fallback_log;
+        let run = self.shared.run_id;
+        let forced = log.forced.load(Ordering::Acquire);
+        if forced != self.logged_forced.swap(forced, Ordering::Relaxed) {
+            return Some(fallback_line(run, log, now_us()));
+        }
+        let retries = log.retries.load(Ordering::Acquire);
+        if retries != self.logged_retries.swap(retries, Ordering::Relaxed) {
+            return Some(format!(
+                "devocal audio: run={run} overload retry {retries}: devocal on again (with \
+                 pre-roll)"
+            ));
+        }
+        None
     }
 
     /// Returns and clears the safety guard's request to run `Holder::follow()` now.
@@ -1164,6 +1418,9 @@ mod tests {
             output_failed: AtomicBool::new(false),
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
+            last_push_us: AtomicU64::new(0),
+            block_start_us: AtomicU64::new(0),
+            fallback_log: FallbackLog::default(),
             wake: OwnedEvent::new().unwrap(),
             render_wake: OwnedEvent::new().unwrap(),
         }
@@ -1252,6 +1509,74 @@ mod tests {
         let ts: Vec<f64> = lines.iter().map(|l| field(l, "t=")).collect();
         assert!(ts.windows(2).all(|w| w[1] > w[0]), "{ts:?}");
         assert_eq!(ts, vec![7.0, 7.1, 7.2, 7.25]);
+    }
+
+    /// Ruling 24: the new columns come after `lat_ms` (existing order unchanged, ` partial`
+    /// still last); counters are per-line deltas, gauges are reset by every line.
+    #[test]
+    fn diag_lines_end_with_the_ruling_24_columns() {
+        use std::cell::Cell;
+        let stats = Arc::new(AudioStats::default());
+        let shared = Arc::new(test_shared());
+        let gains = Arc::new(SharedGains::new(1.0, 1.0));
+        let clock = Cell::new(7_000_000u64);
+        let polls = Cell::new(0u32);
+        let mut lines = Vec::new();
+        diag_loop_with(
+            stats.clone(),
+            shared.clone(),
+            gains,
+            100_000,
+            || {
+                clock.set(clock.get() + 50_000);
+                polls.set(polls.get() + 1);
+                let d = &stats.diag;
+                d.note_block_time(2_500);
+                match polls.get() {
+                    1 => {
+                        d.note_block_time(5_200);
+                        d.capture_gap_max_us.fetch_max(10_400, Ordering::Relaxed);
+                        d.note_check_margin(120);
+                        d.deadline_late_max_us.fetch_max(30, Ordering::Relaxed);
+                    }
+                    3 => {
+                        d.note_check_margin(-16);
+                        d.note_check_margin(7);
+                    }
+                    5 => shared.stop.store(true, Ordering::Release),
+                    _ => {}
+                }
+            },
+            || clock.get(),
+            |l| lines.push(l),
+        );
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        let tail = |l: &str| l[l.find(" lat_ms=").unwrap()..].to_string();
+        assert!(
+            tail(&lines[1]).ends_with(
+                " proc_max_us=5200 proc_over2=3 proc_over3=1 proc_over5=1 \
+                 cap_gap_max_us=10400 chk_margin_min=120 dl_late_max_us=30"
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            tail(&lines[2]).ends_with(
+                " proc_max_us=2500 proc_over2=2 proc_over3=0 proc_over5=0 cap_gap_max_us=0 \
+                 chk_margin_min=-16 dl_late_max_us=0"
+            ),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            lines[3].ends_with(" chk_margin_min=- dl_late_max_us=0 partial"),
+            "{}",
+            lines[3]
+        );
+        // Existing columns keep their order, the new ones follow `lat_ms`.
+        let l = &lines[1];
+        let at = |k: &str| l.find(k).unwrap_or_else(|| panic!("{k} in {l}"));
+        assert!(at(" underruns=") < at(" stage=") && at(" lat_ms=") < at(" proc_max_us="));
     }
 
     #[test]
@@ -1361,6 +1686,8 @@ mod tests {
         let reference = vec![0.1f32; 441 * 2];
         let mut lowered = vec![0.0f32; 441 * 2];
         let mut confirmed = 0u64;
+        let mut overload = render::OverloadJudge::new();
+        let fallback_log = FallbackLog::default();
         let before = alloc_count::this_thread();
         for i in 0..50u64 {
             cond.condition(&mut loud, 1.0, &stats, &follow, |_| {});
@@ -1400,6 +1727,8 @@ mod tests {
                 Starvation {
                     ran_model: true,
                     backlog_frames: 0,
+                    warming: false,
+                    force: false,
                 },
             );
             let _ = judge.poll(i + 20, i + 30);
@@ -1412,6 +1741,19 @@ mod tests {
             let _ = render::decay_now(0.3, 0.5, i * 100_000);
             power = render::track_power(power, &block);
             let _ = is_backlogged(true, 128, 128);
+            // Ruling 24: the overload judgement, the starvation detail and the diag gauges.
+            let seen = Starvation {
+                ran_model: true,
+                backlog_frames: (i as usize) * 7,
+                ..Starvation::default()
+            };
+            let v = overload.judge(seen, 128, i % 3 == 0, i * 4_000_000);
+            fallback_log.set_detail(StarvationDetail {
+                verdict: v.code(),
+                ..StarvationDetail::default()
+            });
+            stats.diag.note_block_time(i * 900);
+            stats.diag.note_check_margin(i as i64 - 50);
             let _ = capture::guard_block(&mut block);
             let wake = render::wake_from_wait(i as u32 % 4, true);
             let deadline = render::deadline_mode(timer.is_some(), 441);
@@ -1468,14 +1810,20 @@ mod tests {
             Starvation {
                 ran_model: true,
                 backlog_frames: 0,
+                warming: false,
+                force: false,
             },
             Starvation {
                 ran_model: false,
                 backlog_frames: 44_100,
+                warming: false,
+                force: false,
             },
             Starvation {
                 ran_model: true,
                 backlog_frames: 300,
+                warming: false,
+                force: false,
             },
         ] {
             assert_eq!(unpack_starvation(pack_starvation(s)), s);

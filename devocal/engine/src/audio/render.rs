@@ -25,7 +25,10 @@
 //! Pre-roll, headroom release and decay, fades and the underrun judge run on every wake.
 //!
 //! Ruling 18: an underrun while the processing thread was not behind is jitter and raises the
-//! target by one hop (at most one capture packet in total); when a user "on" is accepted the
+//! target by one hop (at most one capture packet in total). Ruling 24: so does the first one
+//! with the processing thread behind (a hiccup, [`OverloadJudge`]); only a second within
+//! [`OVERLOAD_REPEAT_US`], or one with the jitter headroom at its cap, is published as forcing
+//! the fallback, and never one during the warm-up. When a user "on" is accepted the
 //! output pre-rolls once by about one capture packet of silence. Both are released again (O1,
 //! [`Headroom`]): the pre-roll once the model has warmed up, the jitter part after 5 s
 //! without an underrun (backing off up to 60 s while jitter keeps returning); the released
@@ -62,8 +65,8 @@ use super::endpoint::{find_render_device, low_latency_eligible, read_mix_format,
 use super::{
     count_underrun, edge_fade_frames, is_backlogged, now_us, pack_starvation, render_open_line,
     stage_from_code, stage_runs_model, AudioStats, ComGuard, FadeIn, HiResTimer, Mmcss, OwnedEvent,
-    RenderCommand, Shared, SharedGains, Starvation, INPUT_FLOWING_US, MAX_EXTRA_HEADROOM_FRAMES,
-    PREROLL_FRAMES,
+    RenderCommand, Shared, SharedGains, Starvation, StarvationDetail, INPUT_FLOWING_US,
+    MAX_EXTRA_HEADROOM_FRAMES, PREROLL_FRAMES,
 };
 use crate::dsp::{fade_edges, frames_for_ms, SAMPLE_RATE};
 use crate::processor::Stage;
@@ -286,11 +289,14 @@ impl UnderrunJudge {
     }
 
     /// The output starved at `now_us` (call once per gap); `seen` is what the starvation
-    /// looked like (model running, ring A backlog) and is returned if it counts.
-    pub fn starved(&mut self, last_input_us: u64, now_us: u64, seen: Starvation) {
+    /// looked like (model running, ring A backlog) and is returned if it counts. True when
+    /// this call armed it.
+    pub fn starved(&mut self, last_input_us: u64, now_us: u64, seen: Starvation) -> bool {
         if self.starved_at.is_none() && count_underrun(last_input_us, now_us) {
             self.starved_at = Some((now_us, seen));
+            return true;
         }
+        false
     }
 
     /// `Some` once for an armed starvation that input kept flowing through.
@@ -311,6 +317,93 @@ impl UnderrunJudge {
 /// frames of extra headroom in total.
 pub fn grow_headroom(extra: usize, hop: usize, cap: usize) -> usize {
     (extra + hop).min(cap)
+}
+
+/// Ruling 24: a counted underrun with the processing thread behind forces the fallback only
+/// if another one came less than this long before it (or the jitter headroom is at its cap).
+pub const OVERLOAD_REPEAT_US: u64 = 10_000_000;
+
+/// Ruling 24: how a counted underrun is judged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    /// The processing thread kept up (ring A held less than a hop) or the model was not
+    /// running: jitter.
+    Jitter,
+    /// Behind, during the model's warm-up (its output is the passthrough): treated as jitter.
+    WarmUp,
+    /// Behind, and the first such within [`OVERLOAD_REPEAT_US`]: a hiccup (a slow hop or a
+    /// late packet still being processed at the check), treated as jitter.
+    Isolated,
+    /// Behind again within [`OVERLOAD_REPEAT_US`]: forces the fallback.
+    Repeated,
+    /// Behind with the jitter headroom already at its cap: forces the fallback.
+    AtCap,
+}
+
+const VERDICT_NAMES: [&str; 5] = ["jitter", "warm-up", "isolated", "repeated", "at-cap"];
+
+impl Verdict {
+    pub fn forces(self) -> bool {
+        matches!(self, Verdict::Repeated | Verdict::AtCap)
+    }
+
+    /// For the log (`StarvationDetail::verdict`).
+    pub fn code(self) -> u64 {
+        self as u64
+    }
+
+    pub fn name(code: u64) -> &'static str {
+        VERDICT_NAMES.get(code as usize).copied().unwrap_or("?")
+    }
+}
+
+/// Ruling 24: decides whether a counted underrun forces `Fallback(Overload)`. Ring A holding
+/// a hop at the starvation does not show by itself that the model is too slow: with
+/// 441-frame packets and 128-frame hops it does for much of every packet, and one slow hop or
+/// late packet starves a check by a few ms (fallback-investigation.md). So the first such
+/// underrun is a hiccup, treated as jitter; a second within [`OVERLOAD_REPEAT_US`], or one
+/// with the jitter headroom already at its cap, forces the fallback. A warm-up underrun never
+/// forces, but counts as the earlier one. A genuinely slow model keeps underrunning (and the
+/// LoadMonitor trips within its 1 s window). Pure; times in microseconds.
+pub struct OverloadJudge {
+    last_behind_us: Option<u64>,
+}
+
+impl OverloadJudge {
+    pub fn new() -> Self {
+        Self {
+            last_behind_us: None,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.last_behind_us = None;
+    }
+
+    pub fn judge(
+        &mut self,
+        seen: Starvation,
+        hop: usize,
+        jitter_at_cap: bool,
+        now_us: u64,
+    ) -> Verdict {
+        if !is_backlogged(seen.ran_model, seen.backlog_frames, hop) {
+            return Verdict::Jitter;
+        }
+        let repeat = self
+            .last_behind_us
+            .is_some_and(|t| now_us.saturating_sub(t) < OVERLOAD_REPEAT_US);
+        self.last_behind_us = Some(now_us);
+        if seen.warming {
+            Verdict::WarmUp
+        } else if repeat {
+            Verdict::Repeated
+        } else if jitter_at_cap {
+            Verdict::AtCap
+        } else {
+            Verdict::Isolated
+        }
+    }
 }
 
 /// Jitter headroom is released after this long without a counted underrun (design: 5 s).
@@ -371,6 +464,11 @@ impl Headroom {
     /// [`preroll_frames`] sizes it); `add_preroll` itself does not clamp.
     pub fn total(&self) -> usize {
         self.jitter + self.preroll
+    }
+
+    /// The jitter part has grown to `cap` (ruling 24: no more growth can absorb a hiccup).
+    pub fn jitter_at_cap(&self, cap: usize) -> bool {
+        self.jitter >= cap
     }
 
     /// A counted underrun at `now_us`; `jitter` when the processing thread was not behind,
@@ -928,6 +1026,12 @@ struct Renderer {
     legacy_checks: bool,
     /// Recent missed deadlines of this stream.
     missed: MissedDeadlines,
+    /// Ruling 24: whether a counted underrun forces the fallback.
+    overload: OverloadJudge,
+    /// What the armed starvation looked like, published when it is counted (ruling 24 log).
+    starve_detail: StarvationDetail,
+    /// When the armed deadline is due (for its lateness).
+    deadline_due_us: u64,
 }
 
 impl Renderer {
@@ -966,6 +1070,9 @@ impl Renderer {
             deadline_armed: false,
             legacy_checks: false,
             missed: MissedDeadlines::new(),
+            overload: OverloadJudge::new(),
+            starve_detail: StarvationDetail::default(),
+            deadline_due_us: 0,
         }
     }
 
@@ -1053,6 +1160,7 @@ impl Renderer {
         self.primed = false;
         self.fed = false;
         self.underruns.reset();
+        self.overload.reset();
         // A new stream starts without learned headroom (which includes any earlier pre-roll),
         // without a pre-roll in progress and without a pending decay; a pending request is
         // kept (see above).
@@ -1273,10 +1381,12 @@ impl Renderer {
                     }
                 }
                 if deadline_mode {
+                    let delay = frames_us(period).saturating_sub(DEADLINE_GUARD_US);
                     if let Some(t) = &self.timer {
-                        t.arm_in_us(frames_us(period).saturating_sub(DEADLINE_GUARD_US));
+                        t.arm_in_us(delay);
                     }
                     self.deadline_armed = true;
+                    self.deadline_due_us = now + delay;
                 }
             }
             Wake::Deadline => self.deadline_armed = false,
@@ -1287,17 +1397,28 @@ impl Renderer {
         let hop = self.ctx.shared.proc_hop.load(Ordering::Relaxed) as usize;
         let last_input = self.ctx.shared.last_input_us.load(Ordering::Acquire);
         if let Some(seen) = self.underruns.poll(last_input, now) {
+            let verdict = self.overload.judge(
+                seen,
+                hop,
+                self.headroom.jitter_at_cap(MAX_EXTRA_HEADROOM_FRAMES),
+                now,
+            );
+            let seen = Starvation {
+                force: verdict.forces(),
+                ..seen
+            };
+            self.starve_detail.verdict = verdict.code();
+            self.ctx.shared.fallback_log.set_detail(self.starve_detail);
             // Snapshot first, then the count (the processing thread reads them in that order).
             self.ctx
                 .shared
                 .underrun_snapshot
                 .store(pack_starvation(seen), Ordering::Release);
             self.ctx.stats.underruns.fetch_add(1, Ordering::AcqRel);
-            // Jitter (not a slow model) grows the headroom instead of a fallback; any counted
-            // underrun restarts the quiet period before the headroom decays.
-            let jitter = !is_backlogged(seen.ran_model, seen.backlog_frames, hop);
+            // Jitter, or a hiccup judged as jitter (ruling 24), grows the headroom instead of
+            // a fallback; any counted underrun restarts the quiet period before it decays.
             self.headroom
-                .on_underrun(jitter, hop, MAX_EXTRA_HEADROOM_FRAMES, now);
+                .on_underrun(!verdict.forces(), hop, MAX_EXTRA_HEADROOM_FRAMES, now);
         }
         let mut avail = self.ctx.input.slots() / 2;
         if missed && deadline_mode && padding == 0 && avail == 0 {
@@ -1306,6 +1427,19 @@ impl Renderer {
             // fed after all, and the deadline armed above checks the next one.
             deadline_mode = false;
         }
+        // Ruling 24 diag: how late a deadline wake came, and the margin each check found.
+        let check_late = if wake == Wake::Deadline {
+            now.saturating_sub(self.deadline_due_us)
+        } else {
+            0
+        };
+        let d = &self.ctx.stats.diag;
+        d.deadline_late_max_us
+            .fetch_max(check_late, Ordering::Relaxed);
+        if checks_padding(wake, deadline_mode) {
+            d.note_check_margin((padding + avail) as i64 - period as i64);
+        }
+        let (padding_at_wake, avail_at_wake) = (padding, avail);
         // Pre-roll request from an accepted "on". It stays set until a fill with a sink
         // consumes it here (also across a failed rebind). Consuming it may start no pre-roll
         // (`preroll_frames` returns 0 while one is in progress, when the queue is already
@@ -1561,13 +1695,30 @@ impl Renderer {
             self.drop_pending = 0;
             self.end_drop();
             if self.primed {
+                let stage = stage_from_code(self.ctx.stats.stage.load(Ordering::Acquire));
+                let sh = &self.ctx.shared;
                 let seen = Starvation {
-                    ran_model: stage_runs_model(stage_from_code(
-                        self.ctx.stats.stage.load(Ordering::Acquire),
-                    )),
-                    backlog_frames: self.ctx.shared.in_ring_frames.load(Ordering::Acquire) as usize,
+                    ran_model: stage_runs_model(stage),
+                    backlog_frames: sh.in_ring_frames.load(Ordering::Acquire) as usize,
+                    warming: stage == Stage::WarmingUp,
+                    force: false,
                 };
-                self.underruns.starved(last_input, now, seen);
+                if self.underruns.starved(last_input, now, seen) {
+                    let since = |t: u64| if t == 0 { 0 } else { now.saturating_sub(t) };
+                    self.starve_detail = StarvationDetail {
+                        at_us: now,
+                        wake: wake as u64,
+                        padding: padding_at_wake as u64,
+                        ring_b: avail_at_wake as u64,
+                        shortfall: period.saturating_sub(padding + w) as u64,
+                        since_capture_us: since(last_input),
+                        since_push_us: since(sh.last_push_us.load(Ordering::Relaxed)),
+                        block_busy_us: since(sh.block_start_us.load(Ordering::Relaxed)),
+                        check_late_us: check_late,
+                        headroom: self.headroom.total() as u64,
+                        verdict: 0,
+                    };
+                }
             }
             self.primed = false;
             self.fed = false;
@@ -1738,6 +1889,9 @@ mod tests {
             output_failed: AtomicBool::new(false),
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
+            last_push_us: AtomicU64::new(0),
+            block_start_us: AtomicU64::new(0),
+            fallback_log: crate::audio::FallbackLog::default(),
             wake: OwnedEvent::new().unwrap(),
             render_wake: OwnedEvent::new().unwrap(),
         });
@@ -3885,6 +4039,8 @@ mod tests {
     const SEEN: Starvation = Starvation {
         ran_model: true,
         backlog_frames: 300,
+        warming: false,
+        force: false,
     };
 
     #[test]
@@ -3978,6 +4134,8 @@ mod tests {
         let other = Starvation {
             ran_model: false,
             backlog_frames: 0,
+            warming: false,
+            force: false,
         };
         j.starved(t - 4_000, t + 3_000, other); // same gap, not re-armed
         assert_eq!(j.poll(t - 4_000, t + 3_000), None);
@@ -4045,5 +4203,395 @@ mod tests {
         assert_eq!(&b[4..6], &[1.0, -1.0], "clamped to [-1, 1]");
         assert_eq!(b[6], 0.0, "non-finite becomes silence");
         assert_eq!(b[7], 0.5);
+    }
+
+    // ----- Ruling 24: hiccup simulation (fallback-investigation.md) -----
+
+    /// One run of [`hiccup_sim`]: attach with devocal on at t = 0 (the "on" with its
+    /// pre-roll request before the first fill), model-paced hops, injected hiccups.
+    #[derive(Clone, Debug)]
+    struct HiccupCfg {
+        /// Capture packet phase within the 10 ms device period, us.
+        phase: u64,
+        len_us: u64,
+        /// Model hop time, us (passthrough hops take 300 us).
+        hop_us: u64,
+        /// The first model hop starting at or after `.0` takes `.1` us longer.
+        spikes: Vec<(u64, u64)>,
+        /// The first `.0` model hops take `.1` us each (cold model after idle).
+        cold: Option<(usize, u64)>,
+    }
+
+    impl HiccupCfg {
+        fn new(phase: u64, len_us: u64) -> Self {
+            Self {
+                phase,
+                len_us,
+                hop_us: 1_000,
+                spikes: Vec::new(),
+                // Measured after 14 s idle: 1.95 / 1.56 / 1.41 / 1.31 ms.
+                cold: Some((4, 1_600)),
+            }
+        }
+    }
+
+    #[derive(Default, Debug)]
+    struct HiccupOut {
+        /// (time, frames) of every pad.
+        pads: Vec<(u64, u64)>,
+        /// (time counted, snapshot published with it, stage at the count).
+        underruns: Vec<(u64, Starvation, Stage)>,
+        /// Device reads that found less than a period.
+        starved: u64,
+        max_jitter: usize,
+        /// The detail published with each counted underrun (ruling 24 log).
+        details: Vec<StarvationDetail>,
+    }
+
+    /// Event-driven model of capture (441 frames per 10 ms at `phase`), the processing thread
+    /// (one hop at a time, publishing ring A's backlog after each pop like `pop_block`, the
+    /// stage after each block) and the real `Renderer` in deadline mode on a fake 441-frame
+    /// device (read every 10 ms, deadline 1.5 ms before it). Stages as the processor runs
+    /// them: `WarmingUp` 69 blocks, `FadingIn` 7, then `Devocal`. Deterministic.
+    fn hiccup_sim(cfg: &HiccupCfg) -> HiccupOut {
+        const PERIOD: usize = 441;
+        const PERIOD_US: u64 = 10_000;
+        const HOP: usize = 128;
+        const T0: u64 = 10 * SEC;
+        let sink = FakeSink::new(0);
+        let padding = sink.padding.clone();
+        let (mut r, shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let publish = |r: &Renderer, stage: Stage| {
+            r.ctx
+                .stats
+                .stage
+                .store(crate::audio::stage_code(stage), Ordering::Release);
+        };
+        let (mut stage, mut blocks_left) = (Stage::WarmingUp, 69usize);
+        publish(&r, stage);
+        shared.preroll_request.store(true, Ordering::Release);
+        let mut spikes = cfg.spikes.clone();
+        spikes.sort_unstable();
+        let mut o = HiccupOut::default();
+        let (mut next_read, mut next_capture) = (0u64, cfg.phase);
+        let (mut ring_a, mut model_hops, mut pushed) = (0usize, 0usize, 0u64);
+        let (mut busy_until, mut deadline): (Option<u64>, Option<u64>) = (None, None);
+        let mut start_hop = |t: u64, stage: Stage, ring_a: &mut usize| -> Option<u64> {
+            *ring_a -= HOP;
+            shared
+                .in_ring_frames
+                .store(*ring_a as u32, Ordering::Release);
+            let mut d = if stage_runs_model(stage) {
+                model_hops += 1;
+                match cfg.cold {
+                    Some((n, us)) if model_hops <= n => us,
+                    _ => cfg.hop_us,
+                }
+            } else {
+                300
+            };
+            if spikes.first().is_some_and(|&(at, _)| t >= at) {
+                d += spikes.remove(0).1;
+            }
+            Some(t + d)
+        };
+        while next_read < cfg.len_us {
+            let candidates = [Some(next_read), Some(next_capture), busy_until, deadline];
+            let (which, t) = candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.map(|t| (i, t)))
+                .min_by_key(|&(i, t)| (t, i))
+                .unwrap();
+            let wake = match which {
+                0 => {
+                    if t > 0 {
+                        let p = padding.load(Ordering::Relaxed);
+                        if p < PERIOD {
+                            o.starved += 1;
+                        }
+                        padding.store(p.saturating_sub(PERIOD), Ordering::Relaxed);
+                    }
+                    deadline = Some(t + PERIOD_US - DEADLINE_GUARD_US);
+                    next_read = t + PERIOD_US;
+                    Some(Wake::Device)
+                }
+                1 => {
+                    ring_a += PERIOD;
+                    shared
+                        .in_ring_frames
+                        .store(ring_a as u32, Ordering::Release);
+                    shared.last_input_us.store(T0 + t, Ordering::Release);
+                    if busy_until.is_none() && ring_a >= HOP {
+                        busy_until = start_hop(t, stage, &mut ring_a);
+                    }
+                    next_capture += PERIOD_US;
+                    None
+                }
+                2 => {
+                    if blocks_left > 0 {
+                        blocks_left -= 1;
+                        if blocks_left == 0 && stage == Stage::WarmingUp {
+                            stage = Stage::FadingIn;
+                            blocks_left = 7;
+                        } else if blocks_left == 0 {
+                            stage = Stage::Devocal;
+                        }
+                    }
+                    publish(&r, stage);
+                    // Music-like content: a quiet stretch now and then (a decay decides early).
+                    let v = if (pushed / HOP as u64) % 24 < 4 {
+                        0.0
+                    } else {
+                        0.5
+                    };
+                    for _ in 0..HOP * 2 {
+                        tx.push(v).unwrap();
+                    }
+                    pushed += HOP as u64;
+                    busy_until = if ring_a >= HOP {
+                        start_hop(t, stage, &mut ring_a)
+                    } else {
+                        shared
+                            .in_ring_frames
+                            .store(ring_a as u32, Ordering::Release);
+                        None
+                    };
+                    Some(Wake::Data)
+                }
+                _ => {
+                    deadline = None;
+                    Some(Wake::Deadline)
+                }
+            };
+            let Some(w) = wake else { continue };
+            let (pads, pad_fr, un) = (
+                pad_events(&r),
+                r.ctx.stats.diag.render_pad_frames.load(Ordering::Relaxed),
+                underruns(&r),
+            );
+            r.fill_at(w, T0 + t).unwrap();
+            if pad_events(&r) > pads {
+                let f = r.ctx.stats.diag.render_pad_frames.load(Ordering::Relaxed) - pad_fr;
+                o.pads.push((t, f));
+            }
+            if underruns(&r) > un {
+                let s = crate::audio::unpack_starvation(
+                    shared.underrun_snapshot.load(Ordering::Acquire),
+                );
+                o.underruns.push((t, s, stage));
+                o.details.push(shared.fallback_log.detail());
+            }
+            o.max_jitter = o.max_jitter.max(r.headroom.jitter);
+        }
+        o
+    }
+
+    /// Whether the processing thread forces `Fallback(Overload)` for this counted underrun
+    /// (user on, model running, no load overload), at processor `stage`.
+    fn forces_fallback(s: Starvation, stage: Stage) -> bool {
+        super::super::processing::should_force_fallback(Some(s), true, true, false, stage)
+    }
+
+    fn forced(o: &HiccupOut) -> Vec<u64> {
+        o.underruns
+            .iter()
+            .filter(|(_, s, stage)| forces_fallback(*s, *stage))
+            .map(|&(t, _, _)| t)
+            .collect()
+    }
+
+    /// Ruling 24, case b-4 (run 2): a 2 ms slow hop 100 ms into the warm-up leaves the check
+    /// 58 frames short with ring A holding 371: pad 627 (target 1010), one underrun with a
+    /// backlog. It must not force the fallback (never from `WarmingUp`).
+    #[test]
+    fn warm_up_hiccup_b4_signature_does_not_fall_back() {
+        let mut c = HiccupCfg::new(6_000, SEC);
+        c.spikes = vec![(100 * MS, 2_000)];
+        let o = hiccup_sim(&c);
+        assert_eq!(o.pads, vec![(108_500, 627)], "the b-4 signature: {o:?}");
+        assert_eq!(o.underruns.len(), 1, "{o:?}");
+        let (_, s, _) = o.underruns[0];
+        assert!(s.ran_model && s.backlog_frames >= 128, "{s:?}");
+        assert!(forced(&o).is_empty(), "{o:?}");
+    }
+
+    /// Ruling 24, cases c-2 (run 1) and c-1 (run 2): in steady devocal one 2 ms slow hop
+    /// leaves a single pad of 220 / 144 frames and one backlogged underrun. It is treated as
+    /// jitter: no fallback, the headroom grows by a hop, nothing more is padded.
+    #[test]
+    fn steady_hiccup_c2_c1_signatures_do_not_fall_back() {
+        for (phase, at, pad) in [(4_750, 3_360 * MS, 219), (3_750, 3 * SEC, 144)] {
+            let mut c = HiccupCfg::new(phase, 4 * SEC);
+            c.spikes = vec![(at, 2_000)];
+            let o = hiccup_sim(&c);
+            let after: Vec<_> = o.pads.iter().filter(|p| p.0 >= 2 * SEC).collect();
+            assert_eq!(after.len(), 1, "phase {phase}: {o:?}");
+            assert!(after[0].1.abs_diff(pad) <= 2, "phase {phase}: {after:?}");
+            let late: Vec<_> = o.underruns.iter().filter(|u| u.0 >= 2 * SEC).collect();
+            assert_eq!(late.len(), 1, "phase {phase}: {o:?}");
+            assert!(late[0].1.backlog_frames >= 128, "phase {phase}: {late:?}");
+            assert!(forced(&o).is_empty(), "phase {phase}: {o:?}");
+            assert_eq!(o.max_jitter, 128, "phase {phase}: grown as jitter");
+        }
+    }
+
+    /// Ruling 24: a second backlogged underrun within `OVERLOAD_REPEAT_US` forces the
+    /// fallback; the first one alone does not. (The first one's pad and headroom growth absorb
+    /// a second 5 or 10 ms hiccup 2 s later, so the second here is 15 ms.)
+    #[test]
+    fn a_second_backlogged_hiccup_within_10s_falls_back() {
+        let mut c = HiccupCfg::new(3_750, 6 * SEC);
+        c.spikes = vec![(3 * SEC, 5_000), (5 * SEC, 15_000)];
+        let o = hiccup_sim(&c);
+        let late: Vec<_> = o.underruns.iter().filter(|u| u.0 >= 2 * SEC).collect();
+        assert_eq!(late.len(), 2, "{o:?}");
+        assert!(late.iter().all(|u| u.1.backlog_frames >= 128), "{late:?}");
+        let f = forced(&o);
+        assert_eq!(f, vec![late[1].0], "only the second forces: {o:?}");
+    }
+
+    /// Ruling 24: a model that cannot keep up (every hop 3.2 ms against 2.9 ms of audio)
+    /// still reaches the fallback quickly through repeated underruns: within 1.5 s of the
+    /// "on", in every capture phase (the LoadMonitor's 1 s window would follow anyway).
+    #[test]
+    fn a_slow_model_still_falls_back_within_1_5s() {
+        for phase in (0..10_000).step_by(1_000) {
+            let mut c = HiccupCfg::new(phase, 3 * SEC);
+            c.hop_us = 3_200;
+            c.cold = None;
+            let o = hiccup_sim(&c);
+            let f = forced(&o);
+            assert!(
+                f.first().is_some_and(|&t| t < 1_500 * MS),
+                "phase {phase}: {f:?} {o:?}"
+            );
+        }
+    }
+
+    /// Ruling 24: never from `WarmingUp` (its output is the passthrough): a very cold model
+    /// (8 hops of 6 ms) underruns during the warm-up without forcing anything there.
+    #[test]
+    fn warm_up_underruns_never_force() {
+        for phase in (0..10_000).step_by(1_000) {
+            let mut c = HiccupCfg::new(phase, SEC);
+            c.cold = Some((8, 6_000));
+            let o = hiccup_sim(&c);
+            let warm: Vec<_> = o
+                .underruns
+                .iter()
+                .filter(|u| u.2 == Stage::WarmingUp)
+                .collect();
+            assert!(!warm.is_empty(), "phase {phase}: not vacuous: {o:?}");
+            assert!(
+                warm.iter().all(|u| !forces_fallback(u.1, u.2)),
+                "phase {phase}: {warm:?}"
+            );
+        }
+    }
+
+    /// Ruling 24: the overload judgement on its own.
+    #[test]
+    fn overload_judge_forces_only_a_repeat_or_at_cap() {
+        let behind = Starvation {
+            ran_model: true,
+            backlog_frames: 371,
+            warming: false,
+            force: false,
+        };
+        let kept_up = Starvation {
+            backlog_frames: 127,
+            ..behind
+        };
+        let warming = Starvation {
+            warming: true,
+            ..behind
+        };
+        let idle = Starvation {
+            ran_model: false,
+            ..behind
+        };
+        let t = 100 * SEC;
+        let mut j = OverloadJudge::new();
+        assert_eq!(j.judge(kept_up, 128, false, t), Verdict::Jitter);
+        assert_eq!(j.judge(idle, 128, false, t), Verdict::Jitter);
+        assert_eq!(j.judge(behind, 128, false, t), Verdict::Isolated);
+        assert_eq!(
+            j.judge(behind, 128, false, t + OVERLOAD_REPEAT_US - 1),
+            Verdict::Repeated
+        );
+        // Long after the last one: a hiccup again.
+        let t2 = t + 3 * OVERLOAD_REPEAT_US;
+        assert_eq!(j.judge(behind, 128, false, t2), Verdict::Isolated);
+        assert_eq!(
+            j.judge(behind, 128, false, t2 + OVERLOAD_REPEAT_US),
+            Verdict::Isolated,
+            "exactly the window apart is not a repeat"
+        );
+        // Jitter headroom at its cap: the first one forces.
+        let mut j = OverloadJudge::new();
+        assert_eq!(j.judge(behind, 128, true, t), Verdict::AtCap);
+        // Warm-up never forces, even repeated, but counts as the earlier one.
+        let mut j = OverloadJudge::new();
+        assert_eq!(j.judge(warming, 128, true, t), Verdict::WarmUp);
+        assert_eq!(j.judge(warming, 128, false, t + MS), Verdict::WarmUp);
+        assert_eq!(j.judge(behind, 128, false, t + SEC), Verdict::Repeated);
+        j.reset();
+        assert_eq!(j.judge(behind, 128, false, t + 2 * SEC), Verdict::Isolated);
+        assert!(Verdict::Repeated.forces() && Verdict::AtCap.forces());
+        for v in [Verdict::Jitter, Verdict::WarmUp, Verdict::Isolated] {
+            assert!(!v.forces(), "{v:?}");
+        }
+        assert_eq!(Verdict::name(Verdict::Repeated.code()), "repeated");
+        assert_eq!(Verdict::name(99), "?");
+    }
+
+    /// Ruling 24 log: a counted underrun publishes what the check saw, with its verdict.
+    #[test]
+    fn a_counted_underrun_publishes_its_detail() {
+        let mut c = HiccupCfg::new(3_750, 4 * SEC);
+        c.spikes = vec![(3 * SEC, 2_000)];
+        let o = hiccup_sim(&c);
+        assert_eq!(o.details.len(), 1, "{o:?}");
+        let d = o.details[0];
+        assert_eq!(d.verdict, Verdict::Isolated.code());
+        assert_eq!(d.wake, Wake::Deadline as u64);
+        assert_eq!(d.padding + d.ring_b + d.shortfall, 441, "{d:?}");
+        assert!(d.shortfall > 0 && d.since_capture_us < 10_000, "{d:?}");
+        // The line the engine logs from it.
+        let log = crate::audio::FallbackLog::default();
+        let d = StarvationDetail {
+            at_us: 5_000,
+            wake: Wake::Deadline as u64,
+            padding: 300,
+            ring_b: 0,
+            shortfall: 18,
+            since_capture_us: 700,
+            since_push_us: 2_100,
+            block_busy_us: 1_400,
+            check_late_us: 30,
+            headroom: 0,
+            verdict: Verdict::Repeated.code(),
+        };
+        log.set_detail(d);
+        assert_eq!(log.detail(), d);
+        log.trigger.store(1, Ordering::Relaxed);
+        log.forced_at_us.store(9_000, Ordering::Relaxed);
+        log.load_milli.store(356, Ordering::Relaxed);
+        log.stage.store(4, Ordering::Relaxed);
+        log.retry_armed.store(true, Ordering::Relaxed);
+        let l = crate::audio::fallback_line(3, &log, 59_000);
+        assert_eq!(
+            l,
+            "devocal audio: run=3 forced fallback (overload) 50 ms ago: trigger=underrun \
+             load=0.356 stage=4 retry=scheduled | starved 4 ms before: verdict=repeated \
+             wake=deadline padding=300 ring_b=0 shortfall=18 since_capture_us=700 \
+             since_push_us=2100 block_busy_us=1400 check_late_us=30 headroom=0"
+        );
+        log.trigger.store(2, Ordering::Relaxed);
+        let l = crate::audio::fallback_line(3, &log, 59_000);
+        assert!(l.contains("trigger=load") && !l.contains("starved"), "{l}");
     }
 }

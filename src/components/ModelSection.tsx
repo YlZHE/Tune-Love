@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button, Progress } from "@radix-ui/themes";
 import { useModelDownload, type ModelAction } from "../useModelDownload";
 import {
-  MODEL_MANIFEST, approxSize, formatMiB, hasModelConsent, isValidMirrorPrefix, modelErrorText, modelTotalBytes,
+  MODEL_MANIFEST, STEMGENRT_ID, approxSize, formatMiB, hasModelConsent, isValidMirrorPrefix, modelErrorText, modelTotalBytes,
   progressPercent, progressText, readMirrorPrefix, rememberModelConsent, type ModelInfo, type ModelStatus,
 } from "../modelDownload";
 import { ModelConsentDialog } from "./ModelConsentDialog";
@@ -10,17 +10,27 @@ import "./ModelSection.css";
 
 type Send = ReturnType<typeof useModelDownload>["send"];
 
-// Props are wired by the settings page for the download-from-toggle flow; this row set only
-// reads them once that flow exists.
-export function ModelSection(_props: { autoEnablePending: boolean; onAutoEnableConsumed(): void; focusSeq: number }) {
+// The StemgenRT row is the one the main window's missing-model hint points at. While
+// `autoEnablePending` holds, its next download or import asks the backend to turn de-vocal on
+// after installing, and then reports the request used up. A non-zero `focusSeq` change focuses
+// the row's first usable button.
+export function ModelSection({ autoEnablePending, onAutoEnableConsumed, focusSeq }: {
+  autoEnablePending: boolean; onAutoEnableConsumed(): void; focusSeq: number;
+}) {
   const { statuses, send } = useModelDownload();
   return <div className="model-section">
-    {MODEL_MANIFEST.models.map(model =>
-      <ModelRow key={model.id} model={model} status={statuses?.find(s => s.id === model.id) ?? null} send={send} />)}
+    {MODEL_MANIFEST.models.map(model => {
+      const target = model.id === STEMGENRT_ID;
+      return <ModelRow key={model.id} model={model} status={statuses?.find(s => s.id === model.id) ?? null} send={send}
+        autoEnable={target && autoEnablePending} onAutoEnableConsumed={onAutoEnableConsumed} focusSeq={target ? focusSeq : 0} />;
+    })}
   </div>;
 }
 
-function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStatus | null; send: Send }) {
+function ModelRow({ model, status, send, autoEnable, onAutoEnableConsumed, focusSeq }: {
+  model: ModelInfo; status: ModelStatus | null; send: Send;
+  autoEnable: boolean; onAutoEnableConsumed(): void; focusSeq: number;
+}) {
   // A rejected command is shown only while the row is still in the phase it was raised in:
   // a phase change brings fresher information than the rejection.
   const [rejection, setRejection] = useState<{ text: string; phase: string } | null>(null);
@@ -31,14 +41,27 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
   const actionError = rejection && rejection.phase === phase ? rejection.text : "";
 
   // One command at a time per row, so a fast double-click cannot come back as already_running.
+  // A pending auto-enable rides on the first download or import actually sent.
   const run = (action: ModelAction, options?: { mirrorPrefix?: string }) => {
     if (busy) return;
     setRejection(null);
     setBusy(true);
-    send(model.id, action, options)
+    const withAutoEnable = autoEnable && (action === "download" || action === "import");
+    send(model.id, action, { ...options, autoEnable: withAutoEnable })
       .catch((e: unknown) => setRejection({ text: e instanceof Error ? e.message : modelErrorText(String(e)), phase }))
       .finally(() => setBusy(false));
+    if (withAutoEnable) onAutoEnableConsumed();
   };
+
+  // Focus waits for the first status: until then the row has no buttons.
+  const row = useRef<HTMLDivElement>(null);
+  const focusWanted = useRef(false);
+  useEffect(() => { if (focusSeq) focusWanted.current = true; }, [focusSeq]);
+  useEffect(() => {
+    if (!focusWanted.current || !status) return;
+    focusWanted.current = false;
+    row.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+  });
   // The consent box is open while this holds the prefix to list in it (null: closed).
   const [consent, setConsent] = useState<{ mirrorPrefix: string } | null>(null);
   // Only a non-empty, valid prefix is ever sent or listed.
@@ -126,9 +149,14 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
     </>;
   }
 
-  return <div role="group" aria-label={model.name} className="model-row">
+  // Only where a download or import can still be started.
+  const autoEnableNote = autoEnable && (status?.phase === "missing" || status?.phase === "failed")
+    ? <p className="model-row-note">下载完成后将自动开启去人声</p> : null;
+
+  return <div ref={row} role="group" aria-label={model.name} className="model-row">
     <h3>{model.name}</h3>
     {body}
+    {autoEnableNote}
     {actionError && status?.phase !== "failed" && <p role="alert" className="color-error">{actionError}</p>}
     <ModelConsentDialog model={consent ? model : null} mirrorPrefix={consent?.mirrorPrefix ?? ""}
       onAccept={acceptConsent} onCancel={() => setConsent(null)} />

@@ -18,8 +18,16 @@ async function prepare(page: Page, view = "/?view=settings", opts: { models?: Re
     state.modelFailure = null;
     state.modelDelayMs = 0;
     state.devocal = { ...OFF, ...devocal };
+    state.openSettingsCalls = [];
+    // Event bridge, shaped like @tauri-apps/api 2.x: listen() passes the id returned by
+    // transformCallback as `handler`; unlisten() calls unregisterListener, then plugin:event|unlisten.
+    state.callbacks = new Map();
+    state.listeners = new Map();
+    let nextId = 1;
+    state.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
     state.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "settings" } },
+      transformCallback: (callback: (value: unknown) => void) => { const id = nextId++; state.callbacks.set(id, callback); return id; },
       invoke: async (command: string, args: any) => {
         if (command === "get_model_status") return structuredClone(state.models);
         if (command === "model_command") {
@@ -38,6 +46,9 @@ async function prepare(page: Page, view = "/?view=settings", opts: { models?: Re
           return structuredClone(state.models);
         }
         if (command === "get_devocal_status") return structuredClone(state.devocal);
+        if (command === "open_settings") { state.openSettingsCalls.push(args); return null; }
+        if (command === "plugin:event|listen") { const eventId = nextId++; state.listeners.set(eventId, { event: args.event, handler: args.handler }); return eventId; }
+        if (command === "plugin:event|unlisten") { state.listeners.delete(args.eventId); return null; }
         if (command === "get_now_playing") return { status: "idle", track: null, capturedAtMs: Date.now() };
         if (command === "get_audio_level" || command === "get_key_detection") return null;
         if (command === "plugin:window|is_always_on_top") return true;
@@ -310,4 +321,92 @@ test("retry goes through the consent box too", async ({ page }) => {
   await dialog.getByRole("button", { name: "同意并下载", exact: true }).click();
   await expect.poll(async () => (await requests(page)).length).toBe(1);
   expect(await requests(page)).toEqual([request("download")]);
+});
+
+// Delivers a Rust `emit_to` to every live listener for that event, the way the IPC bridge does.
+const emitEvent = (page: Page, event: string, payload: unknown) => page.evaluate(({ event, payload }) => {
+  const state = window as any;
+  for (const [, listener] of state.listeners) {
+    if (listener.event === event) state.callbacks.get(listener.handler)({ event, id: 1, payload });
+  }
+}, { event, payload });
+const AUTO_ENABLE_NOTE = "下载完成后将自动开启去人声";
+
+test("main: the missing-model warning opens settings at the model row", async ({ page }) => {
+  await prepare(page, "/", { devocal: { phase: "unavailable", error: "model_not_found" } });
+  const warning = page.locator(".devocal-warning[aria-live=polite]");
+  const button = warning.getByRole("button", { name: "未找到去人声模型，请在设置中下载", exact: true });
+  // Visible without hovering the window, and still the only announced text.
+  await expect(button).toBeVisible();
+  await expect(page.locator(".footer-controls")).toHaveCSS("opacity", "0");
+  await expect(page.locator("[aria-live]", { hasText: "未找到去人声模型" })).toHaveCount(1);
+  await button.click();
+  await expect.poll(() => page.evaluate(() => (window as any).openSettingsCalls)).toEqual([{ section: "devocal-model" }]);
+  // An engine that cannot start offers no settings shortcut.
+  await page.evaluate(() => { (window as any).devocal = { ...(window as any).devocal, error: "engine_unavailable: spawn failed" }; });
+  await expect(page.locator(".devocal-warning")).toHaveText("去人声引擎无法启动");
+  await expect(page.locator(".devocal-warning").getByRole("button")).toHaveCount(0);
+});
+
+test("main: the settings button still opens settings without a section", async ({ page }) => {
+  await prepare(page, "/");
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).openSettingsCalls)).toEqual([{}]);
+});
+
+test("settings opened from the missing-model hint downloads with autoEnable", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings&section=devocal-model", { consent: false });
+  const section = page.getByRole("region", { name: "去人声" });
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  expect((await section.boundingBox())!.y).toBeLessThan(600);
+  await expect(row.getByRole("button", { name: DOWNLOAD, exact: true })).toBeFocused();
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  // Opening the consent box does not use up the request; agreeing does. (The modal box hides
+  // the row from the accessibility tree, so the note is found by text alone.)
+  await expect(page.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  await page.getByRole("alertdialog").getByRole("button", { name: "同意并下载", exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(1);
+  expect(await requests(page)).toEqual([{ ...request("download"), autoEnable: true }]);
+  await row.getByRole("button", { name: "取消", exact: true }).click();
+  await row.getByRole("button", { name: "继续下载", exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(3);
+  expect(await requests(page)).toEqual([{ ...request("download"), autoEnable: true }, request("cancel"), request("download")]);
+  await expect(row.getByText(AUTO_ENABLE_NOTE)).toHaveCount(0);
+});
+
+test("settings opened from the hint: cancelling consent keeps the request; an import carries it", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings&section=devocal-model", { consent: false });
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  await row.getByRole("button", { name: "从本地文件导入…", exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(1);
+  expect(await requests(page)).toEqual([{ ...request("import"), autoEnable: true }]);
+});
+
+test("settings opened normally downloads without autoEnable", async ({ page }) => {
+  const row = await prepare(page);
+  await expect(row.getByRole("button", { name: DOWNLOAD, exact: true })).toBeVisible();
+  await expect(row.getByText(AUTO_ENABLE_NOTE)).toHaveCount(0);
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(1);
+  expect(await requests(page)).toEqual([request("download")]);
+});
+
+test("a settings-section event in an open settings window focuses the model row", async ({ page }) => {
+  const row = await prepare(page);
+  await expect(row.getByRole("button", { name: DOWNLOAD, exact: true })).toBeVisible();
+  await expect(row.getByText(AUTO_ENABLE_NOTE)).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => [...(window as any).listeners.values()]
+    .filter((l: any) => l.event === "settings-section").length)).toBe(1);
+  // Unknown sections are ignored.
+  await emitEvent(page, "settings-section", "colors");
+  await expect(row.getByText(AUTO_ENABLE_NOTE)).toHaveCount(0);
+  await emitEvent(page, "settings-section", "devocal-model");
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  await expect(row.getByRole("button", { name: DOWNLOAD, exact: true })).toBeFocused();
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(1);
+  expect(await requests(page)).toEqual([{ ...request("download"), autoEnable: true }]);
 });

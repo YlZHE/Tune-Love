@@ -50,3 +50,9 @@ devocal-core = { path = "../core", features = ["fake"] }
 [[example]]
 name = "latency_probe"
 test = true
+
+# Measures how much later the process loopback delivers audio than the endpoint loopback
+# (pure analysis unit-tested; the capture itself is never run by the tests).
+[[example]]
+name = "split_probe"
+test = true

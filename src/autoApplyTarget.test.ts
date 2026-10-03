@@ -19,61 +19,52 @@ const written = (overrides: Partial<WrittenPair> = {}): WrittenPair => ({
 
 describe("nextWrite", () => {
   test("writes a new Major/Minor pair as profile option labels", () => {
-    expect(nextWrite(null, minor, ready(), "song-a", true)).toEqual({ key: "F#", scale: "Minor" });
-    expect(nextWrite(null, major, ready(), "song-a", true)).toEqual({ key: "B", scale: "Major" });
+    expect(nextWrite(null, minor, ready(), "song-a")).toEqual({ key: "F#", scale: "Minor" });
+    expect(nextWrite(null, major, ready(), "song-a")).toEqual({ key: "B", scale: "Major" });
   });
 
-  test("before any evidence the pair is Chromatic with no key, if the plugin has Chromatic", () => {
-    expect(nextWrite(null, null, ready(), "song-a", true)).toEqual({ key: null, scale: "Chromatic" });
-    expect(nextWrite(null, null, ready(), "song-a", false)).toBeNull();
-    expect(nextWrite({ ...written(), key: null, scale: "Chromatic" }, null, ready(), "song-a", true)).toBeNull();
+  test("before any evidence the pair is Chromatic with no key", () => {
+    expect(nextWrite(null, null, ready(), "song-a")).toEqual({ key: null, scale: "Chromatic" });
+    expect(nextWrite({ ...written(), key: null, scale: "Chromatic" }, null, ready(), "song-a")).toBeNull();
   });
 
   test("Chromatic targets write the scale only, or key plus Chromatic when a key is known", () => {
-    expect(nextWrite(null, chromatic, ready(), "song-a", true)).toEqual({ key: null, scale: "Chromatic" });
-    expect(nextWrite(null, { ...chromatic, key: 8 }, ready(), "song-a", true)).toEqual({ key: "G#", scale: "Chromatic" });
-    expect(nextWrite(written({ key: null, scale: "Chromatic" }), chromatic, ready(), "song-a", true)).toBeNull();
-    expect(nextWrite(written(), chromatic, ready("session-a", ["scale"]), "song-a", true))
+    expect(nextWrite(null, chromatic, ready(), "song-a")).toEqual({ key: null, scale: "Chromatic" });
+    expect(nextWrite(null, { ...chromatic, key: 8 }, ready(), "song-a")).toEqual({ key: "G#", scale: "Chromatic" });
+    expect(nextWrite(written({ key: null, scale: "Chromatic" }), chromatic, ready(), "song-a")).toBeNull();
+    expect(nextWrite(written(), chromatic, ready("session-a", ["scale"]), "song-a"))
       .toEqual({ key: null, scale: "Chromatic" });
-    expect(nextWrite(null, { ...chromatic, key: 8 }, ready("session-a", ["scale"]), "song-a", true)).toBeNull();
-  });
-
-  test("a plugin without Chromatic gets the candidate, or nothing", () => {
-    expect(nextWrite(null, chromatic, ready(), "song-a", false)).toEqual({ key: "D", scale: "Major" });
-    expect(nextWrite(null, { ...chromatic, key: 8 }, ready(), "song-a", false)).toEqual({ key: "D", scale: "Major" });
-    expect(nextWrite(null, { ...chromatic, candidate: null }, ready(), "song-a", false)).toBeNull();
-    expect(nextWrite(written({ key: "D", scale: "Major" }), chromatic, ready(), "song-a", false)).toBeNull();
-    expect(nextWrite(null, minor, ready(), "song-a", false)).toEqual({ key: "F#", scale: "Minor" });
+    expect(nextWrite(null, { ...chromatic, key: 8 }, ready("session-a", ["scale"]), "song-a")).toBeNull();
   });
 
   test("never re-sends the pair already written for this connection and track", () => {
-    expect(nextWrite(written(), minor, ready(), "song-a", true)).toBeNull();
-    expect(nextWrite(written({ status: "pending" }), minor, ready(), "song-a", true)).toBeNull();
+    expect(nextWrite(written(), minor, ready(), "song-a")).toBeNull();
+    expect(nextWrite(written({ status: "pending" }), minor, ready(), "song-a")).toBeNull();
   });
 
   test("a failed write is not retried for the same pair", () => {
-    expect(nextWrite(written({ status: "failed" }), minor, ready(), "song-a", true)).toBeNull();
+    expect(nextWrite(written({ status: "failed" }), minor, ready(), "song-a")).toBeNull();
   });
 
   test("a different pair for the same track is written", () => {
-    expect(nextWrite(written(), major, ready(), "song-a", true)).toEqual({ key: "B", scale: "Major" });
-    expect(nextWrite(written(), { ...minor, scale: "major" }, ready(), "song-a", true)).toEqual({ key: "F#", scale: "Major" });
+    expect(nextWrite(written(), major, ready(), "song-a")).toEqual({ key: "B", scale: "Major" });
+    expect(nextWrite(written(), { ...minor, scale: "major" }, ready(), "song-a")).toEqual({ key: "F#", scale: "Major" });
   });
 
   test("track or connection changes reset the memory", () => {
-    expect(nextWrite(written(), minor, ready(), "song-b", true)).toEqual({ key: "F#", scale: "Minor" });
-    expect(nextWrite(written(), minor, ready("session-b"), "song-a", true)).toEqual({ key: "F#", scale: "Minor" });
+    expect(nextWrite(written(), minor, ready(), "song-b")).toEqual({ key: "F#", scale: "Minor" });
+    expect(nextWrite(written(), minor, ready("session-b"), "song-a")).toEqual({ key: "F#", scale: "Minor" });
   });
 
   test.each(["disconnected", "awaiting", "error"] as const)("does not write while %s", phase => {
-    expect(nextWrite(null, minor, { ...ready(), phase }, "song-a", true)).toBeNull();
+    expect(nextWrite(null, minor, { ...ready(), phase }, "song-a")).toBeNull();
   });
 
   test("requires both key and scale capabilities and a connection id", () => {
-    expect(nextWrite(null, minor, ready("session-a", ["retune", "key"]), "song-a", true)).toBeNull();
-    expect(nextWrite(null, minor, ready("session-a", ["scale"]), "song-a", true)).toBeNull();
-    expect(nextWrite(null, minor, { ...ready(), connectionId: null }, "song-a", true)).toBeNull();
-    expect(nextWrite(null, minor, ready(), "", true)).toBeNull();
+    expect(nextWrite(null, minor, ready("session-a", ["retune", "key"]), "song-a")).toBeNull();
+    expect(nextWrite(null, minor, ready("session-a", ["scale"]), "song-a")).toBeNull();
+    expect(nextWrite(null, minor, { ...ready(), connectionId: null }, "song-a")).toBeNull();
+    expect(nextWrite(null, minor, ready(), "")).toBeNull();
   });
 });
 

@@ -8,21 +8,14 @@ export type WrittenPair = OptionPair & {
   connectionId: string; trackKey: string; status: "pending" | "written" | "failed";
 };
 
-/** What the plugin should be set to: a target (or no evidence yet) as an option pair. Chromatic
- * degrades to the Major/Minor candidate when the plugin has no Chromatic option. */
-function effectivePair(target: AutoTuneTarget | null, chromaticSupported: boolean): OptionPair | null {
-  if (!target) return chromaticSupported ? { key: null, scale: "Chromatic" } : null;
-  if (target.scale !== "chromatic" || chromaticSupported) return targetOptionLabels(target);
-  return target.candidate ? targetOptionLabels({ ...target, ...target.candidate }) : null;
-}
-
 /** The pair to send now, or null when nothing should be written. */
 export function nextWrite(prev: WrittenPair | null, target: AutoTuneTarget | null,
-  state: ControlState, trackKey: string, chromaticSupported: boolean): OptionPair | null {
+  state: ControlState, trackKey: string): OptionPair | null {
   if (!trackKey || state.phase !== "ready" || !state.connectionId
     || !state.capabilities.includes("scale")) return null;
-  const pair = effectivePair(target, chromaticSupported);
-  if (!pair || (pair.key !== null && !state.capabilities.includes("key"))) return null;
+  // No evidence yet means Chromatic with no key.
+  const pair: OptionPair = target ? targetOptionLabels(target) : { key: null, scale: "Chromatic" };
+  if (pair.key !== null && !state.capabilities.includes("key")) return null;
   if (prev && prev.connectionId === state.connectionId && prev.trackKey === trackKey
     && prev.key === pair.key && prev.scale === pair.scale) return null;
   return pair;

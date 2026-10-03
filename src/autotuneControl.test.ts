@@ -240,33 +240,3 @@ describe("Kaka Retune speed conversion", () => {
     expect(requests.every(r => r.op === "status")).toBe(true);
   });
 });
-
-describe("supportsChromatic", () => {
-  const options = (labels: string[]) => ({ ok: true, state: ready(), options: { ok: true as const, source: "profile" as const,
-    profile_id: "fixture", role: "scale" as const, id: 1, options: labels.map((label, i) => ({ label, normalized: i })) } });
-
-  it("asks once per connection and reads the Chromatic label", async () => {
-    const sent: BridgeRequest[] = [];
-    const control = new AutoTuneControl(async request => {
-      sent.push(request);
-      return request.op === "options" ? options(["Major", "Minor", "Chromatic"]) : { ok: true, state: ready() };
-    });
-    expect(await control.supportsChromatic()).toBe(false);
-    await control.connect("candidate");
-    expect(await control.supportsChromatic()).toBe(true);
-    expect(await control.supportsChromatic()).toBe(true);
-    expect(sent.filter(request => request.op === "options")).toEqual([{ op: "options", candidateId: "candidate", role: "scale" }]);
-  });
-
-  it("is false without the label or when the query fails", async () => {
-    const plain = new AutoTuneControl(async request => request.op === "options" ? options(["Major", "Minor"]) : { ok: true, state: ready() });
-    await plain.connect("candidate");
-    expect(await plain.supportsChromatic()).toBe(false);
-    const broken = new AutoTuneControl(async request => {
-      if (request.op === "options") throw new Error("boom");
-      return { ok: true, state: ready() };
-    });
-    await broken.connect("candidate");
-    expect(await broken.supportsChromatic()).toBe(false);
-  });
-});

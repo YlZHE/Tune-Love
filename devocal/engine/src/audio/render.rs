@@ -185,6 +185,9 @@ pub const LOW_ENERGY_WAIT_US: u64 = 1_000_000;
 /// A quiet spot: the frames to fade and skip have an RMS at most this fraction (-6 dB) of
 /// the recent output RMS.
 pub const LOW_ENERGY_RATIO: f32 = 0.5;
+/// A released headroom is skipped only after the queue's low point has been watched this
+/// long: ring B arrives in bursts, so one wake can overstate what is really spare.
+pub const DECAY_OBSERVE_US: u64 = 30_000;
 /// Time constant of the recent output power average, in frames (100 ms).
 const RECENT_POWER_FRAMES: f64 = 4_410.0;
 
@@ -222,7 +225,9 @@ impl Headroom {
         *self = Self::new();
     }
 
-    /// Jitter plus pre-roll headroom in frames (never above the cap passed in).
+    /// Jitter plus pre-roll headroom in frames. At most the `cap` passed to `on_underrun`
+    /// provided every `add_preroll` stays within the headroom left below that cap (as
+    /// [`preroll_frames`] sizes it); `add_preroll` itself does not clamp.
     pub fn total(&self) -> usize {
         self.jitter + self.preroll
     }
@@ -245,7 +250,8 @@ impl Headroom {
         }
     }
 
-    /// A pre-roll of `frames` began at `now_us` (sized by [`preroll_frames`] within the cap).
+    /// A pre-roll of `frames` began at `now_us`. Precondition: `frames` fits the headroom
+    /// left below the cap (as sized by [`preroll_frames`]); not clamped here.
     pub fn add_preroll(&mut self, frames: usize, now_us: u64) {
         if frames == 0 {
             return;
@@ -306,7 +312,7 @@ fn mean_square(a: &[f32], b: &[f32]) -> f64 {
 /// [`RECENT_POWER_FRAMES`]) with `frames` (interleaved stereo); non-finite frames are skipped.
 pub(crate) fn track_power(ms: f64, frames: &[f32]) -> f64 {
     let alpha = 1.0 / RECENT_POWER_FRAMES;
-    frames.chunks_exact(2).fold(ms, |m, f| {
+    frames.as_chunks::<2>().0.iter().fold(ms, |m, f| {
         let p = (f64::from(f[0]) * f64::from(f[0]) + f64::from(f[1]) * f64::from(f[1])) / 2.0;
         if p.is_finite() {
             m + (p - m) * alpha
@@ -737,6 +743,9 @@ struct Renderer {
     /// Released headroom still queued, to be skipped at a quiet spot; since when.
     decay_drop: usize,
     decay_since_us: u64,
+    /// Lowest queue (device padding + ring B) seen at any wake since `decay_since_us`
+    /// (`usize::MAX` when no decay is pending).
+    decay_low: usize,
     /// The pending `drop_pending` is a headroom decay (counted as `render_decay_frames`).
     drop_is_decay: bool,
     /// Exponential average of the mean square of the real frames written (`track_power`).
@@ -767,6 +776,7 @@ impl Renderer {
             headroom: Headroom::new(),
             decay_drop: 0,
             decay_since_us: 0,
+            decay_low: usize::MAX,
             drop_is_decay: false,
             recent_ms: 0.0,
             preroll_left: 0,
@@ -857,7 +867,7 @@ impl Renderer {
         // without a pre-roll in progress and without a pending decay; a pending request is
         // kept (see above).
         self.headroom.reset();
-        self.decay_drop = 0;
+        self.end_decay();
         self.drop_is_decay = false;
         self.recent_ms = 0.0;
         self.ctx.stats.headroom_frames.store(0, Ordering::Relaxed);
@@ -865,6 +875,12 @@ impl Renderer {
         self.preroll_fade = false;
         self.last_frame = [0.0; 2];
         self.last_gain = 0.0;
+    }
+
+    /// No decay pending any more (done, cancelled, or a new stream).
+    fn end_decay(&mut self) {
+        self.decay_drop = 0;
+        self.decay_low = usize::MAX;
     }
 
     fn discard_all(&mut self) {
@@ -999,8 +1015,13 @@ impl Renderer {
         if freed > 0 {
             if self.decay_drop == 0 {
                 self.decay_since_us = now;
+                self.decay_low = usize::MAX;
             }
             self.decay_drop += freed;
+        }
+        if self.decay_drop > 0 {
+            // Every wake, written to or not: the low point is what is really spare.
+            self.decay_low = self.decay_low.min(padding + avail);
         }
         self.ctx
             .stats
@@ -1047,32 +1068,43 @@ impl Renderer {
             return self.write_out(need, padding);
         }
 
-        if self.decay_drop > 0 && self.drop_pending == 0 {
-            // O1: the released headroom is what is queued beyond the target now.
-            let spare = (padding + avail).saturating_sub(target);
-            if spare == 0 {
-                // Nothing extra is queued (player paused): nothing to skip.
-                self.decay_drop = 0;
+        let waited = now.saturating_sub(self.decay_since_us);
+        if self.decay_drop > 0 && self.drop_pending == 0 && waited >= DECAY_OBSERVE_US {
+            // O1: what is really spare is the lowest queue since the release, beyond the
+            // target. None (player paused, or a late packet ate it): nothing to skip.
+            if self.decay_low <= target {
+                self.end_decay();
             } else {
+                let spare = self.decay_low - target;
                 let window =
                     self.peek_rms((self.fade_frames + self.decay_drop.min(spare)).min(avail));
                 let recent = self.recent_ms.sqrt() as f32;
-                let waited = now.saturating_sub(self.decay_since_us);
                 if decay_now(window, recent, waited) {
-                    self.drop_pending = self
+                    let d = self
                         .decay_drop
                         .min(spare)
                         .min(avail.saturating_sub(self.fade_frames));
-                    self.drop_is_decay = self.drop_pending > 0;
-                    self.decay_drop = 0;
+                    if d > 0 {
+                        self.drop_pending = d;
+                        self.drop_is_decay = true;
+                        self.end_decay();
+                    } else if waited >= 2 * LOW_ENERGY_WAIT_US {
+                        // Not one fade's worth queued on any wake for a second past the
+                        // forced point: what is left (< 5 ms) stays.
+                        self.end_decay();
+                    }
+                    // Otherwise too little in ring B for fade + skip now: retry next wake.
                 }
             }
         }
 
         let mut w = 0;
         if self.drop_pending > 0 && avail > 0 {
-            // Trim: fade out what plays next, skip the excess, fade the rest in.
-            let k = self.fade_frames.min(need).min(avail);
+            // Trim: fade out what plays next, skip the excess, fade the rest in. A decay
+            // keeps its full fade even beyond `need` (frames move from ring B to the device;
+            // the queue is the same), so small periods do not shorten it.
+            let fade_room = if self.drop_is_decay { room } else { need };
+            let k = self.fade_frames.min(fade_room).min(avail);
             self.take(0, k);
             fade_edges(&mut self.staging[..k * 2], false, true, k);
             avail -= k;
@@ -1091,7 +1123,7 @@ impl Renderer {
             self.fade_in.start(0);
             w = k;
         }
-        let real = (need - w).min(avail);
+        let real = need.saturating_sub(w).min(avail);
         self.take(w, real);
         w += real;
         let diag = &self.ctx.stats.diag;
@@ -1472,10 +1504,12 @@ mod tests {
         assert_eq!(r.peek_rms(0), 0.0);
     }
 
-    /// Ring B gets 441 frames of 0.5 per 10 ms until `feed_until_us`; the device plays one
-    /// 441-frame period every 10 ms; `fill_at` runs every 1 ms from `t0` for `ms` ms.
-    /// Calls `each(r, now, first)` after every fill, `first` being the index in `out` of
-    /// the first sample that fill wrote.
+    /// Runs `ms` ms from `t0` in 1 ms steps. Each step `feed(i)` gives `(frames, value)`:
+    /// that many frames of `value` arrive in ring B (marked as fresh input, so underruns are
+    /// judged); then the device plays one 441-frame period every 10 ms; then `fill_at` runs,
+    /// every step or, with `period_wakes`, only on the device period (as the real event
+    /// wakes it). Calls `each(r, now, first)` after every fill, `first` being the index in
+    /// `out` of the first sample that fill wrote.
     #[allow(clippy::too_many_arguments)]
     fn simulate(
         r: &mut Renderer,
@@ -1484,25 +1518,43 @@ mod tests {
         out: &Mutex<Vec<f32>>,
         t0: u64,
         ms: u64,
-        feed_until_us: u64,
+        period_wakes: bool,
+        mut feed: impl FnMut(u64) -> (u64, f32),
         mut each: impl FnMut(&mut Renderer, u64, usize),
     ) {
         for i in 0..ms {
             let now = t0 + i * MS;
-            if now < feed_until_us {
-                let frames = (i + 1) * 441 / 10 - i * 441 / 10;
+            let (frames, value) = feed(i);
+            if frames > 0 {
                 for _ in 0..frames * 2 {
-                    tx.push(0.5).unwrap();
+                    tx.push(value).unwrap();
                 }
+                r.ctx.shared.last_input_us.store(now, Ordering::Release);
             }
             if i > 0 && i % 10 == 0 {
                 let p = padding.load(Ordering::Relaxed);
                 padding.store(p.saturating_sub(441), Ordering::Relaxed);
             }
+            if period_wakes && i % 10 != 0 {
+                continue;
+            }
             let first = out.lock().unwrap().len();
             r.fill_at(now).unwrap();
             each(r, now, first);
         }
+    }
+
+    /// 441 frames per 10 ms, spread over every ms.
+    fn smooth(i: u64) -> u64 {
+        (i + 1) * 441 / 10 - i * 441 / 10
+    }
+
+    fn underruns(r: &Renderer) -> u64 {
+        r.ctx.stats.underruns.load(Ordering::Relaxed)
+    }
+
+    fn pad_events(r: &Renderer) -> u64 {
+        r.ctx.stats.diag.render_pad_events.load(Ordering::Relaxed)
     }
 
     fn decay_frames(r: &Renderer) -> u64 {
@@ -1521,6 +1573,7 @@ mod tests {
         assert_eq!(r.headroom.total(), 441);
         let fade = r.fade_frames;
         let mut decayed_at = None;
+        let mut skip_at = 0;
         simulate(
             &mut r,
             &mut tx,
@@ -1528,7 +1581,8 @@ mod tests {
             &out,
             t0,
             6_500,
-            u64::MAX,
+            false,
+            |i| (smooth(i), 0.5),
             |r, now, first| {
                 let d = decay_frames(r);
                 if now < t0 + 5 * SEC {
@@ -1543,6 +1597,7 @@ mod tests {
                     assert!(block[0] > 0.4, "starts at full level: {}", block[0]);
                     assert_eq!(block[(fade - 1) * 2], 0.0);
                     assert_eq!(block[(fade - 1) * 2 + 1], 0.0);
+                    skip_at = first / 2 + fade;
                 }
             },
         );
@@ -1554,6 +1609,26 @@ mod tests {
         );
         let d = decay_frames(&r);
         assert!(d > 0 && d <= 441, "{d}");
+        // After the skip the audio fades back in from silence to full level.
+        let o = out.lock().unwrap();
+        let after: Vec<f32> = o[skip_at * 2..(skip_at + 2 * fade) * 2]
+            .iter()
+            .step_by(2)
+            .copied()
+            .collect();
+        assert!(after[0] < 0.01, "starts near zero: {}", after[0]);
+        assert!(
+            after.windows(2).all(|p| p[1] >= p[0]),
+            "rises monotonically"
+        );
+        assert!(
+            after[fade / 2] > 0.1 && after[fade / 2] < 0.4,
+            "{}",
+            after[fade / 2]
+        );
+        assert_eq!(after[2 * fade - 1], 0.5, "back to full level");
+        drop(o);
+        assert_eq!(underruns(&r), 0);
         assert_eq!(
             r.ctx.stats.diag.render_trim_frames.load(Ordering::Relaxed),
             0,
@@ -1581,13 +1656,157 @@ mod tests {
             &out,
             t0,
             6_000,
-            t0 + 100 * MS,
+            false,
+            |i| (if i < 100 { smooth(i) } else { 0 }, 0.5),
             |_, _, _| {},
         );
         assert_eq!(decay_frames(&r), 0);
         assert_eq!(r.headroom.total(), 0);
         assert_eq!(r.decay_drop, 0, "cancelled");
         assert_eq!(r.ctx.stats.headroom_frames.load(Ordering::Relaxed), 0);
+    }
+
+    /// Fix round 1: ring B arrives in 441-frame packets, so one wake can overstate the spare
+    /// queue by a packet; the decay uses the low point over at least `DECAY_OBSERVE_US` and
+    /// must never cause an underrun or a pad. Packets land `phase` ms after each device
+    /// period; one of them (due at `due` ms) arrives `late` ms late.
+    #[test]
+    fn decay_with_bursty_input_never_starves() {
+        struct Case {
+            phase: u64,
+            due: u64,
+            late: u64,
+            period_wakes: bool,
+            /// The audio turns quiet (0.1 after 0.5) just before the release, so the decay
+            /// may go at its first chance instead of after the forced 1 s.
+            quiet: bool,
+            decays: bool,
+        }
+        let cases = [
+            // 3 + 5 = 8 ms: late but before the next period; the spare holds, the forced
+            // decay goes ahead.
+            Case {
+                phase: 3,
+                due: 5_503,
+                late: 5,
+                period_wakes: false,
+                quiet: false,
+                decays: true,
+            },
+            // 7 + 5 = 12 ms: misses a period, the queued excess covers it, the low point
+            // reaches the target and the decay is cancelled.
+            Case {
+                phase: 7,
+                due: 5_507,
+                late: 5,
+                period_wakes: false,
+                quiet: false,
+                decays: false,
+            },
+            // Device-period wakes, a quiet spot at the release, and the first packet after it
+            // misses a period: a decision on the first wake (the old single-wake rule) skips
+            // 441 frames and then underruns; watching the low point for 30 ms cancels.
+            Case {
+                phase: 3,
+                due: 5_013,
+                late: 9,
+                period_wakes: true,
+                quiet: true,
+                decays: false,
+            },
+        ];
+        for c in cases {
+            let sink = FakeSink::new(0);
+            let (padding, out) = (sink.padding.clone(), sink.out.clone());
+            let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+            r.after_open();
+            let t0 = 10 * SEC;
+            let cap = MAX_EXTRA_HEADROOM_FRAMES;
+            r.headroom.on_underrun(true, cap, cap, t0);
+            let feed = |i: u64| {
+                let on_time = i % 10 == c.phase && i != c.due;
+                let frames = 441 * (u64::from(on_time) + u64::from(i == c.due + c.late));
+                let value = if c.quiet && i >= 4_980 { 0.1 } else { 0.5 };
+                (frames, value)
+            };
+            // The stream start pads once (not primed, never counted); judge from the
+            // release at 5 s on.
+            let mut at_release = None;
+            simulate(
+                &mut r,
+                &mut tx,
+                &padding,
+                &out,
+                t0,
+                7_000,
+                c.period_wakes,
+                feed,
+                |r, now, _| {
+                    if now == t0 + 5 * SEC {
+                        assert_eq!(r.headroom.total(), 0, "released");
+                        at_release = Some(pad_events(r));
+                    }
+                },
+            );
+            let what = format!("phase {} late {} at {}", c.phase, c.late, c.due);
+            let p0 = at_release.unwrap();
+            assert_eq!(underruns(&r), 0, "{what}");
+            assert_eq!(pad_events(&r), p0, "no pad across the decay ({what})");
+            assert_eq!(decay_frames(&r) > 0, c.decays, "{what}");
+            assert!(decay_frames(&r) <= 441);
+            assert_eq!(r.decay_drop, 0, "settled ({what})");
+        }
+    }
+
+    /// Fix round 1, minors 2 and 3: with too little in ring B for a full fade plus a skip the
+    /// decay stays pending and retries (giving up a second past the forced point); when it
+    /// goes, its fade-out keeps the full 5 ms even where the wake needs fewer frames.
+    #[test]
+    fn a_decay_without_room_to_fade_retries_then_gives_up() {
+        let sink = FakeSink::new(0);
+        let (padding, out) = (sink.padding.clone(), sink.out.clone());
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        let fade = r.fade_frames;
+        let t = 100 * SEC;
+        let push = |tx: &mut Producer<f32>, frames: usize| {
+            for _ in 0..frames * 2 {
+                tx.push(0.5).unwrap();
+            }
+        };
+        // Target 441 + 128 = 569; device at 500 (needs 69); ring B 100 frames: queue 600,
+        // 31 frames spare, but 100 <= one fade. Forced (waited 1.5 s), yet nothing to do.
+        padding.store(500, Ordering::Relaxed);
+        push(&mut tx, 100);
+        r.decay_drop = 441;
+        r.decay_since_us = t - 1_500 * MS;
+        r.decay_low = 600;
+        r.fill_at(t).unwrap();
+        assert_eq!(decay_frames(&r), 0);
+        assert_eq!(r.decay_drop, 441, "kept pending");
+        // Next wake: enough queued. The 31 spare frames go, behind a full 221-frame fade
+        // although the wake needs only 69.
+        padding.store(500, Ordering::Relaxed);
+        push(&mut tx, 400);
+        let first = out.lock().unwrap().len();
+        r.fill_at(t + 10 * MS).unwrap();
+        assert_eq!(decay_frames(&r), 31);
+        assert_eq!((r.decay_drop, r.decay_low), (0, usize::MAX));
+        let o = out.lock().unwrap();
+        assert_eq!((o.len() - first) / 2, fade, "full fade written");
+        // (Still inside the stream-start fade-in, so not at full level yet.)
+        assert!(o[first] > 0.0);
+        assert_eq!(o[first + (fade - 1) * 2], 0.0);
+        drop(o);
+        // Still nothing to fade a second past the forced point: given up.
+        padding.store(500, Ordering::Relaxed);
+        r.decay_drop = 441;
+        r.decay_since_us = t - 2_000 * MS;
+        r.decay_low = 600;
+        assert!(r.ctx.input.slots() / 2 <= fade);
+        r.fill_at(t + 20 * MS).unwrap();
+        assert_eq!(decay_frames(&r), 31);
+        assert_eq!(r.decay_drop, 0, "given up");
     }
 
     #[test]

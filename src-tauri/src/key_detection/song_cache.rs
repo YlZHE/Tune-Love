@@ -2,7 +2,13 @@
 //! written before its vocal starts. Local only: a small JSON file under the
 //! app's local data directory, keyed by normalized title/artist/album (not by
 //! player). Bounded, written atomically, and tolerant of a damaged file.
-use super::scale_match::{AutoTuneTarget, Scale};
+//!
+//! File version 2 adds the candidate name and allows Chromatic ("uncertain")
+//! results. Version 1 files are still read (entries get no candidate) and are
+//! rewritten as version 2 on the next change. Downgrade: an older app that only
+//! knows version 1 treats a version 2 file as damaged, moves it aside as
+//! `.json.damaged` and starts empty, so going back loses the remembered songs.
+use super::scale_match::{AutoTuneTarget, Candidate, Scale};
 use std::{
     collections::HashMap,
     fs,
@@ -12,15 +18,29 @@ use std::{
 /// Only remember a result backed by this much non-silent analysis.
 pub const MIN_CACHE_EVIDENCE_SECONDS: f64 = 30.0;
 const MAX_ENTRIES: usize = 5_000;
-const FILE_VERSION: u32 = 1;
+const FILE_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CachedKey {
     pub key: u8,
     pub scale: Scale,
+    /// The set's Major/Minor name; always present for Chromatic, None in version 1 entries.
+    #[serde(default)]
+    pub candidate: Option<Candidate>,
     pub evidence_seconds: f64,
     pub updated_ms: u64,
+}
+
+impl CachedKey {
+    fn is_valid(&self) -> bool {
+        self.key < 12
+            && self.evidence_seconds.is_finite()
+            && self
+                .candidate
+                .map_or(true, |c| c.key < 12 && c.scale != Scale::Chromatic)
+            && (self.scale != Scale::Chromatic || self.candidate.is_some())
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -67,10 +87,10 @@ impl SongCache {
     pub fn load(path: PathBuf) -> Self {
         let entries = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<CacheFile>(&bytes) {
-                Ok(file) if file.version == FILE_VERSION => file
+                Ok(file) if (1..=FILE_VERSION).contains(&file.version) => file
                     .entries
                     .into_iter()
-                    .filter(|e| e.value.key < 12 && e.value.evidence_seconds.is_finite())
+                    .filter(|e| e.value.is_valid())
                     .map(|e| (e.id, e.value))
                     .collect(),
                 _ => {
@@ -93,20 +113,21 @@ impl SongCache {
     /// Remember `target` for `id` if it is well supported and differs from what
     /// is stored. Returns the serialized file to persist, or None if unchanged.
     pub fn put(&mut self, id: &str, target: &AutoTuneTarget, now_ms: u64) -> Option<Vec<u8>> {
-        // Task 3 adds remembering Chromatic results; until then only a committed Major/Minor is stored.
-        let (Some(key), Scale::Major | Scale::Minor) = (target.key, target.scale) else {
+        // A key-less target (no evidence yet) is never stored; Chromatic keeps its candidate.
+        let Some(key) = target.key else {
             return None;
         };
+        if target.scale == Scale::Chromatic && target.candidate.is_none() {
+            return None;
+        }
         if target.evidence_seconds < MIN_CACHE_EVIDENCE_SECONDS
             || !target.evidence_seconds.is_finite()
         {
             return None;
         }
-        if self
-            .entries
-            .get(id)
-            .is_some_and(|e| e.key == key && e.scale == target.scale)
-        {
+        if self.entries.get(id).is_some_and(|e| {
+            e.key == key && e.scale == target.scale && e.candidate == target.candidate
+        }) {
             return None;
         }
         self.entries.insert(
@@ -114,6 +135,7 @@ impl SongCache {
             CachedKey {
                 key,
                 scale: target.scale,
+                candidate: target.candidate,
                 evidence_seconds: target.evidence_seconds,
                 updated_ms: now_ms,
             },
@@ -208,6 +230,93 @@ mod tests {
             cache.get("s").map(|c| (c.key, c.scale)),
             Some((1, Scale::Major))
         );
+    }
+
+    fn chromatic_target(key: u8, candidate: Option<Candidate>, seconds: f64) -> AutoTuneTarget {
+        AutoTuneTarget {
+            scale: Scale::Chromatic,
+            candidate,
+            ..target(key, Scale::Chromatic, seconds)
+        }
+    }
+
+    fn eb_major() -> Option<Candidate> {
+        Some(Candidate {
+            key: 3,
+            scale: Scale::Major,
+        })
+    }
+
+    #[test]
+    fn put_stores_chromatic_with_candidate() {
+        let mut cache = SongCache {
+            path: Some(PathBuf::from("unused.json")),
+            ..Default::default()
+        };
+        assert!(cache
+            .put("s", &chromatic_target(3, eb_major(), 40.0), 1)
+            .is_some());
+        let stored = cache.get("s").unwrap();
+        assert_eq!((stored.key, stored.scale), (3, Scale::Chromatic));
+        assert_eq!(stored.candidate, eb_major());
+        assert!(
+            cache
+                .put("s", &chromatic_target(3, eb_major(), 90.0), 2)
+                .is_none(),
+            "same key, scale and candidate is not rewritten"
+        );
+        let renamed = Some(Candidate {
+            key: 0,
+            scale: Scale::Minor,
+        });
+        assert!(
+            cache
+                .put("s", &chromatic_target(0, renamed, 90.0), 3)
+                .is_some(),
+            "a different candidate is a change"
+        );
+        let mut keyless = chromatic_target(3, None, 90.0);
+        keyless.key = None;
+        assert!(cache.put("t", &keyless, 4).is_none());
+        assert!(cache.get("t").is_none());
+    }
+
+    #[test]
+    fn reads_version_1_files() {
+        let dir = std::env::temp_dir().join(format!("song-cache-v1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song-keys-v1.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"entries":[{"id":"old","key":6,"scale":"minor","evidenceSeconds":40.0,"updatedMs":3}]}"#,
+        )
+        .unwrap();
+        let cache = SongCache::load(path.clone());
+        let hit = cache.get("old").expect("v1 entry is kept");
+        assert_eq!((hit.key, hit.scale, hit.candidate), (6, Scale::Minor, None));
+        assert!(!dir.join("song-keys-v1.json.damaged").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trips_version_2() {
+        let dir = std::env::temp_dir().join(format!("song-cache-v2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("song-keys-v1.json");
+        let mut cache = SongCache::load(path.clone());
+        cache.put("a", &chromatic_target(3, eb_major(), 45.0), 7);
+        let bytes = cache.put("b", &target(9, Scale::Minor, 45.0), 8).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"version\":2"));
+        persist(&path, &bytes).unwrap();
+        let loaded = SongCache::load(path);
+        let a = loaded.get("a").unwrap();
+        assert_eq!(
+            (a.key, a.scale, a.candidate, a.updated_ms),
+            (3, Scale::Chromatic, eb_major(), 7)
+        );
+        assert_eq!(loaded.get("b").unwrap().candidate, None);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

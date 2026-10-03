@@ -220,19 +220,28 @@ impl ScaleMatcher {
         self.names = [None; 12];
     }
 
-    /// Start a song from a remembered Major/Minor choice (before any evidence of this play).
-    /// A remembered Chromatic result (with `candidate`) is seeded in Task 3; ignored until then.
-    pub fn seed(&mut self, key: u8, scale: Scale, _candidate: Option<Candidate>) {
-        if key >= 12 || scale == Scale::Chromatic {
+    /// Start a song from a remembered choice (before any evidence of this play).
+    /// Major/Minor: that set, gate open. Chromatic: the remembered `candidate` set, gate
+    /// Chromatic. Either way analysis cannot overrule it before SEED_HOLD_SECONDS.
+    /// A Chromatic seed without a valid Major/Minor candidate is ignored.
+    pub fn seed(&mut self, key: u8, scale: Scale, candidate: Option<Candidate>) {
+        if key >= 12 {
             return;
         }
-        let set = set_of(key, scale);
-        self.current = Some(match scale {
-            Scale::Minor => 12 + key as usize,
-            _ => key as usize,
+        let (name_key, name_scale) = if scale == Scale::Chromatic {
+            match candidate {
+                Some(c) if c.key < 12 && c.scale != Scale::Chromatic => (c.key, c.scale),
+                _ => return,
+            }
+        } else {
+            (key, scale)
+        };
+        self.current = Some(match name_scale {
+            Scale::Minor => 12 + name_key as usize,
+            _ => name_key as usize,
         });
-        self.names[set] = Some((key, scale));
-        self.state.chromatic = false;
+        self.names[set_of(name_key, name_scale)] = Some((name_key, name_scale));
+        self.state.chromatic = scale == Scale::Chromatic;
         self.state.hold = 0.0;
         self.seeded = true;
     }
@@ -920,6 +929,68 @@ mod tests {
         feed(&mut matcher, &C_MAJOR, 40); // overwhelming: analysis takes over
         assert_eq!(pair(&matcher), (Some(0), Scale::Major));
         assert_eq!(matcher.target().unwrap().source, TargetSource::Analysis);
+    }
+
+    #[test]
+    fn seeded_chromatic_holds_until_seed_hold() {
+        let mut matcher = new_matcher();
+        matcher.seed(3, Scale::Chromatic, candidate(3, Scale::Major));
+        let seeded = matcher.target().unwrap();
+        assert_eq!(
+            (seeded.key, seeded.scale, seeded.candidate, seeded.source),
+            (
+                Some(3),
+                Scale::Chromatic,
+                candidate(3, Scale::Major),
+                TargetSource::Cache
+            )
+        );
+        feed(&mut matcher, &C_MAJOR, 19); // clean evidence, but under the hold
+        let held = matcher.target().unwrap();
+        assert_eq!(
+            (held.scale, held.candidate, held.source),
+            (
+                Scale::Chromatic,
+                candidate(3, Scale::Major),
+                TargetSource::Cache
+            )
+        );
+        feed(&mut matcher, &C_MAJOR, 40); // analysis takes over and the gate opens
+        let after = matcher.target().unwrap();
+        assert_eq!(
+            (after.key, after.scale, after.source),
+            (Some(0), Scale::Major, TargetSource::Analysis)
+        );
+    }
+
+    #[test]
+    fn seeded_chromatic_that_analysis_confirms_leaves_chromatic_only_after_the_hold() {
+        let mut matcher = new_matcher();
+        matcher.seed(0, Scale::Chromatic, candidate(0, Scale::Major));
+        feed(&mut matcher, &C_MAJOR, 19);
+        assert_eq!(matcher.target().unwrap().scale, Scale::Chromatic);
+        feed(&mut matcher, &C_MAJOR, 4); // 3 s of hold after the seed hold
+        let after = matcher.target().unwrap();
+        assert_eq!((after.key, after.scale), (Some(0), Scale::Major));
+        assert_eq!(
+            after.source,
+            TargetSource::Cache,
+            "same set: still the cached result"
+        );
+    }
+
+    #[test]
+    fn a_seed_of_chromatic_without_candidate_or_with_bad_input_is_ignored() {
+        let mut matcher = new_matcher();
+        matcher.seed(3, Scale::Chromatic, None);
+        matcher.seed(12, Scale::Major, None);
+        matcher.seed(3, Scale::Chromatic, candidate(13, Scale::Major));
+        matcher.seed(3, Scale::Chromatic, candidate(3, Scale::Chromatic));
+        let target = matcher.target().unwrap();
+        assert_eq!(
+            (target.key, target.scale, target.candidate),
+            (None, Scale::Chromatic, None)
+        );
     }
 
     #[test]

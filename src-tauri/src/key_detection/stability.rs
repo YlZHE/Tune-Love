@@ -128,7 +128,7 @@ impl Stabilizer {
                 let remembered = song_id(&identity.track_key)
                     .and_then(|id| cache.lock().unwrap_or_else(|e| e.into_inner()).get(&id));
                 if let Some(hit) = remembered {
-                    self.matcher.seed(hit.key, hit.scale, None);
+                    self.matcher.seed(hit.key, hit.scale, hit.candidate);
                 }
             }
             return true;
@@ -252,7 +252,6 @@ impl Stabilizer {
 
         if failed {
             self.confirmed = None;
-            self.matcher.set_name_hint(None);
             self.clear_pending();
             self.status = "unavailable";
             self.updated_at_ms = now;
@@ -353,6 +352,37 @@ mod tests {
             capture_generation: capture,
             sample_end_sequence: sequence,
         }
+    }
+
+    #[test]
+    fn a_remembered_uncertain_song_starts_chromatic_with_its_cached_candidate() {
+        use super::super::scale_match::{Candidate, Scale, TargetSource};
+        let cache = Arc::new(Mutex::new(SongCache::default()));
+        let track = serde_json::to_string(&["player", "Song", "Artist", "Album"]).unwrap();
+        let candidate = Some(Candidate {
+            key: 3,
+            scale: Scale::Major,
+        });
+        cache.lock().unwrap().put(
+            &song_id(&track).unwrap(),
+            &AutoTuneTarget {
+                key: Some(3),
+                scale: Scale::Chromatic,
+                candidate,
+                uncovered_notes: Vec::new(),
+                evidence_seconds: 60.0,
+                source: TargetSource::Analysis,
+            },
+            1,
+        );
+        let mut stabilizer = Stabilizer::new();
+        stabilizer.set_cache(cache);
+        stabilizer.observe(&obs(Some((&track, 1)), true, 1, 0), 1);
+        let target = stabilizer.snapshot().autotune_target.unwrap();
+        assert_eq!(
+            (target.key, target.scale, target.candidate, target.source),
+            (Some(3), Scale::Chromatic, candidate, TargetSource::Cache)
+        );
     }
 
     #[test]

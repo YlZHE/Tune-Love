@@ -19,6 +19,16 @@
 //! fundamental, minimum and maximum periods and the period `GetCurrentSharedModeEnginePeriod`
 //! says is in force.
 //!
+//! Reading the report (for the runbook): quote `deliveryOffsetUs`, which is corrected for the
+//! frames that follow the matched one inside the output packet (a packet is read after its last
+//! frame, so the raw difference `deliveryOffsetRawUs` is biased by up to one output packet);
+//! the raw one is kept for comparison only. Only trust a run with `runValid: true`. It is false
+//! (reasons in `invalidReasons`) when the content lag is not constant (`lagUnstable`: per-window
+//! lag p05..p95 wider than 4 frames, e.g. a pause or a dropped packet on one stream), when
+//! either stream reported data discontinuities, when no alignment was found, or when the silent
+//! small-period stream died during the recording (`smallPeriod.endedEarly`, with the error and
+//! the time). A failing capture stops the other capture and the silent stream at once.
+//!
 //! Usage:
 //!   split_probe --pid <player root pid> --seconds <s> [--endpoint <render endpoint id>]
 //!               [--small-period --confirm-period-change] [--out <json>] [--dump <prefix>]
@@ -40,7 +50,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
 
@@ -171,7 +181,18 @@ struct LagEstimate {
     corr: f64,
     /// Number of windows that voted.
     windows: usize,
+    /// Spread of the voting windows' own lags (frames): a constant lag has a spread of a frame
+    /// or two; a pause or a dropped packet on one stream steps it by whole packets.
+    lag_spread: Spread,
 }
+
+/// `p95 - p05` of the per-window lags above which the lag is not constant: 4 frames, twice the
+/// +-2 frame tolerance `latency_probe` uses for "same lag", about 0.09 ms at 44.1 kHz. Real
+/// content aligns within that (the fine search is exact to the frame); a dropped or inserted
+/// packet shifts one recording by at least a packet (hundreds of frames), far above it. Using
+/// the 5-95 percentile range lets the odd stray window (repeating music matching better at a
+/// wrong lag) through, while `min`/`max` are reported too so a late short step is still visible.
+const LAG_UNSTABLE_FRAMES: f64 = 4.0;
 
 fn decimate(x: &[f32]) -> Vec<f32> {
     x.chunks_exact(DECIMATE)
@@ -273,18 +294,24 @@ fn global_lag(out: &[f32], src: &[f32], rate: u32, max_lag_ms: u32) -> Option<La
     }
     let mut lags: Vec<i64> = votes.iter().map(|v| v.0).collect();
     lags.sort_unstable();
+    let all: Vec<f64> = lags.iter().map(|&l| l as f64).collect();
     Some(LagEstimate {
         frames: lags[lags.len() / 2],
         corr: votes.iter().map(|v| v.1).sum::<f64>() / votes.len() as f64,
         windows: votes.len(),
+        lag_spread: spread(&all)?,
     })
 }
 
-/// For every source packet: the QPC arrival time of the source packet holding its last frame
-/// `x` minus the arrival time of the output packet holding the same content, output frame
-/// `y = x + lag_frames`. Positive: the process loopback (source) delivered later. Source
-/// packets whose `y` is outside the output are skipped.
-fn delivery_offsets_us(src: &[PacketTime], out: &[PacketTime], lag_frames: i64) -> Vec<i64> {
+/// One source packet matched with the output packet holding the same content.
+struct Match {
+    /// Source arrival minus output arrival, microseconds (raw).
+    raw_us: i64,
+    /// Frames of the output packet that come after the matched frame `y`.
+    out_tail_frames: u64,
+}
+
+fn match_packets(src: &[PacketTime], out: &[PacketTime], lag_frames: i64) -> Vec<Match> {
     let mut v = Vec::with_capacity(src.len());
     for s in src {
         if s.frames == 0 {
@@ -303,12 +330,46 @@ fn delivery_offsets_us(src: &[PacketTime], out: &[PacketTime], lag_frames: i64) 
             continue;
         }
         let p = &out[idx - 1];
-        if y >= p.first_frame + u64::from(p.frames) {
+        let end = p.first_frame + u64::from(p.frames);
+        if y >= end {
             continue;
         }
-        v.push(s.arrival_us as i64 - p.arrival_us as i64);
+        v.push(Match {
+            raw_us: s.arrival_us as i64 - p.arrival_us as i64,
+            out_tail_frames: end - 1 - y,
+        });
     }
     v
+}
+
+/// For every source packet: the QPC arrival time of the source packet holding its last frame
+/// `x` minus the arrival time of the output packet holding the same content, output frame
+/// `y = x + lag_frames`. Positive: the process loopback (source) delivered later. Source
+/// packets whose `y` is outside the output are skipped. RAW: see
+/// [`delivery_offsets_corrected_us`] for the one to use.
+fn delivery_offsets_us(src: &[PacketTime], out: &[PacketTime], lag_frames: i64) -> Vec<i64> {
+    match_packets(src, out, lag_frames)
+        .into_iter()
+        .map(|m| m.raw_us)
+        .collect()
+}
+
+/// The raw offsets corrected for the frames that follow `y` in its output packet. A packet is
+/// read after its LAST frame was captured, so an output packet arriving at `t` delivers `y`
+/// already `(last - y) / rate` old; the source side needs no term because `x` is the last
+/// frame of its packet. Corrected = raw + `(last - y) / rate`, the offset between the two
+/// deliveries of the same instant of audio. This is the one to quote (reported as
+/// `deliveryOffsetUs`; the raw one is `deliveryOffsetRawUs`).
+fn delivery_offsets_corrected_us(
+    src: &[PacketTime],
+    out: &[PacketTime],
+    lag_frames: i64,
+    rate: u32,
+) -> Vec<f64> {
+    match_packets(src, out, lag_frames)
+        .into_iter()
+        .map(|m| m.raw_us as f64 + m.out_tail_frames as f64 * 1e6 / f64::from(rate))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -382,7 +443,59 @@ fn mono(stereo: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// The report for two stereo recordings and their packet records.
+/// Reasons the run cannot be trusted (empty: it can). Pure: `small_period` is the report's
+/// `smallPeriod` value, `discontinuities` the data-discontinuity counts of (source, output).
+fn invalid_reasons(
+    lag: Option<LagEstimate>,
+    discontinuities: (usize, usize),
+    small_period: &Value,
+) -> Vec<String> {
+    let mut r = Vec::new();
+    match lag {
+        None => r.push("no content alignment between the two recordings".to_string()),
+        Some(l) => {
+            let width = l.lag_spread.p95 - l.lag_spread.p05;
+            if width > LAG_UNSTABLE_FRAMES {
+                r.push(format!(
+                    "lag not constant: per-window lag p05..p95 spans {width:.1} frames \
+                     (limit {LAG_UNSTABLE_FRAMES})"
+                ));
+            }
+        }
+    }
+    if discontinuities.0 + discontinuities.1 > 0 {
+        r.push(format!(
+            "data discontinuities: source {}, output {} (a stream lost frames)",
+            discontinuities.0, discontinuities.1
+        ));
+    }
+    if small_period["endedEarly"] == json!(true) {
+        r.push(format!(
+            "the silent small-period stream ended early: {}",
+            small_period["endedEarlyError"]
+                .as_str()
+                .unwrap_or("unknown")
+        ));
+    }
+    r
+}
+
+/// Marks the small-period report with whether the silent stream ran for the whole recording.
+/// `failure` is its error text and the time (seconds after the stream started) it ended at.
+fn finish_small_period(mut info: Value, failure: Option<(String, f64)>) -> Value {
+    if info.is_null() {
+        return info;
+    }
+    info["endedEarly"] = json!(failure.is_some());
+    if let Some((err, at_s)) = failure {
+        info["endedEarlyError"] = json!(err);
+        info["endedEarlyAfterS"] = json!(at_s);
+    }
+    info
+}
+
+/// The report for two stereo recordings and their packet records. `discontinuities` are the
+/// (source, output) data-discontinuity counts (0 when unknown).
 fn report(
     rate: u32,
     src: &[f32],
@@ -390,24 +503,39 @@ fn report(
     src_packets: &[PacketTime],
     out_packets: &[PacketTime],
     small_period: Value,
+    discontinuities: (usize, usize),
 ) -> Value {
     let lag = global_lag(&mono(out), &mono(src), rate, MAX_LAG_MS);
-    let offsets = lag.map(|l| {
+    let corrected =
+        lag.map(|l| delivery_offsets_corrected_us(src_packets, out_packets, l.frames, rate));
+    let raw = lag.map(|l| {
         delivery_offsets_us(src_packets, out_packets, l.frames)
             .into_iter()
             .map(|o| o as f64)
             .collect::<Vec<f64>>()
     });
+    let reasons = invalid_reasons(lag, discontinuities, &small_period);
+    let lag_unstable = lag
+        .is_some_and(|l| l.lag_spread.p95 - l.lag_spread.p05 > LAG_UNSTABLE_FRAMES)
+        || discontinuities.0 + discontinuities.1 > 0;
     json!({
         "rate": rate,
         "lagFrames": lag.map(|l| l.frames),
         "lagMs": lag.map(|l| l.frames as f64 * 1000.0 / f64::from(rate)),
         "lagCorr": lag.map(|l| l.corr),
         "lagWindows": lag.map(|l| l.windows),
-        "deliveryOffsetUs": spread_json(offsets.and_then(|o| spread(&o))),
+        "lagSpreadFrames": lag.map(|l| spread_json(Some(l.lag_spread))),
+        "lagUnstable": lag_unstable,
+        "sourceDiscontinuities": discontinuities.0,
+        "outputDiscontinuities": discontinuities.1,
+        // Corrected for the frames after the matched one in the output packet: quote this.
+        "deliveryOffsetUs": spread_json(corrected.and_then(|o| spread(&o))),
+        "deliveryOffsetRawUs": spread_json(raw.and_then(|o| spread(&o))),
         "sourcePackets": packet_stats(src_packets),
         "outputPackets": packet_stats(out_packets),
         "smallPeriod": small_period,
+        "runValid": reasons.is_empty(),
+        "invalidReasons": reasons,
     })
 }
 
@@ -426,6 +554,17 @@ fn now_us() -> u64 {
     let mut c = 0i64;
     let _ = unsafe { QueryPerformanceCounter(&mut c) };
     (c.max(0) as u128 * 1_000_000 / u128::from(freq)) as u64
+}
+
+/// Flags shared by the capture threads and the silent stream.
+#[derive(Default)]
+struct Control {
+    /// Set by a capture that failed: the other capture and the silent stream stop at once.
+    abort: AtomicBool,
+    /// Set by the main thread when the recording is over.
+    stop: AtomicBool,
+    /// Why (and when, QPC microseconds) the silent stream died after it had started.
+    silent_failure: Mutex<Option<(String, u64)>>,
 }
 
 enum Source {
@@ -469,7 +608,16 @@ fn endpoint_rate(id: &Option<String>) -> Result<u32, String> {
     result
 }
 
-fn record(src: Source, seconds: f64, rate: u32) -> Result<Recording, String> {
+/// Records for `seconds` or until another capture fails; sets `abort` if this one fails.
+fn record(src: Source, seconds: f64, rate: u32, ctl: &Control) -> Result<Recording, String> {
+    let r = record_inner(src, seconds, rate, ctl);
+    if r.is_err() {
+        ctl.abort.store(true, Ordering::SeqCst);
+    }
+    r
+}
+
+fn record_inner(src: Source, seconds: f64, rate: u32, ctl: &Control) -> Result<Recording, String> {
     wasapi::initialize_mta()
         .ok()
         .map_err(|e| format!("COM: {e}"))?;
@@ -502,7 +650,7 @@ fn record(src: Source, seconds: f64, rate: u32) -> Result<Recording, String> {
         };
         let mut bytes = vec![0u8; rate as usize * 8];
         let start = Instant::now();
-        while start.elapsed().as_secs_f64() < seconds {
+        while start.elapsed().as_secs_f64() < seconds && !ctl.abort.load(Ordering::SeqCst) {
             let _ = event.wait_for_event(50);
             loop {
                 let frames = cap.get_next_packet_size().map_err(|e| e.to_string())?;
@@ -569,14 +717,12 @@ unsafe fn read_period_info(client: &IAudioClient3, fmt: *const WAVEFORMATEX) -> 
 /// the error) on `ready` once the stream runs.
 fn silent_stream(
     endpoint: Option<String>,
-    stop: Arc<AtomicBool>,
+    ctl: Arc<Control>,
     ready: mpsc::Sender<Result<Value, String>>,
 ) {
     wasapi::initialize_mta().ok().ok();
-    let r = silent_stream_inner(&endpoint, &stop, &ready);
-    if let Err(e) = r {
-        // A failure after `ready` was sent is invisible to the receiver; it only matters
-        // before.
+    // An error here happened before `ready` was sent (later ones go to `ctl.silent_failure`).
+    if let Err(e) = silent_stream_inner(&endpoint, &ctl, &ready) {
         let _ = ready.send(Err(e));
     }
     wasapi::deinitialize();
@@ -584,7 +730,7 @@ fn silent_stream(
 
 fn silent_stream_inner(
     endpoint: &Option<String>,
-    stop: &AtomicBool,
+    ctl: &Control,
     ready: &mpsc::Sender<Result<Value, String>>,
 ) -> Result<(), String> {
     unsafe {
@@ -605,16 +751,24 @@ fn silent_stream_inner(
             .GetMixFormat()
             .map_err(|e| format!("mix format: {e}"))?;
         let mut info = read_period_info(&client, fmt);
-        let min = info["minFrames"].as_u64().ok_or_else(|| {
-            info["error"]
+        // `fmt` is freed on every path, including the one without period info.
+        let init = match info["minFrames"].as_u64() {
+            Some(min) => client
+                .InitializeSharedAudioStream(
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    min as u32,
+                    fmt,
+                    None,
+                )
+                .map_err(|e| format!("InitializeSharedAudioStream({min} frames): {e}"))
+                .map(|()| min as u32),
+            None => Err(info["error"]
                 .as_str()
                 .unwrap_or("no period info")
-                .to_string()
-        })? as u32;
-        let init =
-            client.InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, min, fmt, None);
+                .to_string()),
+        };
         CoTaskMemFree(Some(fmt.cast()));
-        init.map_err(|e| format!("InitializeSharedAudioStream({min} frames): {e}"))?;
+        let min = init?;
         let event: HANDLE = CreateEventW(None, false, false, PCWSTR::null())
             .map_err(|e| format!("CreateEventW: {e}"))?;
         let result = (|| {
@@ -659,10 +813,22 @@ fn silent_stream_inner(
             info["requestedFrames"] = json!(min);
             info["bufferFrames"] = json!(buffer);
             let _ = ready.send(Ok(info));
-            while !stop.load(Ordering::Relaxed) {
-                WaitForSingleObject(event, 100);
-                let padding = client.GetCurrentPadding().unwrap_or(buffer);
-                silence(buffer.saturating_sub(padding))?;
+            // From here on a failure cannot reach `ready`: it is recorded for the report
+            // (the small period no longer held), and the stream ends.
+            let feed = || -> Result<(), String> {
+                while !ctl.stop.load(Ordering::SeqCst) && !ctl.abort.load(Ordering::SeqCst) {
+                    WaitForSingleObject(event, 100);
+                    let padding = client
+                        .GetCurrentPadding()
+                        .map_err(|e| format!("render padding: {e}"))?;
+                    silence(buffer.saturating_sub(padding))?;
+                }
+                Ok(())
+            };
+            if let Err(e) = feed() {
+                if let Ok(mut f) = ctl.silent_failure.lock() {
+                    *f = Some((e, now_us()));
+                }
             }
             let _ = client.Stop();
             drop(render);
@@ -750,7 +916,12 @@ fn dump(
     let path = format!("{prefix}-packets.csv");
     std::fs::write(&path, packets_csv(&src.packets, &out.packets))
         .map_err(|e| format!("write {path}: {e}"))?;
-    let meta = json!({ "rate": rate, "smallPeriod": small_period });
+    let meta = json!({
+        "rate": rate,
+        "smallPeriod": small_period,
+        "sourceDiscontinuities": src.discontinuities,
+        "outputDiscontinuities": out.discontinuities,
+    });
     let path = format!("{prefix}-meta.json");
     std::fs::write(&path, meta.to_string()).map_err(|e| format!("write {path}: {e}"))
 }
@@ -788,7 +959,19 @@ fn analyze(prefix: &str, out_path: &Option<String>) -> Result<(), String> {
     let (sp, op) = parse_packets_csv(
         &std::fs::read_to_string(&csv_path).map_err(|e| format!("read {csv_path}: {e}"))?,
     )?;
-    let mut r = report(rate, &src, &out, &sp, &op, meta["smallPeriod"].clone());
+    let count = |k: &str| meta[k].as_u64().unwrap_or(0) as usize;
+    let mut r = report(
+        rate,
+        &src,
+        &out,
+        &sp,
+        &op,
+        meta["smallPeriod"].clone(),
+        (
+            count("sourceDiscontinuities"),
+            count("outputDiscontinuities"),
+        ),
+    );
     r["analyzed"] = json!(prefix);
     emit(r, out_path)
 }
@@ -804,15 +987,19 @@ fn run() -> Result<(), String> {
     let rate = endpoint_rate(&args.endpoint)?;
 
     // The silent stream first, so that the whole recording runs at the small period.
-    let stop = Arc::new(AtomicBool::new(false));
+    let ctl = Arc::new(Control::default());
     let mut small: Option<thread::JoinHandle<()>> = None;
     let mut small_info = Value::Null;
+    let mut small_started_us = 0;
     if args.small_period {
         let (tx, rx) = mpsc::channel();
-        let (ep, st) = (args.endpoint.clone(), stop.clone());
-        small = Some(thread::spawn(move || silent_stream(ep, st, tx)));
+        let (ep, c) = (args.endpoint.clone(), ctl.clone());
+        small = Some(thread::spawn(move || silent_stream(ep, c, tx)));
         match rx.recv() {
-            Ok(Ok(info)) => small_info = info,
+            Ok(Ok(info)) => {
+                small_info = info;
+                small_started_us = now_us();
+            }
             Ok(Err(e)) => {
                 if let Some(h) = small.take() {
                     let _ = h.join();
@@ -823,15 +1010,29 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let endpoint = args.endpoint.clone();
-    let src = thread::spawn(move || record(Source::Process(pid), secs, rate));
-    let out = thread::spawn(move || record(Source::Endpoint(endpoint), secs, rate));
+    let (endpoint, c1, c2) = (args.endpoint.clone(), ctl.clone(), ctl.clone());
+    let src = thread::spawn(move || record(Source::Process(pid), secs, rate, &c1));
+    let out = thread::spawn(move || record(Source::Endpoint(endpoint), secs, rate, &c2));
     let src = src.join();
     let out = out.join();
-    stop.store(true, Ordering::Relaxed);
+    // Whatever happened, the endpoint must not stay at the small period: stop the stream and
+    // wait for it before reporting anything.
+    ctl.stop.store(true, Ordering::SeqCst);
+    let mut small_failure = None;
     if let Some(h) = small {
-        let _ = h.join();
+        if h.join().is_err() {
+            small_failure = Some(("the stream thread panicked".to_string(), now_us()));
+        }
+        if let Ok(mut f) = ctl.silent_failure.lock() {
+            if let Some(e) = f.take() {
+                small_failure = Some(e);
+            }
+        }
     }
+    let small_info = finish_small_period(
+        small_info,
+        small_failure.map(|(e, at)| (e, at.saturating_sub(small_started_us) as f64 / 1e6)),
+    );
     let src = src.map_err(|_| "source capture panicked")??;
     let out = out.map_err(|_| "output capture panicked")??;
 
@@ -848,12 +1049,24 @@ fn run() -> Result<(), String> {
         &src.packets,
         &out.packets,
         small_info,
+        (src.discontinuities, out.discontinuities),
     );
+    if r["runValid"] == json!(false) {
+        eprintln!(
+            "split_probe: RUN NOT VALID: {}",
+            r["invalidReasons"]
+                .as_array()
+                .map(|a| a
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "))
+                .unwrap_or_default()
+        );
+    }
     r["pid"] = json!(pid);
     r["seconds"] = json!(secs);
     r["endpoint"] = json!(args.endpoint);
-    r["sourceDiscontinuities"] = json!(src.discontinuities);
-    r["outputDiscontinuities"] = json!(out.discontinuities);
     r["sourceTimestampErrors"] = json!(src.timestamp_errors);
     r["outputTimestampErrors"] = json!(out.timestamp_errors);
     r["sourceSilentPackets"] = json!(src.silent_packets);
@@ -1057,6 +1270,7 @@ mod tests {
             &sp,
             &op,
             Value::Null,
+            (0, 0),
         );
         assert_eq!(r["rate"], 48_000);
         assert_eq!(r["lagFrames"], 960);
@@ -1065,5 +1279,129 @@ mod tests {
         assert_eq!(r["sourcePackets"]["packets"], sp.len());
         assert_eq!(r["outputPackets"]["packets"], op.len());
         assert!(r["smallPeriod"].is_null());
+        for key in [
+            "lagSpreadFrames",
+            "lagUnstable",
+            "deliveryOffsetRawUs",
+            "runValid",
+            "invalidReasons",
+        ] {
+            assert!(!r[key].is_null(), "{key}");
+        }
+        assert_eq!(r["lagUnstable"], false);
+        assert_eq!(r["runValid"], true, "{}", r["invalidReasons"]);
+    }
+
+    /// 10 s of noise; the output follows it at `lag1`, and from `switch` frames on at `lag2`.
+    fn stepped(rate: u32, switch: usize, lag1: usize, lag2: usize) -> (Vec<f32>, Vec<f32>) {
+        let src = noise(10 * rate as usize, 21);
+        let out = (0..src.len())
+            .map(|i| {
+                let l = if i < switch { lag1 } else { lag2 };
+                if i < l {
+                    0.0
+                } else {
+                    src[i - l]
+                }
+            })
+            .collect();
+        (src, out)
+    }
+
+    #[test]
+    fn a_constant_lag_is_stable() {
+        let rate = 48_000;
+        let (src, out) = stepped(rate, 0, 1234, 1234);
+        let e = global_lag(&out, &src, rate, 500).unwrap();
+        assert!(
+            e.lag_spread.p95 - e.lag_spread.p05 <= LAG_UNSTABLE_FRAMES,
+            "{e:?}"
+        );
+        assert!(invalid_reasons(Some(e), (0, 0), &Value::Null).is_empty());
+    }
+
+    #[test]
+    fn a_step_in_the_lag_makes_the_run_invalid() {
+        // A dropped packet / a pause: from 5 s on the output is 480 frames later.
+        let rate = 48_000;
+        let (src, out) = stepped(rate, 5 * rate as usize, 1234, 1234 + 480);
+        let e = global_lag(&out, &src, rate, 500).unwrap();
+        assert!(e.lag_spread.max - e.lag_spread.min >= 400.0, "{e:?}");
+        let reasons = invalid_reasons(Some(e), (0, 0), &Value::Null);
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].contains("lag not constant"));
+        let r = report(
+            rate,
+            &src.iter().flat_map(|&s| [s, s]).collect::<Vec<_>>(),
+            &out.iter().flat_map(|&s| [s, s]).collect::<Vec<_>>(),
+            &[],
+            &[],
+            Value::Null,
+            (0, 0),
+        );
+        assert_eq!(r["lagUnstable"], true);
+        assert_eq!(r["runValid"], false);
+    }
+
+    #[test]
+    fn discontinuities_and_a_dead_small_period_stream_invalidate_the_run() {
+        let rate = 48_000;
+        let (src, out) = stepped(rate, 0, 100, 100);
+        let e = global_lag(&out, &src, rate, 500);
+        let r = invalid_reasons(e, (0, 2), &Value::Null);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!(r[0].contains("discontinuities"));
+        let info = finish_small_period(json!({ "minFrames": 128 }), None);
+        assert_eq!(info["endedEarly"], false);
+        assert!(invalid_reasons(e, (0, 0), &info).is_empty());
+        let info = finish_small_period(info, Some(("render padding: gone".into(), 3.5)));
+        assert_eq!(info["endedEarly"], true);
+        assert_eq!(info["endedEarlyAfterS"], 3.5);
+        let r = invalid_reasons(e, (0, 0), &info);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!(r[0].contains("ended early") && r[0].contains("render padding: gone"));
+        // No small-period stream: nothing to mark.
+        assert!(finish_small_period(Value::Null, None).is_null());
+        // No alignment at all is a reason too.
+        assert_eq!(invalid_reasons(None, (0, 0), &Value::Null).len(), 1);
+    }
+
+    #[test]
+    fn the_corrected_offset_removes_the_half_packet_bias() {
+        // Frame f is captured at f / rate. Each packet is read 1 ms after its LAST frame; the
+        // source (480-frame packets) is read a further `D` later than the output (441-frame
+        // packets), lag 0. The true offset is D for every packet.
+        let rate = 48_000u32;
+        let t = |f: u64| f * 1_000_000 / u64::from(rate);
+        let d = 7_000u64;
+        let mk = |size: u32, extra: u64| -> Vec<PacketTime> {
+            packets(5 * u64::from(rate), size, |_| 0)
+                .into_iter()
+                .map(|mut p| {
+                    p.arrival_us = t(p.first_frame + u64::from(p.frames) - 1) + 1_000 + extra;
+                    p
+                })
+                .collect()
+        };
+        let src = mk(480, d);
+        let out = mk(441, 0);
+        let corrected = delivery_offsets_corrected_us(&src, &out, 0, rate);
+        assert!(corrected.len() > 100);
+        assert!(
+            corrected.iter().all(|&c| (c - d as f64).abs() <= 2.0),
+            "{:?}",
+            &corrected[..5]
+        );
+        // The raw offsets carry up to a packet (9.2 ms) of bias.
+        let raw: Vec<f64> = delivery_offsets_us(&src, &out, 0)
+            .into_iter()
+            .map(|o| o as f64)
+            .collect();
+        let sp = spread(&raw).unwrap();
+        assert!(sp.max - sp.min > 5_000.0, "{sp:?}");
+        assert!(sp.max <= d as f64 + 2.0, "{sp:?}");
+        // ... and the corrected spread is what the report quotes.
+        let c = spread(&corrected).unwrap();
+        assert!(c.max - c.min <= 4.0, "{c:?}");
     }
 }

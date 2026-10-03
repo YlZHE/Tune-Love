@@ -122,7 +122,7 @@ uncovered(S) = Σ weights[pc]，pc 不属于 S
   - 首句综合分；
   - 每首切换次数；
   - 全程 Chromatic 的歌单。
-- **开发集**：已见过的 45 首（试点 5 首 + frontend-b 前四批 40 首）。在网格上选取 `ENTER / EXIT / EXIT_HOLD / MIN_SECONDS`。
+- **开发集**：以往任何一轮用过的全部歌曲（试点、留出集 holdout、frontend-b 各批，以 `work/scale-match-20261002/preregistration.md` 为准）。在网格上选取 `ENTER / EXIT / EXIT_HOLD / MIN_SECONDS`。
   - 选取规则：误拉率最低；同等误拉下，修音覆盖率最高。
   - 预登记写在看到新歌结果之前。
 - **检验集**：按既有方式（SHA-256 排序）选出一批未用过的新歌，共 10 首，比较新规则与现行 majmin 规则。

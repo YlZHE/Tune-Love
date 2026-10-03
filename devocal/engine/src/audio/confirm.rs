@@ -787,7 +787,9 @@ mod tests {
         res
     }
 
-    const DELAYS_US: [u64; 5] = [0, 5_000, 12_000, 16_000, 26_000];
+    /// Delivery delays: up to the P0 measurement's process-loopback offset S (about 38.5 ms)
+    /// and beyond it (ruling 17).
+    const DELAYS_US: [u64; 7] = [0, 5_000, 12_000, 16_000, 26_000, 38_000, 45_000];
 
     #[test]
     fn never_louder_than_the_reference_during_any_attach() {
@@ -824,7 +826,7 @@ mod tests {
     fn stationary_attach_leaves_no_hole_longer_than_10ms() {
         for original in [1.0f32, 0.3] {
             let (mut r2_longest, mut control_shortest, mut control_longest) = (0, usize::MAX, 0);
-            for d in [12_000u64, 16_000, 26_000] {
+            for d in [12_000u64, 16_000, 26_000, 38_000, 45_000] {
                 for phi in (0..10).map(|k| k * 1_000) {
                     let r = simulate(Source::Stationary, original, d, phi, true);
                     let control = simulate(Source::Stationary, original, d, phi, false);
@@ -832,8 +834,11 @@ mod tests {
                         r.longest_hole <= 4,
                         "R2 original {original} d {d} phi {phi}: {r:?}"
                     );
+                    // Without R2 the hole lasts until the conservative window lets go, so a
+                    // later step (larger d) shortens it: 27..33 chunks at d = 45 ms.
+                    let control_min = if d <= 26_000 { 32 } else { 24 };
                     assert!(
-                        control.longest_hole >= 32,
+                        control.longest_hole >= control_min,
                         "control original {original} d {d} phi {phi}: {control:?}"
                     );
                     r2_longest = r2_longest.max(r.longest_hole);

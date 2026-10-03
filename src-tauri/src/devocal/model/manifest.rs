@@ -176,21 +176,34 @@ pub fn candidates(file: &FileSpec, custom_prefix: Option<&str>, mirrors: &[Strin
     if let Some(prefix) = custom_prefix.filter(|p| valid_prefix(p)) {
         out.push(Candidate { kind: SourceKind::Custom, url: format!("{prefix}{}", file.origin) });
     }
-    for prefix in mirrors {
-        let host = prefix["https://".len()..].split('/').next().unwrap_or_default();
+    for prefix in mirrors.iter().filter(|p| valid_prefix(p)) {
+        let Some(rest) = prefix.strip_prefix("https://") else { continue };
+        let host = rest.split('/').next().unwrap_or_default();
         out.push(Candidate { kind: SourceKind::Mirror(host.into()), url: format!("{prefix}{}", file.origin) });
     }
     out
 }
 
-/// A download-acceleration prefix: `https://` + non-empty host, ends with `/`, no whitespace or
-/// control characters, at most 200 characters.
+/// A download-acceleration prefix: `https://` + host (`[A-Za-z0-9.-]+`, optional `:port`), ends
+/// with `/`, no whitespace or control characters, at most 200 characters. The host rule keeps
+/// userinfo (`a@evil`), queries and fragments out, since the origin URL is appended verbatim.
 pub fn valid_prefix(prefix: &str) -> bool {
     let Some(rest) = prefix.strip_prefix("https://") else { return false };
     prefix.len() <= MAX_PREFIX_LEN
         && prefix.ends_with('/')
         && !prefix.chars().any(|c| c.is_whitespace() || c.is_control())
-        && rest.split('/').next().is_some_and(|host| !host.is_empty())
+        && rest.split('/').next().is_some_and(valid_authority)
+}
+
+/// `host` or `host:port`: a non-empty host of ASCII letters, digits, `.` and `-`; a port 1-65535.
+fn valid_authority(authority: &str) -> bool {
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    !host.is_empty()
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && port.is_none_or(|p| p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n > 0))
 }
 
 #[cfg(test)]
@@ -287,9 +300,19 @@ mod tests {
     #[test]
     fn invalid_custom_prefix_is_ignored() {
         let f = spec("m.onnx", "https://github.com/a/b/raw/c/m.onnx", true);
-        let c = candidates(&f, Some("http://bad/"), &[]);
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].kind, SourceKind::Origin);
+        for bad in ["http://bad/", "https://a@evil/", "https://a.b?x/"] {
+            let c = candidates(&f, Some(bad), &[]);
+            assert_eq!(c.len(), 1, "{bad}");
+            assert_eq!(c[0].kind, SourceKind::Origin);
+        }
+    }
+
+    #[test]
+    fn invalid_mirrors_are_skipped() {
+        let f = spec("m.onnx", "https://github.com/a/b/raw/c/m.onnx", true);
+        let mirrors = ["x", "http://ghfast.top/", "https://a@evil/", "https://ghproxy.net/"].map(String::from);
+        let c = candidates(&f, None, &mirrors);
+        assert_eq!(c.iter().map(|c| c.kind.label()).collect::<Vec<_>>(), ["origin", "mirror:ghproxy.net"]);
     }
 
     #[test]
@@ -301,13 +324,16 @@ mod tests {
 
     #[test]
     fn valid_prefix_rules() {
-        for ok in ["https://ghfast.top/", "https://a.b/c/"] {
+        for ok in ["https://ghfast.top/", "https://a.b/c/", "https://my-proxy.example:8443/", "https://a.b:1/x/"] {
             assert!(valid_prefix(ok), "{ok}");
         }
         let long = format!("https://a.b/{}/", "x".repeat(200));
         for bad in [
             "", "http://a.b/", "https://a.b", "https:///", "https://a b/", " https://a.b/",
             "javascript:alert(1)/", "https://a.b/\n", long.as_str(),
+            "https://a@evil/", "https://user:pw@evil/", "https://a.b?x/", "https://a.b#x/", "https://a_b/",
+            "https://a.b:/", "https://a.b:0/", "https://a.b:65536/", "https://a.b:80x/", "https://:443/",
+            "https://a.b:1:2/", "https://[::1]/", "https://a.b\\c/", "https://a.b:+80/",
         ] {
             assert!(!valid_prefix(bad), "{bad:?}");
         }

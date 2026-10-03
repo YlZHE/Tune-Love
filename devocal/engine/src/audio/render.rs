@@ -12,8 +12,10 @@
 //! a check: the read deadline [`DEADLINE_GUARD_US`] before the device's next read (the timer,
 //! armed on each device wake), or a 20 ms wait with no wake at all. A device wake that comes
 //! while its deadline is still armed (the deadline never fired: the wake before was handled
-//! late, or the timer was) is a check too, so a read is never left unchecked. Without a
-//! timer, or with a period of at most two guards, every device wake is a check, as before O2.
+//! late, or the timer was) is a check only if the device ran dry (nothing queued, nothing in
+//! ring B); after [`MISSED_DEADLINE_LIMIT`] such misses within [`MISSED_DEADLINE_WINDOW_US`]
+//! the stream checks on every device wake until it is reopened. Without a timer, or with a
+//! period of at most two guards, every device wake is a check, as before O2.
 //! If a check finds less than one period queued the device would starve at its next read, so
 //! the shortfall up to the target is written as silence: the real frames before it fade out
 //! (`fade_edges`), the audio after it fades in, and one underrun is counted per gap if input
@@ -27,9 +29,11 @@
 //! output pre-rolls once by about one capture packet of silence. Both are released again (O1,
 //! [`Headroom`]): the pre-roll once the model has warmed up, the jitter part after 5 s
 //! without an underrun (backing off up to 60 s while jitter keeps returning); the released
-//! audio is skipped at a quiet spot (at most 1 s later), and not at all if nothing extra is
-//! queued (paused). A queue more than 20 ms over target for a whole second is trimmed back.
-//! Both skips fade out, skip and fade in. Output gain is ramped across each write; every
+//! audio is skipped at a quiet spot (at most 1 s later), down to the lowest queue the checks
+//! saw beyond the target, and not at all if nothing extra is queued (paused). A pre-roll
+//! writes exactly the silence it adds to the headroom. A queue more than 20 ms over target
+//! for a whole second is trimmed back. Both skips fade out, skip and fade in; a decay skip
+//! larger than ring B goes on discarding arriving frames until it is done. Output gain is ramped across each write; every
 //! sample is clamped to [-1, 1] (non-finite -> 0) before it reaches the device.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,6 +91,43 @@ const FAILED_POLL: Duration = Duration::from_millis(10);
 /// The read deadline: this long before the device's next read (one period after its wake)
 /// the queue is checked and, if short, padded (O2).
 pub const DEADLINE_GUARD_US: u64 = 1_500;
+
+/// A missed deadline is isolated unless this many fall within [`MISSED_DEADLINE_WINDOW_US`];
+/// then the stream checks on device wakes, as before O2, until it is reopened (ruling 17).
+pub const MISSED_DEADLINE_LIMIT: usize = 3;
+/// See [`MISSED_DEADLINE_LIMIT`].
+pub const MISSED_DEADLINE_WINDOW_US: u64 = 2_000_000;
+
+/// The times of a stream's last [`MISSED_DEADLINE_LIMIT`] missed deadlines. Pure.
+pub(crate) struct MissedDeadlines {
+    at: [u64; MISSED_DEADLINE_LIMIT],
+    seen: usize,
+}
+
+impl MissedDeadlines {
+    pub fn new() -> Self {
+        Self {
+            at: [0; MISSED_DEADLINE_LIMIT],
+            seen: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Records a missed deadline at `now_us`; true when it and the
+    /// [`MISSED_DEADLINE_LIMIT`] - 1 before it all fall within the last
+    /// [`MISSED_DEADLINE_WINDOW_US`] (the oldest less than that long ago: one miss a second
+    /// stays isolated).
+    pub fn miss(&mut self, now_us: u64) -> bool {
+        self.at.rotate_left(1);
+        self.at[MISSED_DEADLINE_LIMIT - 1] = now_us;
+        self.seen = (self.seen + 1).min(MISSED_DEADLINE_LIMIT);
+        self.seen == MISSED_DEADLINE_LIMIT
+            && now_us.saturating_sub(self.at[0]) < MISSED_DEADLINE_WINDOW_US
+    }
+}
 
 /// Why the render thread woke.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -844,11 +885,14 @@ struct Renderer {
     /// Released headroom still queued, to be skipped at a quiet spot; since when.
     decay_drop: usize,
     decay_since_us: u64,
-    /// Lowest queue (device padding + ring B) seen at any wake since `decay_since_us`
-    /// (`usize::MAX` when no decay is pending).
+    /// Lowest queue (device padding + ring B) seen at a check wake ([`checks_padding`], in
+    /// the effective deadline mode) since `decay_since_us` (`usize::MAX` when no decay is
+    /// pending).
     decay_low: usize,
     /// The pending `drop_pending` is a headroom decay (counted as `render_decay_frames`).
     drop_is_decay: bool,
+    /// The pending skip's fade-out has been written; a decay is still discarding.
+    drop_faded: bool,
     /// Exponential average of the mean square of the real frames written (`track_power`).
     recent_ms: f64,
     /// Pre-roll silence still to write, and whether its leading fade-out is still to do.
@@ -864,6 +908,11 @@ struct Renderer {
     /// The deadline was armed by a device wake and has not fired (been handled) since. A
     /// device wake that finds it still armed checks the queue itself (ruling 8).
     deadline_armed: bool,
+    /// This stream checks on device wakes, as before O2, until it is reopened: it missed
+    /// too many deadlines (ruling 17).
+    legacy_checks: bool,
+    /// Recent missed deadlines of this stream.
+    missed: MissedDeadlines,
 }
 
 impl Renderer {
@@ -887,6 +936,7 @@ impl Renderer {
             decay_since_us: 0,
             decay_low: usize::MAX,
             drop_is_decay: false,
+            drop_faded: false,
             recent_ms: 0.0,
             preroll_left: 0,
             preroll_fade: false,
@@ -895,6 +945,8 @@ impl Renderer {
             timer: None,
             deadline_mode: false,
             deadline_armed: false,
+            legacy_checks: false,
+            missed: MissedDeadlines::new(),
         }
     }
 
@@ -987,18 +1039,27 @@ impl Renderer {
         // kept (see above).
         self.headroom.reset();
         self.end_decay();
-        // No deadline from the old stream may fire into the new one.
+        // No deadline from the old stream may fire into the new one, and a new stream gets
+        // deadline mode back with no misses remembered.
         self.deadline_armed = false;
+        self.legacy_checks = false;
+        self.missed.reset();
         if let Some(t) = &self.timer {
             t.cancel();
         }
-        self.drop_is_decay = false;
+        self.end_drop();
         self.recent_ms = 0.0;
         self.ctx.stats.headroom_frames.store(0, Ordering::Relaxed);
         self.preroll_left = 0;
         self.preroll_fade = false;
         self.last_frame = [0.0; 2];
         self.last_gain = 0.0;
+    }
+
+    /// The skip in `drop_pending` is done (or cancelled).
+    fn end_drop(&mut self) {
+        self.drop_is_decay = false;
+        self.drop_faded = false;
     }
 
     /// No decay pending any more (done, cancelled, or a new stream).
@@ -1077,7 +1138,7 @@ impl Renderer {
             return Ok(());
         };
         let period = sink.period_frames();
-        self.deadline_mode = deadline_mode(self.timer.is_some(), period);
+        self.deadline_mode = !self.legacy_checks && deadline_mode(self.timer.is_some(), period);
         let timer = self
             .timer
             .as_ref()
@@ -1112,21 +1173,37 @@ impl Renderer {
             Wake::Device => 0,
         };
         let period = sink.period_frames();
-        // Ruling 8: the deadline belongs to the read after the device wake that armed it. A
-        // device wake that finds it still armed had a read with no check before it (the wake
-        // was handled late, so the next one cancelled the deadline, or the timer was late):
-        // this wake checks the queue as before O2. Every device wake then arms the next one.
-        let mut deadline_mode = self.deadline_mode;
+        // Ruling 8 as amended by ruling 17: the deadline belongs to the read after the device
+        // wake that armed it. A device wake that finds it still armed had a read with no check
+        // before it (the wake was handled late, so the next one cancelled the deadline, or the
+        // timer was late). Such an isolated miss pads only if the device ran dry (below);
+        // [`MISSED_DEADLINE_LIMIT`] misses within [`MISSED_DEADLINE_WINDOW_US`] switch the
+        // stream to checking on device wakes until it is reopened. Every device wake in
+        // deadline mode arms the next deadline.
+        let mut deadline_mode = self.deadline_mode && !self.legacy_checks;
+        let mut missed = false;
         match wake {
             Wake::Device if deadline_mode => {
                 if self.deadline_armed {
                     diag.render_missed_deadlines.fetch_add(1, Ordering::Relaxed);
-                    deadline_mode = false;
+                    missed = true;
+                    if self.missed.miss(now) {
+                        diag.render_legacy_switches.fetch_add(1, Ordering::Relaxed);
+                        self.legacy_checks = true;
+                        self.deadline_mode = false;
+                        deadline_mode = false;
+                        self.deadline_armed = false;
+                        if let Some(t) = &self.timer {
+                            t.cancel();
+                        }
+                    }
                 }
-                if let Some(t) = &self.timer {
-                    t.arm_in_us(frames_us(period).saturating_sub(DEADLINE_GUARD_US));
+                if deadline_mode {
+                    if let Some(t) = &self.timer {
+                        t.arm_in_us(frames_us(period).saturating_sub(DEADLINE_GUARD_US));
+                    }
+                    self.deadline_armed = true;
                 }
-                self.deadline_armed = true;
             }
             Wake::Deadline => self.deadline_armed = false,
             _ => {}
@@ -1149,6 +1226,12 @@ impl Renderer {
                 .on_underrun(jitter, hop, MAX_EXTRA_HEADROOM_FRAMES, now);
         }
         let mut avail = self.ctx.input.slots() / 2;
+        if missed && deadline_mode && padding == 0 && avail == 0 {
+            // The unchecked read left the device dry with nothing to write: a starvation,
+            // checked (padded and judged) as before O2. With audio still queued the read was
+            // fed after all, and the deadline armed above checks the next one.
+            deadline_mode = false;
+        }
         // Pre-roll request from an accepted "on". It stays set until a fill with a sink
         // consumes it here (also across a failed rebind). Consuming it may start no pre-roll
         // (`preroll_frames` returns 0 while one is in progress, when the queue is already
@@ -1187,8 +1270,11 @@ impl Renderer {
             }
             self.decay_drop += freed;
         }
-        if self.decay_drop > 0 {
-            // Every wake, written to or not: the low point is what is really spare.
+        if self.decay_drop > 0 && checks_padding(wake, deadline_mode) {
+            // At every check, written to or not: the low point is what is really spare. Only
+            // a check sees the queue the next device read will find; in deadline mode a
+            // device wake sees it right after a read (one period lower) and a data wake at a
+            // burst peak (ruling 17).
             self.decay_low = self.decay_low.min(padding + avail);
         }
         self.ctx
@@ -1202,8 +1288,11 @@ impl Renderer {
         // sees ring B at the peak of a burst.
         if matches!(wake, Wake::Device | Wake::Timeout) {
             if let Some(d) = self.trim.observe(avail + padding, now) {
-                self.drop_pending = d;
-                self.drop_is_decay = false;
+                // Not over a decay still discarding (the trim's second restarts).
+                if self.drop_pending == 0 {
+                    self.drop_pending = d;
+                    self.drop_is_decay = false;
+                }
             }
         }
         let room = buffer.saturating_sub(padding);
@@ -1218,30 +1307,51 @@ impl Renderer {
         }
 
         if self.preroll_left > 0 {
-            // Pre-roll: fade out, then silence while input keeps filling ring B.
+            // Pre-roll: fade out, then exactly the silence registered as headroom (ruling 17:
+            // every frame of it delays the audio, and the decay removes only what the headroom
+            // holds), then ring B's frames up to the target, fading in. Only a check that would
+            // otherwise leave the device short of a period writes more silence: that much would
+            // have been padded anyway.
             let mut w = 0;
             if self.preroll_fade {
                 let k = self.fade_frames.min(need).min(avail);
                 self.take(0, k);
                 fade_edges(&mut self.staging[..k * 2], false, true, k);
+                avail -= k;
                 self.preroll_fade = false;
                 w = k;
             }
-            self.staging[w * 2..need * 2].fill(0.0);
+            let short = if check {
+                period.saturating_sub(padding + w + avail)
+            } else {
+                0
+            };
+            let s = (need - w).min(self.preroll_left.max(short));
+            self.staging[w * 2..(w + s) * 2].fill(0.0);
             if w == 0 {
-                let f = self.fade_frames.min(need);
+                let f = self.fade_frames.min(s);
                 decay_from(self.last_frame, &mut self.staging[..f * 2]);
             }
             self.ctx
                 .stats
                 .diag
                 .render_preroll_frames
-                .fetch_add((need - w) as u64, Ordering::Relaxed);
-            self.preroll_left = self.preroll_left.saturating_sub(need - w);
+                .fetch_add(s as u64, Ordering::Relaxed);
+            self.preroll_left = self.preroll_left.saturating_sub(s);
+            w += s;
             if self.preroll_left == 0 {
                 self.fade_in.start(0);
+                let real = (need - w).min(avail);
+                self.take(w, real);
+                self.ctx
+                    .stats
+                    .diag
+                    .render_real_frames
+                    .fetch_add(real as u64, Ordering::Relaxed);
+                self.fed |= real > 0;
+                w += real;
             }
-            return self.write_out(need, padding);
+            return self.write_out(w, padding);
         }
 
         let waited = now.saturating_sub(self.decay_since_us);
@@ -1256,20 +1366,20 @@ impl Renderer {
                     self.peek_rms((self.fade_frames + self.decay_drop.min(spare)).min(avail));
                 let recent = self.recent_ms.sqrt() as f32;
                 if decay_now(window, recent, waited) {
-                    let d = self
-                        .decay_drop
-                        .min(spare)
-                        .min(avail.saturating_sub(self.fade_frames));
-                    if d > 0 {
-                        self.drop_pending = d;
+                    if avail > self.fade_frames {
+                        // The skip need not be in ring B yet: frames go on being discarded
+                        // as they arrive until it is done (ruling 17; under O2 ring B rarely
+                        // holds a fade plus the whole release). Safe as the low point is: the
+                        // next check still finds the target queued.
+                        self.drop_pending = self.decay_drop.min(spare);
                         self.drop_is_decay = true;
                         self.end_decay();
                     } else if waited >= 2 * LOW_ENERGY_WAIT_US {
                         // Not one fade's worth queued on any wake for a second past the
-                        // forced point: what is left (< 5 ms) stays.
+                        // forced point: what is left stays.
                         self.end_decay();
                     }
-                    // Otherwise too little in ring B for fade + skip now: retry next wake.
+                    // Otherwise too little in ring B for the fade-out now: retry next wake.
                 }
             }
         }
@@ -1278,12 +1388,18 @@ impl Renderer {
         if self.drop_pending > 0 && avail > 0 {
             // Trim: fade out what plays next, skip the excess, fade the rest in. A decay
             // keeps its full fade even beyond `need` (frames move from ring B to the device;
-            // the queue is the same), so small periods do not shorten it.
-            let fade_room = if self.drop_is_decay { room } else { need };
-            let k = self.fade_frames.min(fade_room).min(avail);
-            self.take(0, k);
-            fade_edges(&mut self.staging[..k * 2], false, true, k);
-            avail -= k;
+            // the queue is the same), so small periods do not shorten it. A trim skips what
+            // ring B holds; a decay goes on discarding arriving frames (nothing real is
+            // written meanwhile) until its whole skip is done.
+            if !self.drop_faded {
+                let fade_room = if self.drop_is_decay { room } else { need };
+                let k = self.fade_frames.min(fade_room).min(avail);
+                self.take(0, k);
+                fade_edges(&mut self.staging[..k * 2], false, true, k);
+                avail -= k;
+                w = k;
+                self.drop_faded = true;
+            }
             let d = self.drop_pending.min(avail);
             let diag = &self.ctx.stats.diag;
             let counter = if self.drop_is_decay {
@@ -1294,10 +1410,15 @@ impl Renderer {
             counter.fetch_add(d as u64, Ordering::Relaxed);
             self.skip(d);
             avail -= d;
-            self.drop_pending = 0;
-            self.drop_is_decay = false;
+            self.drop_pending = if self.drop_is_decay {
+                self.drop_pending - d
+            } else {
+                0
+            };
+            if self.drop_pending == 0 {
+                self.end_drop();
+            }
             self.fade_in.start(0);
-            w = k;
         }
         // The frames already staged (a trim or decay fade-out) count as real. A decay fade
         // can exceed the plan (it is bounded by `room`); then nothing more is taken and, the
@@ -1332,6 +1453,9 @@ impl Renderer {
                 let f = self.fade_frames.min(silence);
                 decay_from(self.last_frame, &mut self.staging[..f * 2]);
             }
+            // The queue was not spare after all: a skip still discarding stops here.
+            self.drop_pending = 0;
+            self.end_drop();
             if self.primed {
                 let seen = Starvation {
                     ran_model: stage_runs_model(stage_from_code(
@@ -2245,9 +2369,10 @@ mod tests {
             .load(Ordering::Relaxed)
     }
 
-    /// Ruling 8: two device wakes with no deadline between them (the first was handled late,
-    /// so the second cancelled its deadline) left a read unchecked; the second device wake
-    /// checks as before O2: pads to the target and arms the underrun judge.
+    /// Ruling 8 as amended by ruling 17: two device wakes with no deadline between them (the
+    /// first was handled late, so the second cancelled its deadline) left a read unchecked;
+    /// when the device then ran dry (nothing queued, nothing in ring B) the second device
+    /// wake pads to the target and arms the underrun judge.
     #[test]
     fn a_missed_deadline_falls_back_to_a_device_wake_check() {
         let sink = FakeSink::new(0);
@@ -2280,6 +2405,211 @@ mod tests {
         arrive(&r, &mut tx, 128, t + 22 * MS);
         r.fill_at(Wake::Data, t + 22 * MS).unwrap();
         assert_eq!(underruns(&r), 1);
+    }
+
+    /// A deadline fires, then two device wakes with the deadline between them never fired:
+    /// the device is at `dry_padding` after the second read, ring B holds `queued` frames.
+    fn miss_a_deadline(
+        r: &mut Renderer,
+        padding: &AtomicUsize,
+        tx: &mut Producer<f32>,
+        at: u64,
+        queued: usize,
+        dry_padding: usize,
+    ) {
+        padding.store(500, Ordering::Relaxed);
+        // The previous deadline fires as usual (500 queued: no shortfall).
+        r.fill_at(Wake::Deadline, at - 2 * MS).unwrap();
+        r.fill_at(Wake::Device, at).unwrap();
+        assert!(r.deadline_armed || r.legacy_checks);
+        padding.store(dry_padding, Ordering::Relaxed);
+        arrive(r, tx, queued, at + 9 * MS);
+        r.fill_at(Wake::Device, at + 10 * MS).unwrap();
+    }
+
+    /// Ruling 17 (2): an isolated miss with the device still holding audio (or ring B
+    /// holding some) is no starvation: no pad, no underrun armed; the next deadline checks.
+    #[test]
+    fn an_isolated_missed_deadline_with_audio_queued_neither_pads_nor_counts() {
+        for (dry_padding, queued) in [(128, 0), (0, 100)] {
+            let sink = FakeSink::new(0);
+            let padding = sink.padding.clone();
+            let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+            r.after_open();
+            r.deadline_mode = true;
+            let t = 10 * SEC;
+            arrive(&r, &mut tx, 569, t);
+            r.fill_at(Wake::Data, t).unwrap();
+            r.fill_at(Wake::Deadline, t + 8 * MS).unwrap();
+            assert!(r.primed);
+            miss_a_deadline(&mut r, &padding, &mut tx, t + 10 * MS, queued, dry_padding);
+            assert_eq!(missed_deadlines(&r), 1);
+            assert_eq!(pad_events(&r), 0, "padding {dry_padding} queued {queued}");
+            assert!(r.underruns.starved_at.is_none());
+            assert_eq!(padding.load(Ordering::Relaxed), dry_padding + queued);
+            assert!(r.deadline_armed, "the next deadline checks");
+            assert!(!r.legacy_checks);
+        }
+    }
+
+    /// Ruling 17: a decay skip larger than ring B goes on discarding arriving frames (no
+    /// second fade-out), and a check that has to pad cancels what is left of it.
+    #[test]
+    fn a_decay_skip_continues_across_wakes_until_a_pad_cancels_it() {
+        let sink = FakeSink::new(0);
+        let padding = sink.padding.clone();
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let fade = r.fade_frames;
+        let t = 10 * SEC;
+        padding.store(128, Ordering::Relaxed);
+        arrive(&r, &mut tx, 300, t);
+        r.drop_pending = 400;
+        r.drop_is_decay = true;
+        r.fill_at(Wake::Device, t).unwrap();
+        assert_eq!(
+            padding.load(Ordering::Relaxed),
+            128 + fade,
+            "the fade-out only"
+        );
+        assert_eq!(decay_frames(&r), (300 - fade) as u64);
+        assert_eq!(r.drop_pending, 400 - (300 - fade));
+        // The next block is discarded whole: nothing written, no second fade.
+        arrive(&r, &mut tx, 100, t + MS);
+        r.fill_at(Wake::Data, t + MS).unwrap();
+        assert_eq!(padding.load(Ordering::Relaxed), 128 + fade);
+        assert_eq!(decay_frames(&r), (400 - fade) as u64);
+        assert_eq!(r.drop_pending, 400 - (400 - fade));
+        // The deadline finds less than a period queued: pads, and the rest is cancelled.
+        r.fill_at(Wake::Deadline, t + 8_500).unwrap();
+        assert_eq!(pad_events(&r), 1);
+        assert_eq!(
+            (r.drop_pending, r.drop_faded, r.drop_is_decay),
+            (0, false, false)
+        );
+        assert_eq!(padding.load(Ordering::Relaxed), 569);
+        // At the target, a new block waits in ring B instead of being discarded.
+        arrive(&r, &mut tx, 100, t + 9 * MS);
+        r.fill_at(Wake::Data, t + 9 * MS).unwrap();
+        assert_eq!(
+            decay_frames(&r),
+            (400 - fade) as u64,
+            "no longer discarding"
+        );
+        assert_eq!(r.ctx.input.slots() / 2, 100);
+    }
+
+    #[test]
+    fn missed_deadlines_switch_only_when_three_fall_within_2s() {
+        let mut m = MissedDeadlines::new();
+        let t = 10 * SEC;
+        assert!(!m.miss(t));
+        assert!(!m.miss(t + SEC));
+        // One a second: the oldest of three is exactly 2 s old, still isolated.
+        assert!(!m.miss(t + 2 * SEC));
+        assert!(m.miss(t + 2 * SEC + 999 * MS), "three within 2 s");
+        m.reset();
+        assert!(!m.miss(t));
+        assert!(!m.miss(t + MS));
+        assert!(m.miss(t + 2 * MS));
+    }
+
+    /// The render path with every new branch taken (a pre-roll, its decay discarding across
+    /// wakes, isolated and repeated missed deadlines) never allocates.
+    #[test]
+    fn fill_at_does_not_allocate() {
+        use crate::stemgen::alloc_count;
+        let sink = FakeSink::new(0);
+        let padding = sink.padding.clone();
+        sink.out.lock().unwrap().reserve(4_000_000);
+        let (mut r, shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let t = 10 * SEC;
+        let before = alloc_count::this_thread();
+        for p in 0..400u64 {
+            let at = t + p * 10 * MS;
+            read_period(&padding);
+            if p == 20 {
+                shared.preroll_request.store(true, Ordering::Release);
+            }
+            r.fill_at(Wake::Device, at).unwrap();
+            for h in 0..3u64 {
+                arrive(
+                    &r,
+                    &mut tx,
+                    if h == 2 { 185 } else { 128 },
+                    at + (h + 1) * MS,
+                );
+                r.fill_at(Wake::Data, at + (h + 1) * MS).unwrap();
+            }
+            // An isolated missed deadline every 1.5 s, then three in a row near the end.
+            if p % 150 != 75 && !(380..383).contains(&p) {
+                r.fill_at(Wake::Deadline, at + 8_500).unwrap();
+            }
+        }
+        assert_eq!(alloc_count::this_thread() - before, 0);
+        let diag = &r.ctx.stats.diag;
+        assert_eq!(diag.render_preroll_frames.load(Ordering::Relaxed), 441);
+        assert!(decay_frames(&r) > 0, "the decay ran");
+        // 76, 226, 376 isolated; 381 makes three within 2 s (226, 376, 381) and switches.
+        assert_eq!(missed_deadlines(&r), 4);
+        assert!(r.legacy_checks, "the repeated misses switched");
+    }
+
+    /// Ruling 17 (2): three misses within 2 s switch the stream to checking on device wakes
+    /// (as before O2) until it is reopened; misses spread wider do not.
+    #[test]
+    fn three_missed_deadlines_within_2s_switch_the_stream_to_legacy_checks() {
+        let sink = FakeSink::new(0);
+        let padding = sink.padding.clone();
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let t = 10 * SEC;
+        let switches = |r: &Renderer| {
+            r.ctx
+                .stats
+                .diag
+                .render_legacy_switches
+                .load(Ordering::Relaxed)
+        };
+        // Spread: 0, 1.5 s, 3.1 s (no three within 2 s).
+        for at in [t, t + 1_500 * MS, t + 3_100 * MS] {
+            miss_a_deadline(&mut r, &padding, &mut tx, at, 0, 128);
+        }
+        assert_eq!(missed_deadlines(&r), 3);
+        assert!(!r.legacy_checks);
+        // Two more within 2 s of the last: the third of them switches.
+        miss_a_deadline(&mut r, &padding, &mut tx, t + 4_000 * MS, 0, 128);
+        assert!(!r.legacy_checks);
+        miss_a_deadline(&mut r, &padding, &mut tx, t + 5_000 * MS, 0, 128);
+        assert!(r.legacy_checks);
+        assert!(!r.deadline_mode);
+        assert!(!r.deadline_armed);
+        assert_eq!(switches(&r), 1);
+        assert_eq!(missed_deadlines(&r), 5);
+        // From now on a device wake is a check: 128 queued < a period pads to the target.
+        let pads = pad_events(&r);
+        padding.store(128, Ordering::Relaxed);
+        r.fill_at(Wake::Device, t + 5_100 * MS).unwrap();
+        assert_eq!(pad_events(&r), pads + 1);
+        assert_eq!(padding.load(Ordering::Relaxed), 569);
+        // `fill` keeps the stream out of deadline mode even with a timer.
+        r.timer = HiResTimer::new();
+        if r.timer.is_some() {
+            r.fill().unwrap();
+            assert!(!r.deadline_mode);
+        }
+        // A new stream starts in deadline mode again, with no misses remembered.
+        r.after_open();
+        assert!(!r.legacy_checks);
+        r.deadline_mode = true;
+        miss_a_deadline(&mut r, &padding, &mut tx, t + 6_000 * MS, 0, 128);
+        miss_a_deadline(&mut r, &padding, &mut tx, t + 6_100 * MS, 0, 128);
+        assert!(!r.legacy_checks, "misses of the old stream are forgotten");
+        assert_eq!(switches(&r), 1);
     }
 
     /// The normal order (device, its deadline, the next device wake) never falls back; a new
@@ -2535,6 +2865,318 @@ mod tests {
         let mean_drop = drop_sum / n;
         eprintln!("mean drop over all phases: {mean_drop:.1} frames");
         assert!(mean_drop >= 132.0, "mean drop {mean_drop:.1} frames");
+    }
+
+    /// One run of [`simulate_events`].
+    #[derive(Clone, Copy)]
+    struct EvCfg {
+        /// Capture packet phase within the 10 ms device period, us.
+        phase: u64,
+        len_us: u64,
+        /// The capture stalls: packets due in `[at, at + late)` all arrive at `at + late`.
+        stall: Option<(u64, u64)>,
+        /// The pre-roll request (an accepted "on") is set at this time.
+        preroll_at: Option<u64>,
+        /// One deadline in every `n` never fires (index `k % n == n / 2`): the device wake
+        /// after it finds it still armed.
+        skip_every: Option<u64>,
+    }
+
+    impl EvCfg {
+        fn new(phase: u64, len_us: u64) -> Self {
+            Self {
+                phase,
+                len_us,
+                stall: None,
+                preroll_at: None,
+                skip_every: None,
+            }
+        }
+    }
+
+    /// What [`simulate_events`] saw; times are sim times in us.
+    #[derive(Default, Debug)]
+    struct EvSim {
+        /// Device reads that found less than a period queued.
+        starved: Vec<u64>,
+        /// Wakes that padded.
+        pads: Vec<u64>,
+        underruns: u64,
+        decay: u64,
+        preroll: u64,
+        missed: u64,
+        /// The queue (padding + ring B) every 100 us, and at each deadline wake (before it).
+        queue: Vec<(u64, usize)>,
+        at_deadline: Vec<(u64, usize)>,
+        /// Largest headroom seen, and when it was released (dropped to 0).
+        max_headroom: usize,
+        released_at: Option<u64>,
+    }
+
+    impl EvSim {
+        fn mean_queue(&self, from: u64, to: u64) -> f64 {
+            let w: Vec<usize> = self
+                .queue
+                .iter()
+                .filter(|(t, _)| (from..to).contains(t))
+                .map(|&(_, q)| q)
+                .collect();
+            w.iter().sum::<usize>() as f64 / w.len() as f64
+        }
+
+        /// Lowest queue a deadline found in `[from, to)`.
+        fn low(&self, from: u64, to: u64) -> usize {
+            self.at_deadline
+                .iter()
+                .filter(|(t, _)| (from..to).contains(t))
+                .map(|&(_, q)| q)
+                .min()
+                .unwrap()
+        }
+
+        fn pads_after(&self, t: u64) -> usize {
+            self.pads.iter().filter(|&&p| p > t).count()
+        }
+    }
+
+    /// Event-driven model of the real render path in deadline mode (ruling 17): `fill_at` on
+    /// a real `Renderer` with a fake 441-frame-period device. The device reads 441 frames
+    /// every 10 000 us (a read with padding < 441 is starved) and wakes the renderer right
+    /// after each read, plus once at stream start (t = 0); each device wake arms a deadline
+    /// wake one period minus [`DEADLINE_GUARD_US`] later. Capture delivers 441 frames every
+    /// 10 000 us at `phase` (stamped as fresh input); processing turns them into 128-frame
+    /// hops of 0.5, 300 us each, one after the other, each a data wake. At equal times:
+    /// device, capture, processing, deadline, sample.
+    fn simulate_events(cfg: EvCfg) -> EvSim {
+        const PERIOD: usize = 441;
+        const PERIOD_US: u64 = 10_000;
+        const HOP: usize = 128;
+        const HOP_US: u64 = 300;
+        const SAMPLE_US: u64 = 100;
+        const T0: u64 = 10 * SEC;
+        let sink = FakeSink::new(0);
+        let padding = sink.padding.clone();
+        let (mut r, shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let capture_at = |k: u64| {
+            let due = cfg.phase + k * PERIOD_US;
+            match cfg.stall {
+                Some((at, late)) if (at..at + late).contains(&due) => at + late,
+                _ => due,
+            }
+        };
+        let mut sim = EvSim::default();
+        let wake = |r: &mut Renderer, w: Wake, t: u64, sim: &mut EvSim| {
+            let pads = pad_events(r);
+            r.fill_at(w, T0 + t).unwrap();
+            if pad_events(r) > pads {
+                sim.pads.push(t);
+            }
+            let h = r.headroom.total();
+            if h > sim.max_headroom {
+                sim.max_headroom = h;
+            }
+            if h == 0 && sim.max_headroom > 0 && sim.released_at.is_none() {
+                sim.released_at = Some(t);
+            }
+        };
+        let (mut next_read, mut k, mut ring_a) = (0u64, 0u64, 0usize);
+        let mut next_capture = capture_at(0);
+        let mut busy_until: Option<u64> = None;
+        let mut deadline: Option<u64> = None;
+        let mut deadlines = 0u64;
+        let mut next_sample = 0u64;
+        let mut preroll_at = cfg.preroll_at;
+        while next_sample < cfg.len_us {
+            let candidates = [
+                Some(next_read),
+                Some(next_capture),
+                busy_until,
+                deadline,
+                Some(next_sample),
+                preroll_at,
+            ];
+            let (which, t) = candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.map(|t| (i, t)))
+                .min_by_key(|&(i, t)| (t, i))
+                .unwrap();
+            match which {
+                0 => {
+                    if t > 0 {
+                        let p = padding.load(Ordering::Relaxed);
+                        if p < PERIOD {
+                            sim.starved.push(t);
+                        }
+                        padding.store(p.saturating_sub(PERIOD), Ordering::Relaxed);
+                    }
+                    wake(&mut r, Wake::Device, t, &mut sim);
+                    let skipped = cfg.skip_every.is_some_and(|n| deadlines % n == n / 2);
+                    deadlines += 1;
+                    deadline = (!skipped).then_some(t + PERIOD_US - DEADLINE_GUARD_US);
+                    next_read = t + PERIOD_US;
+                }
+                1 => {
+                    ring_a += PERIOD;
+                    shared.last_input_us.store(T0 + t, Ordering::Release);
+                    if busy_until.is_none() && ring_a >= HOP {
+                        ring_a -= HOP;
+                        busy_until = Some(t + HOP_US);
+                    }
+                    k += 1;
+                    next_capture = capture_at(k);
+                }
+                2 => {
+                    for _ in 0..HOP * 2 {
+                        tx.push(0.5).unwrap();
+                    }
+                    wake(&mut r, Wake::Data, t, &mut sim);
+                    busy_until = if ring_a >= HOP {
+                        ring_a -= HOP;
+                        Some(t + HOP_US)
+                    } else {
+                        None
+                    };
+                }
+                3 => {
+                    deadline = None;
+                    let q = padding.load(Ordering::Relaxed) + r.ctx.input.slots() / 2;
+                    sim.at_deadline.push((t, q));
+                    wake(&mut r, Wake::Deadline, t, &mut sim);
+                }
+                4 => {
+                    let q = padding.load(Ordering::Relaxed) + r.ctx.input.slots() / 2;
+                    sim.queue.push((t, q));
+                    next_sample += SAMPLE_US;
+                }
+                _ => {
+                    preroll_at = None;
+                    shared.preroll_request.store(true, Ordering::Release);
+                }
+            }
+        }
+        let diag = &r.ctx.stats.diag;
+        sim.underruns = underruns(&r);
+        sim.decay = decay_frames(&r);
+        sim.preroll = diag.render_preroll_frames.load(Ordering::Relaxed);
+        sim.missed = missed_deadlines(&r);
+        sim
+    }
+
+    /// Ruling 17 (1): under O2 the decay's low point is taken at check wakes only; a device
+    /// wake sees the queue right after a read, about one period below what the next read
+    /// finds, which used to cancel the decay. A real underrun (the capture stalls 12 ms at
+    /// about 1 s: two packets arrive late, together) grows the headroom by a hop; 5 s later it is released and skipped whole, in every
+    /// capture phase, with no starved read and no further pad or underrun.
+    #[test]
+    fn o2_decay_skips_the_released_jitter_headroom_in_every_phase() {
+        for phase in (0..10_000).step_by(500) {
+            let mut cfg = EvCfg::new(phase, 8 * SEC);
+            cfg.stall = Some((SEC + phase, 12 * MS));
+            let s = simulate_events(cfg);
+            eprintln!(
+                "phase {phase:>5}: headroom {} released {:?} decay {} underruns {} pads {:?} \
+                 starved {:?} queue before {:.1} after {:.1}",
+                s.max_headroom,
+                s.released_at,
+                s.decay,
+                s.underruns,
+                s.pads,
+                s.starved,
+                s.mean_queue(5 * SEC, 6 * SEC),
+                s.mean_queue(7 * SEC, 8 * SEC)
+            );
+            assert_eq!(s.max_headroom, 128, "phase {phase}");
+            assert!(s.released_at.is_some(), "phase {phase}");
+            assert_eq!(s.decay, 128, "phase {phase}");
+            assert_eq!(s.underruns, 1, "phase {phase}");
+            assert!(s.starved.is_empty(), "phase {phase}: {:?}", s.starved);
+            assert_eq!(
+                s.pads_after(SEC + 50 * MS),
+                0,
+                "phase {phase}: {:?}",
+                s.pads
+            );
+        }
+    }
+
+    /// Ruling 17 (2): one deadline in a hundred never firing (its device wake handled late)
+    /// changes nothing when the device has audio queued: the same pads, underruns, decay and
+    /// mean queue as with every deadline firing, in every capture phase.
+    #[test]
+    fn o2_one_missed_deadline_in_a_hundred_changes_nothing() {
+        for phase in (0..10_000).step_by(500) {
+            let mut cfg = EvCfg::new(phase, 8 * SEC);
+            cfg.stall = Some((SEC + phase, 12 * MS));
+            let base = simulate_events(cfg);
+            cfg.skip_every = Some(100);
+            let s = simulate_events(cfg);
+            let (q0, q1) = (base.mean_queue(0, 8 * SEC), s.mean_queue(0, 8 * SEC));
+            eprintln!(
+                "phase {phase:>5}: missed {} pads {} vs {} underruns {} vs {} decay {} vs {} \
+                 mean queue {q0:.2} vs {q1:.2} starved {} vs {}",
+                s.missed,
+                base.pads.len(),
+                s.pads.len(),
+                base.underruns,
+                s.underruns,
+                base.decay,
+                s.decay,
+                base.starved.len(),
+                s.starved.len()
+            );
+            assert_eq!(s.missed, 8, "phase {phase}: one a second");
+            assert_eq!(s.pads, base.pads, "phase {phase}");
+            assert_eq!(s.underruns, base.underruns, "phase {phase}");
+            assert_eq!(s.decay, base.decay, "phase {phase}");
+            assert!(s.starved.is_empty(), "phase {phase}");
+            assert!((q1 - q0).abs() <= 1.0, "phase {phase}: {q0} vs {q1}");
+        }
+    }
+
+    /// Ruling 17 (minor): a pre-roll writes exactly the silence it registers as headroom
+    /// (it wrote 765 frames for 441 registered), and once the model has warmed up (here the
+    /// 200 ms grace) the decay skips everything above the target, in every capture phase,
+    /// in one fade-out / fade-in. Ruling 3 floors the decay at the target, and O2's steady
+    /// low sits up to a hop below it (only a period must be queued at a deadline), so what
+    /// is not skipped is exactly that distance: 441 - (target - low before the "on").
+    #[test]
+    fn o2_decay_skips_a_released_preroll_in_every_phase() {
+        const TARGET: usize = 441 + 128;
+        for phase in (0..10_000).step_by(500) {
+            let mut cfg = EvCfg::new(phase, 3 * SEC);
+            cfg.preroll_at = Some(SEC);
+            let s = simulate_events(cfg);
+            let (before, after) = (
+                s.mean_queue(SEC / 2, SEC),
+                s.mean_queue(5 * SEC / 2, 3 * SEC),
+            );
+            let (low_before, low_after) = (s.low(SEC / 2, SEC), s.low(5 * SEC / 2, 3 * SEC));
+            eprintln!(
+                "phase {phase:>5}: preroll {} decay {} released {:?} pads {:?} starved {:?} \
+                 queue before {before:.1} after {after:.1} low before {low_before} after \
+                 {low_after}",
+                s.preroll, s.decay, s.released_at, s.pads, s.starved
+            );
+            assert_eq!(s.preroll, 441, "phase {phase}: silence written");
+            assert!(s.starved.is_empty(), "phase {phase}");
+            assert_eq!(s.pads_after(50 * MS), 0, "phase {phase}: {:?}", s.pads);
+            assert_eq!(s.underruns, 0, "phase {phase}");
+            assert!(
+                (TARGET..=TARGET + 16).contains(&low_after),
+                "phase {phase}: settles at the target, low {low_after}"
+            );
+            let below = TARGET.saturating_sub(low_before) as u64;
+            assert!(below < 128, "phase {phase}: low before {low_before}");
+            assert!(
+                (441 - 16..=441).contains(&(s.decay + below)),
+                "phase {phase}: decay {} below {below}",
+                s.decay
+            );
+            assert!(after <= before + 128.0 + 16.0, "phase {phase}");
+        }
     }
 
     /// Frames to milliseconds at the engine rate.

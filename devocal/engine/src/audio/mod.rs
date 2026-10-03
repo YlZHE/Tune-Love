@@ -149,9 +149,14 @@ pub struct DiagCounters {
     /// Render wakes after 20 ms with nothing signalled. Device wakes are `render_wakes`
     /// minus data, deadline and timeout wakes.
     pub render_timeout_wakes: AtomicU64,
-    /// Device wakes that found their deadline still armed (it never fired) and checked the
-    /// queue themselves (ruling 8). Close to the device wakes: deadlines are being missed.
+    /// Device wakes that found their deadline still armed (it never fired). An isolated
+    /// miss checks only whether the device ran dry (ruling 17). Close to the device wakes:
+    /// deadlines are being missed.
     pub render_missed_deadlines: AtomicU64,
+    /// Streams switched to checking on device wakes (legacy, until reopened) after
+    /// [`render::MISSED_DEADLINE_LIMIT`] missed deadlines within
+    /// [`render::MISSED_DEADLINE_WINDOW_US`].
+    pub render_legacy_switches: AtomicU64,
     pub render_real_frames: AtomicU64,
     pub render_pad_events: AtomicU64,
     pub render_pad_frames: AtomicU64,
@@ -241,6 +246,7 @@ pub(crate) fn diag_loop_with(
             &d.render_deadline_wakes,
             &d.render_timeout_wakes,
             &d.render_missed_deadlines,
+            &d.render_legacy_switches,
             &d.render_real_frames,
             &d.render_pad_events,
             &d.render_pad_frames,
@@ -268,6 +274,7 @@ pub(crate) fn diag_loop_with(
         "r_deadline",
         "r_timeout",
         "r_missed",
+        "r_legacy",
         "r_real",
         "r_pad_ev",
         "r_pad_fr",
@@ -287,8 +294,8 @@ pub(crate) fn diag_loop_with(
         "devocal diag: run={run} start t={:.6} unix_ms={unix_ms}",
         last_us as f64 / 1e6
     ));
-    let line = |last: &[u64; 23], now: [u64; 23], t_us: u64, span_us: u64, partial: bool| {
-        let mut fields = [("", 0u64); 23];
+    let line = |last: &[u64; 24], now: [u64; 24], t_us: u64, span_us: u64, partial: bool| {
+        let mut fields = [("", 0u64); 24];
         for (i, f) in fields.iter_mut().enumerate() {
             *f = (names[i], now[i].wrapping_sub(last[i]));
         }
@@ -1307,6 +1314,7 @@ mod tests {
         let (mut mk_tx, mut mk_rx) = RingBuffer::<u64>::new(8);
         let mut trim = render::TrimPolicy::new(1_000);
         let mut headroom = render::Headroom::new();
+        let mut missed = render::MissedDeadlines::new();
         let mut power = 0.0f64;
         let mut block = vec![0.25f32; 441 * 2];
         let mut loud = vec![3.0f32; 441 * 2];
@@ -1378,6 +1386,10 @@ mod tests {
             let wake = render::wake_from_wait(i as u32 % 4, true);
             let deadline = render::deadline_mode(timer.is_some(), 441);
             let _ = render::plan_fill(wake, deadline, i as usize, 300, 4_000, 441, 569);
+            let _ = missed.miss(i * 700_000);
+            if i % 10 == 0 {
+                missed.reset();
+            }
             if let Some(t) = &timer {
                 t.arm_in_us(8_500);
             }

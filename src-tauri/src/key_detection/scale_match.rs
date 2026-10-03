@@ -288,8 +288,12 @@ impl ScaleMatcher {
         }
         self.current = Some(chosen);
         let statistic = gate_statistic(&self.weights(), &mask(chosen));
+        let before = self.state.chromatic;
         self.state
             .update(&self.gate, statistic, self.seconds, step.seconds);
+        if self.state.chromatic != before {
+            self.seeded = false;
+        }
     }
 
     fn weights(&self) -> [f64; 12] {
@@ -969,14 +973,59 @@ mod tests {
         matcher.seed(0, Scale::Chromatic, candidate(0, Scale::Major));
         feed(&mut matcher, &C_MAJOR, 19);
         assert_eq!(matcher.target().unwrap().scale, Scale::Chromatic);
-        feed(&mut matcher, &C_MAJOR, 4); // 3 s of hold after the seed hold
+        feed(&mut matcher, &C_MAJOR, 2); // seed hold over, gate hold not yet met
+        let waiting = matcher.target().unwrap();
+        assert_eq!(
+            (waiting.scale, waiting.source),
+            (Scale::Chromatic, TargetSource::Cache),
+            "same set and still Chromatic: still the cached result"
+        );
+        feed(&mut matcher, &C_MAJOR, 2); // 3 s of hold after the seed hold: the gate opens
         let after = matcher.target().unwrap();
         assert_eq!((after.key, after.scale), (Some(0), Scale::Major));
         assert_eq!(
             after.source,
-            TargetSource::Cache,
-            "same set: still the cached result"
+            TargetSource::Analysis,
+            "the gate change is the analysis overruling the cache"
         );
+    }
+
+    #[test]
+    fn a_cached_major_that_analysis_turns_chromatic_reports_analysis() {
+        // C major notes with F weak and D-flat strong: the set stays C major (hysteresis),
+        // but the out-of-set D-flat outweighs the weakest in-set note more than ENTER.
+        let levels = [
+            (0, 1.0),
+            (2, 1.0),
+            (4, 1.0),
+            (5, 0.5),
+            (7, 1.0),
+            (9, 1.0),
+            (11, 1.0),
+            (1, 1.0),
+        ];
+        let mut matcher = new_matcher();
+        matcher.seed(0, Scale::Major, None);
+        for _ in 0..19 {
+            matcher.add(&weighted(&levels));
+        }
+        let held = matcher.target().unwrap();
+        assert_eq!(
+            (held.scale, held.source),
+            (Scale::Major, TargetSource::Cache),
+            "under the seed hold nothing changes"
+        );
+        for _ in 0..30 {
+            matcher.add(&weighted(&levels));
+        }
+        let after = matcher.target().unwrap();
+        assert_eq!(after.scale, Scale::Chromatic);
+        assert_eq!(
+            after.candidate,
+            candidate(0, Scale::Major),
+            "same set, now uncertain"
+        );
+        assert_eq!(after.source, TargetSource::Analysis);
     }
 
     #[test]

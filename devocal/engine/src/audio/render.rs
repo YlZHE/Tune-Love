@@ -888,7 +888,7 @@ struct Renderer {
     decay_since_us: u64,
     /// Lowest queue (device padding + ring B) seen at a check wake ([`checks_padding`], in
     /// the effective deadline mode) since `decay_since_us` (`usize::MAX` when no decay is
-    /// pending).
+    /// pending, or no check wake has been seen since the release).
     decay_low: usize,
     /// The pending `drop_pending` is a headroom decay (counted as `render_decay_frames`).
     drop_is_decay: bool,
@@ -1366,8 +1366,14 @@ impl Renderer {
         let waited = now.saturating_sub(self.decay_since_us);
         if self.decay_drop > 0 && self.drop_pending == 0 && waited >= DECAY_OBSERVE_US {
             // O1: what is really spare is the lowest queue since the release, beyond the
-            // target. None (player paused, or a late packet ate it): nothing to skip.
-            if self.decay_low <= target {
+            // target. None (player paused, or a late packet ate it): nothing to skip. No check
+            // wake seen yet (say every deadline was missed): unknown, so wait for one, giving
+            // up a second past the forced point.
+            if self.decay_low == usize::MAX {
+                if waited >= 2 * LOW_ENERGY_WAIT_US {
+                    self.end_decay();
+                }
+            } else if self.decay_low <= target {
                 self.end_decay();
             } else {
                 let spare = self.decay_low - target;
@@ -2541,6 +2547,52 @@ mod tests {
         assert!(o.len() > first);
         assert_eq!(o[first], 0.0);
         assert!(o[first..].iter().all(|s| s.abs() <= 0.5));
+    }
+
+    /// Residual fix (ruling 17 re-review): with no check wake since the release the low point
+    /// is unknown, so nothing is spare yet; the decay waits for a check, and gives up at the
+    /// usual bound if none ever comes.
+    #[test]
+    fn a_decay_waits_for_a_check_wake_before_skipping() {
+        let sink = FakeSink::new(0);
+        let padding = sink.padding.clone();
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let t = 100 * SEC;
+        // Forced point passed (1.1 s), but no check wake observed yet.
+        r.decay_drop = 441;
+        r.decay_since_us = t - 1_100 * MS;
+        assert_eq!(r.decay_low, usize::MAX);
+        padding.store(300, Ordering::Relaxed);
+        arrive(&r, &mut tx, 600, t);
+        r.fill_at(Wake::Data, t).unwrap();
+        assert_eq!(decay_frames(&r), 0, "nothing known to be spare");
+        assert_eq!((r.drop_pending, r.decay_drop), (0, 441), "still pending");
+        // The deadline sees 569 + 331 queued: 331 spare over the 569 target.
+        r.fill_at(Wake::Deadline, t + 8 * MS).unwrap();
+        assert_eq!(r.decay_low, 900);
+        padding.store(128, Ordering::Relaxed);
+        r.fill_at(Wake::Data, t + 10 * MS).unwrap();
+        assert_eq!(decay_frames(&r), (331 - r.fade_frames) as u64);
+        assert_eq!(r.drop_pending, r.fade_frames, "the rest as it arrives");
+        assert_eq!(r.decay_drop, 0);
+
+        // No check wake ever: given up a second past the forced point, nothing skipped.
+        let sink = FakeSink::new(0);
+        let padding = sink.padding.clone();
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        r.decay_drop = 441;
+        r.decay_since_us = t - 1_100 * MS;
+        padding.store(300, Ordering::Relaxed);
+        arrive(&r, &mut tx, 600, t);
+        r.fill_at(Wake::Data, t).unwrap();
+        assert_eq!(r.decay_drop, 441);
+        padding.store(300, Ordering::Relaxed);
+        r.fill_at(Wake::Data, t + 900 * MS).unwrap();
+        assert_eq!((r.decay_drop, decay_frames(&r)), (0, 0), "given up at 2 s");
     }
 
     #[test]

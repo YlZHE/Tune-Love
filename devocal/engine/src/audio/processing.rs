@@ -168,7 +168,8 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
             }
         }
         // From here until it is pushed to ring B the block is in neither ring; publish it as
-        // in flight for the latency estimate (set first, so it is never missing in between).
+        // in flight for the latency estimate. Set before the pop and cleared after the push,
+        // so it is never missing from the estimate (briefly counted twice instead).
         ctx.shared
             .proc_in_flight_frames
             .store(st.hop as u32, Ordering::Relaxed);
@@ -214,14 +215,17 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
             .load_ratio_milli
             .store((ratio * 1000.0).round() as u32, Ordering::Relaxed);
 
-        ctx.shared.proc_in_flight_frames.store(0, Ordering::Relaxed);
         if ctx.output.slots() >= st.hop * 2 {
             let _ = ctx.output.push_entire_slice(&st.out_block);
+            // Cleared only once the block is in ring B: for a moment it counts twice (never
+            // zero times) in the latency estimate (ruling 23).
+            ctx.shared.proc_in_flight_frames.store(0, Ordering::Relaxed);
             st.out_pos += st.hop as u64;
             // O2: the render thread writes the block to the device on arrival.
             ctx.shared.render_wake.set();
         } else {
             // Ring B full (render stalled): drop the block, fade around the jump.
+            ctx.shared.proc_in_flight_frames.store(0, Ordering::Relaxed);
             ctx.stats
                 .diag
                 .proc_ring_b_drops
@@ -660,6 +664,12 @@ mod tests {
             "in flight on every call"
         );
         assert_eq!(max.load(Ordering::Relaxed), HOP as u32);
+        // Cleared right after the last push.
+        while shared.proc_in_flight_frames.load(Ordering::Relaxed) != 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert_eq!(
             shared.proc_in_flight_frames.load(Ordering::Relaxed),
             0,

@@ -57,8 +57,9 @@ pub struct DetectionSnapshot {
     pub status: &'static str,
     pub key: Option<MusicalKey>,
     pub updated_at_ms: u64,
-    /// Recommended Auto-Tune Key/Scale (Major/Minor only) for the current song;
-    /// None until the first non-silent evidence of that song.
+    /// Recommended Auto-Tune Key/Scale for the current song: Chromatic (key may be
+    /// null) until the matcher settles on a Major/Minor set, and again whenever it is
+    /// uncertain. None only without a track identity or while analysis is unavailable.
     pub autotune_target: Option<AutoTuneTarget>,
 }
 

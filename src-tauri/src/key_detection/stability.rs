@@ -307,7 +307,13 @@ impl Stabilizer {
             status: self.status,
             key: self.confirmed,
             updated_at_ms: self.updated_at_ms,
-            autotune_target: self.identity.as_ref().and_then(|_| self.matcher.target()),
+            // No target while analysis is unavailable: the UI falls back to the brand and
+            // nothing is written, instead of Chromatic for every song forever.
+            autotune_target: self
+                .identity
+                .as_ref()
+                .filter(|_| self.status != "unavailable")
+                .and_then(|_| self.matcher.target()),
         }
     }
 }
@@ -499,14 +505,8 @@ mod tests {
             true,
             now + 3,
         );
-        assert_eq!(
-            stabilizer
-                .snapshot()
-                .autotune_target
-                .unwrap()
-                .evidence_seconds,
-            30.0
-        );
+        // ...and while unavailable there is no target at all (the evidence is not lost, see below).
+        assert!(stabilizer.snapshot().autotune_target.is_none());
 
         // Pause keeps the song's evidence; a new track forgets it.
         stabilizer.observe(&obs(Some(("track", 1)), false, 2, 32 * 48_000), now + 4);
@@ -726,6 +726,20 @@ mod tests {
         let snapshot = state.snapshot();
         assert_eq!(snapshot.status, "unavailable");
         assert_eq!(snapshot.key, None);
+        assert!(snapshot.autotune_target.is_none());
+    }
+
+    #[test]
+    fn target_returns_when_analysis_recovers_from_unavailable() {
+        let mut state = Stabilizer::new();
+        let failed = observation("a", 1, 1, 40);
+        state.observe(&failed, 40);
+        let token = state.begin(&failed, 40).unwrap();
+        state.complete(&token, &failed, None, true, 41);
+        assert!(state.snapshot().autotune_target.is_none());
+        vote(&mut state, observation("a", 1, 1, 50), Some(key(0)), 50);
+        assert_ne!(state.snapshot().status, "unavailable");
+        assert!(state.snapshot().autotune_target.is_some());
     }
 
     #[test]

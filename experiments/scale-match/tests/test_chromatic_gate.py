@@ -167,5 +167,56 @@ class ProductionChromaticTests(unittest.TestCase):
         self.assertTrue((combos == matcher.CHROMATIC).all())
 
 
+class RustParityTests(unittest.TestCase):
+    """The five sequences that src-tauri/src/key_detection/scale_match.rs hard-codes as its
+    parity tests (parity_*), replayed through production_chromatic at the frozen gate
+    parameters. The expected strings are the Rust tests' strings: 'C' = Chromatic."""
+
+    FROZEN = GateParams(3.0, 1.5, 3.0, 3.0, "ratio")
+    C_MAJOR_PCS = (0, 2, 4, 5, 7, 9, 11)
+    G_MAJOR_PCS = (7, 9, 11, 0, 2, 4, 6)
+
+    @staticmethod
+    def levels(spec, rms=0.1):
+        c = [0.0] * 12
+        for pc, level in spec:
+            c[pc] = level
+        return {"seconds": 1.0, "rms": rms, "chroma": c}
+
+    def flags(self, evidences):
+        rows = [{"second": k, "evidence": ev} for k, ev in enumerate(evidences, 1)]
+        combos = production_chromatic(rows, float(len(evidences)), self.FROZEN)
+        return "".join("C" if c == matcher.CHROMATIC else "." for c in combos[1:])
+
+    def flat(self, pcs):
+        return self.levels([(pc, 1.0) for pc in pcs])
+
+    D_AND_DFLAT = [(5, 1.0), (7, 1.0), (8, 1.0), (10, 1.0), (0, 1.0), (1, 1.0), (3, 0.8), (2, 1.0)]
+
+    def test_clean_c_major(self):
+        self.assertEqual(self.flags([self.flat(self.C_MAJOR_PCS)] * 30), "CCCC" + "." * 26)
+
+    def test_d_and_dflat_strong_stays_chromatic(self):
+        self.assertEqual(self.flags([self.levels(self.D_AND_DFLAT)] * 20), "C" * 20)
+
+    def test_equal_weight_extra_note_leaves_chromatic(self):
+        spec = [(pc, 1.0 if pc == 3 else level) for pc, level in self.D_AND_DFLAT]
+        self.assertEqual(self.flags([self.levels(spec)] * 20), "CCCC" + "." * 16)
+
+    def test_set_change_does_not_reenter_chromatic(self):
+        seq = [self.flat(self.C_MAJOR_PCS)] * 12 + [self.flat(self.G_MAJOR_PCS)] * 25
+        self.assertEqual(self.flags(seq), "CCCC" + "." * 33)
+
+    def test_silent_steps_then_a_borrowed_set_enters(self):
+        silent = {"seconds": 1.0, "rms": 0.0, "chroma": [1.0] * 12}
+        f_minor_plus_d = [(2, 1.0), (1, 1.0), (5, 0.5), (7, 0.5), (8, 0.5), (10, 0.5), (0, 0.5), (3, 0.5)]
+        seq = [self.flat(self.C_MAJOR_PCS)] * 12 + [silent] * 3 + [self.levels(f_minor_plus_d)] * 15
+        self.assertEqual(self.flags(seq), "CCCC" + "." * 24 + "CC")
+
+    def test_a_borrowed_note_below_the_lines_stays_out_of_chromatic(self):
+        seq = [self.flat(self.C_MAJOR_PCS)] * 10 + [self.flat((0, 2, 4, 5, 7, 9, 11, 1))] * 12
+        self.assertEqual(self.flags(seq), "CCCC" + "." * 18)
+
+
 if __name__ == "__main__":
     unittest.main()

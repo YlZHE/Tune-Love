@@ -25,8 +25,9 @@
 //! only then, on a later tick, calls `Holder::begin_attach` with that tick's time, so the
 //! 30 ms volume ramp is not compressed by the audio start-up and nothing is lowered when the
 //! audio cannot start. The first tick after the start stamps the start time; `begin_attach`
-//! waits until the capture has delivered [`ATTACH_REF_FRAMES`] (20 ms recorded at the
-//! player's original volume, the reference for R2's level check) or [`ATTACH_REF_WAIT_US`]
+//! waits until the capture has delivered [`ATTACH_REF_FRAMES`] (three 441-frame packets,
+//! 30 ms, recorded at the player's original volume: the reference for R2's level check,
+//! which needs at least 20 ms of full chunks) or [`ATTACH_REF_WAIT_US`]
 //! (100 ms) have passed since that stamp, whichever comes first. During the wait the player
 //! plays at its own volume and the engine's output gain is still 0, so nothing is audible
 //! twice. A default render device change seen during the wait (the Holder is still idle and
@@ -116,9 +117,13 @@ pub const EXIT_RELEASE_TIMEOUT_US: u64 = 2_000_000;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the writer may take to flush the last events at exit.
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
-/// R2: captured frames (20 ms) the engine waits for before `begin_attach`, so the level check
-/// has a reference recorded at the player's original volume.
-pub const ATTACH_REF_FRAMES: u64 = 882;
+/// R2: captured frames the engine waits for before `begin_attach`, so the level check has a
+/// reference recorded at the player's original volume: three 441-frame packets (30 ms). The
+/// level check needs 8 full 110-frame chunks (880 frames, about 20 ms) and records only the
+/// four full chunks of each packet (not its 1-frame remainder), so two packets would leave no
+/// margin at all; the third covers a packet whose chunks are not recorded yet when the engine
+/// reads the count, or a partial packet.
+pub const ATTACH_REF_FRAMES: u64 = 1_323;
 /// R2: longest wait for [`ATTACH_REF_FRAMES`] after the audio started (a paused player sends
 /// nothing); the attach then proceeds without a reference.
 pub const ATTACH_REF_WAIT_US: u64 = 100_000;
@@ -719,8 +724,8 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         let Some(pending) = self.pending_attach.as_mut() else {
             return;
         };
-        // R2: wait for 20 ms of audio captured at the player's own volume (the level check's
-        // reference), at most ATTACH_REF_WAIT_US. Meanwhile the player plays at its original
+        // R2: wait for 30 ms of audio captured at the player's own volume (the level check's
+        // reference, ATTACH_REF_FRAMES), at most ATTACH_REF_WAIT_US. Meanwhile the player plays at its original
         // volume and our output gain is 0, so nothing is heard twice or louder.
         let started_us = *pending.started_us.get_or_insert(now_us);
         if self.audio.input_frames() < ATTACH_REF_FRAMES
@@ -2646,7 +2651,8 @@ mod tests {
         assert!(errors(&out).is_empty(), "{out:?}");
     }
 
-    /// Review Focus 1: the player keeps its volume until 20 ms of reference audio is captured.
+    /// Review Focus 1: the player keeps its volume until three packets (30 ms) of reference
+    /// audio are captured.
     #[test]
     fn attach_waits_for_pre_attach_audio() {
         let mut r = Rig::new("attach-ref-audio");
@@ -2665,14 +2671,15 @@ mod tests {
             "our output is silent while waiting"
         );
         assert_eq!(gains.attach(), None);
-        r.audio().set_input_frames(ATTACH_REF_FRAMES - 1);
+        assert_eq!(ATTACH_REF_FRAMES, 1_323, "three 441-frame packets");
+        r.audio().set_input_frames(1_322);
         r.run(1);
         assert_eq!(
             r.core.sessions().set_volume_calls(),
             0,
-            "881 frames: not yet"
+            "1322 frames: not yet"
         );
-        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        r.audio().set_input_frames(1_323);
         r.run(1);
         assert_eq!(r.core.sessions().set_volume_calls(), 1);
         assert!(r.volume(SESSION) < 0.8, "{}", r.volume(SESSION));

@@ -533,6 +533,52 @@ mod tests {
         assert_eq!(c.chunk_gain(&alt(step_amp(0.1, 0.5, 2), 1), 1.0), 1.0);
     }
 
+    /// The real capture pattern: 441-frame packets through `condition_with`, so each packet
+    /// records 4 full chunks and skips its 1-frame remainder. Two packets (what the engine
+    /// may have seen counted when it starts the attach) give a valid reference; one does not.
+    #[test]
+    fn two_real_packets_make_a_reference_one_does_not() {
+        let stats = AudioStats::default();
+        let follow = AtomicBool::new(false);
+        for packets in [2usize, 1] {
+            let mut c = LevelConfirm::new();
+            let mut cond = Conditioner::new();
+            c.observe(None, T0 - 30_000);
+            for _ in 0..packets {
+                let mut pkt = alt(0.1, 441);
+                cond.condition_with(
+                    &mut pkt,
+                    |raw| c.chunk_gain(raw, 1.0),
+                    &stats,
+                    &follow,
+                    |_| {},
+                );
+            }
+            c.observe(ramp(2, 0.5), T0);
+            let mut pkt = alt(step_amp(0.1, 0.5, 2), 441);
+            let mut gains = Vec::new();
+            cond.condition_with(
+                &mut pkt,
+                |raw| {
+                    let g = c.chunk_gain(raw, 1.0);
+                    gains.push(g);
+                    g
+                },
+                &stats,
+                &follow,
+                |_| {},
+            );
+            if packets == 2 {
+                assert!(gains.iter().all(|&g| g > 1.0), "{gains:?}");
+                assert_eq!(c.take_counts(), (5, 0));
+            } else {
+                assert!(gains.iter().all(|&g| g == 1.0), "{gains:?}");
+                assert_eq!(c.take_counts(), (0, 5));
+            }
+        }
+        assert_eq!(stats.unattenuated_blocks.load(Ordering::Relaxed), 0);
+    }
+
     // ---- Invariant simulation ------------------------------------------------------------
 
     #[derive(Debug, Clone, Copy, PartialEq)]

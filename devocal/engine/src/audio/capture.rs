@@ -226,7 +226,6 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
                 Ok((n, info)) => {
                     let d = &ctx.stats.diag;
                     d.capture_packets.fetch_add(1, Ordering::Relaxed);
-                    d.capture_frames.fetch_add(n as u64, Ordering::Relaxed);
                     if info.flags.data_discontinuity {
                         d.capture_flag_discontinuity.fetch_add(1, Ordering::Relaxed);
                     }
@@ -282,6 +281,12 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
                     let _ = markers.push(InputMarker::GuardGap(pushed + offset as u64));
                 },
             );
+            // Counted only now, after R2 recorded the packet's chunks: the engine starts the
+            // attach once enough frames are counted, and they must all be in the reference.
+            ctx.stats
+                .diag
+                .capture_frames
+                .fetch_add(n as u64, Ordering::Relaxed);
             let (confirmed, fallback) = confirm.take_counts();
             if confirmed > 0 {
                 ctx.stats

@@ -30,6 +30,7 @@ async function prepare(page: Page, view = "/", initial: Record<string, unknown> 
           if (action === "release") state.devocal = { ...OFF };
           return structuredClone(state.devocal);
         }
+        if (command === "get_model_status") return [];
         if (command === "get_now_playing") return { status: "idle", track: null, capturedAtMs: Date.now() };
         if (command === "get_audio_level" || command === "get_key_detection") return null;
         if (command === "plugin:window|is_always_on_top") return true;

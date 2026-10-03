@@ -30,12 +30,15 @@
 //! [`Headroom`]): the pre-roll once the model has warmed up, the jitter part after 5 s
 //! without an underrun (backing off up to 60 s while jitter keeps returning); the released
 //! audio is skipped at a quiet spot (at most 1 s later), down to the lowest queue the checks
-//! saw beyond the target, and not at all if nothing extra is queued (paused). A pre-roll
-//! writes exactly the silence it adds to the headroom. A queue more than 20 ms over target
-//! for a whole second is trimmed back. Both skips fade out, skip and fade in; a decay skip
-//! larger than ring B goes on discarding arriving frames until it is done. Output gain is
-//! ramped across each write; every sample is clamped to [-1, 1] (non-finite -> 0) before it
-//! reaches the device.
+//! saw beyond the target, and not at all if nothing extra is queued (paused). When devocal
+//! goes off (or falls back), the queue the checks see rises (the model delivers a packet's
+//! hops later than the passthrough does), so audio devocal left queued is skipped the same
+//! way once the crossfade back has left ring B, if it is at least a hop (ruling 21); no
+//! decay skips during a crossfade. A pre-roll writes exactly the silence it adds to the
+//! headroom. A queue more than 20 ms over target for a whole second is trimmed back. Both
+//! skips fade out, skip and fade in; a decay skip larger than ring B goes on discarding
+//! arriving frames until it is done. Output gain is ramped across each write; every sample is
+//! clamped to [-1, 1] (non-finite -> 0) before it reaches the device.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -890,6 +893,14 @@ struct Renderer {
     /// the effective deadline mode) since `decay_since_us` (`usize::MAX` when no decay is
     /// pending, or no check wake has been seen since the release).
     decay_low: usize,
+    /// Smallest spare the pending decay skips: 0 for released headroom, one hop for a
+    /// settle after devocal (below that the queue is within O2's own spread).
+    decay_min: usize,
+    /// The stage seen at the previous wake ran the model.
+    model_seen: bool,
+    /// Devocal went off (or fell back): once ring B has been read up to here (past the
+    /// crossfade back to the passthrough), a settle decay starts (ruling 21 b).
+    settle_at: Option<u64>,
     /// The pending `drop_pending` is a headroom decay (counted as `render_decay_frames`).
     drop_is_decay: bool,
     /// The pending skip's fade-out has been written; a decay is still discarding.
@@ -936,6 +947,9 @@ impl Renderer {
             decay_drop: 0,
             decay_since_us: 0,
             decay_low: usize::MAX,
+            decay_min: 0,
+            model_seen: false,
+            settle_at: None,
             drop_is_decay: false,
             drop_faded: false,
             recent_ms: 0.0,
@@ -1040,6 +1054,8 @@ impl Renderer {
         // kept (see above).
         self.headroom.reset();
         self.end_decay();
+        self.model_seen = false;
+        self.settle_at = None;
         // No deadline from the old stream may fire into the new one, and a new stream gets
         // deadline mode back with no misses remembered.
         self.deadline_armed = false;
@@ -1063,10 +1079,43 @@ impl Renderer {
         self.drop_faded = false;
     }
 
+    /// Ruling 21 (b): devocal off (or a fallback) needs nothing it left queued. The model
+    /// delivers each capture packet's hops later than the passthrough does, so the queue
+    /// the checks see during devocal is lower; audio a decay could not call spare then (a
+    /// pre-roll, say) shows up above the target once the passthrough is back. When the
+    /// stage stops running the model, the position after everything in ring B plus the
+    /// block that may still be in flight (its stage is published before it is pushed) marks
+    /// the end of the crossfade; once ring B has been read past it, a settle decay starts and
+    /// skips, through the decay path, what the checks then find above the target if that is
+    /// at least a hop (any spare if released headroom was still pending; its observation
+    /// starts again), up to the trim margin (beyond it the trim takes the excess anyway).
+    /// Back on cancels a settle not yet started.
+    fn settle_after_devocal(&mut self, stage: Stage, avail: usize, hop: usize, now: u64) {
+        let runs_model = stage_runs_model(stage);
+        if runs_model {
+            self.settle_at = None;
+        } else if self.model_seen {
+            self.settle_at = Some(self.read_pos + (avail + hop) as u64);
+        }
+        self.model_seen = runs_model;
+        if self.settle_at.is_some_and(|at| self.read_pos >= at) {
+            self.settle_at = None;
+            // A released headroom not yet decided joins in, judged by the passthrough's lows
+            // like the rest: the observation starts again.
+            if self.decay_drop == 0 {
+                self.decay_min = hop.max(1);
+            }
+            self.decay_since_us = now;
+            self.decay_low = usize::MAX;
+            self.decay_drop = self.decay_drop.max(frames_for_ms(TRIM_MARGIN_MS));
+        }
+    }
+
     /// No decay pending any more (done, cancelled, or a new stream).
     fn end_decay(&mut self) {
         self.decay_drop = 0;
         self.decay_low = usize::MAX;
+        self.decay_min = 0;
     }
 
     fn discard_all(&mut self) {
@@ -1278,7 +1327,9 @@ impl Renderer {
                 self.decay_low = usize::MAX;
             }
             self.decay_drop += freed;
+            self.decay_min = 0;
         }
+        self.settle_after_devocal(stage, avail, hop, now);
         if self.decay_drop > 0 && checks_padding(wake, deadline_mode) {
             // At every check, written to or not: the low point is what is really spare. Only
             // a check sees the queue the next device read will find; in deadline mode a
@@ -1364,7 +1415,15 @@ impl Renderer {
         }
 
         let waited = now.saturating_sub(self.decay_since_us);
-        if self.decay_drop > 0 && self.drop_pending == 0 && waited >= DECAY_OBSERVE_US {
+        // Never in the middle of a crossfade between passthrough and accompaniment, nor
+        // before the crossfade back to the passthrough has left ring B (ruling 21 b).
+        let crossfading =
+            matches!(stage, Stage::FadingIn | Stage::FadingOut) || self.settle_at.is_some();
+        if self.decay_drop > 0
+            && self.drop_pending == 0
+            && waited >= DECAY_OBSERVE_US
+            && !crossfading
+        {
             // O1: what is really spare is the lowest queue since the release, beyond the
             // target. None (player paused, or a late packet ate it): nothing to skip. No check
             // wake seen yet (say every deadline was missed): unknown, so wait for one, giving
@@ -1373,7 +1432,8 @@ impl Renderer {
                 if waited >= 2 * LOW_ENERGY_WAIT_US {
                     self.end_decay();
                 }
-            } else if self.decay_low <= target {
+            } else if self.decay_low < target + self.decay_min.max(1) {
+                // Nothing spare (or, for a settle, less than a hop: O2's own spread).
                 self.end_decay();
             } else {
                 let spare = self.decay_low - target;
@@ -2631,6 +2691,16 @@ mod tests {
             if p == 20 {
                 shared.preroll_request.store(true, Ordering::Release);
             }
+            // Devocal on and off again: the settle after it (ruling 21 b).
+            let stage = match p {
+                20..=199 => Stage::Devocal,
+                200..=202 => Stage::FadingOut,
+                _ => Stage::Passthrough,
+            };
+            r.ctx
+                .stats
+                .stage
+                .store(crate::audio::stage_code(stage), Ordering::Release);
             r.fill_at(Wake::Device, at).unwrap();
             for h in 0..3u64 {
                 arrive(
@@ -2650,6 +2720,7 @@ mod tests {
         let diag = &r.ctx.stats.diag;
         assert_eq!(diag.render_preroll_frames.load(Ordering::Relaxed), 441);
         assert!(decay_frames(&r) > 0, "the decay ran");
+        assert!(r.settle_at.is_none() && !r.model_seen, "the settle armed");
         // 76, 226, 376 isolated; 381 makes three within 2 s (226, 376, 381) and switches.
         assert_eq!(missed_deadlines(&r), 4);
         assert!(r.legacy_checks, "the repeated misses switched");
@@ -3010,8 +3081,17 @@ mod tests {
         /// after it finds it still armed.
         skip_every: Option<u64>,
         /// Processing time of one 128-frame hop, us (300: passthrough; a model takes longer,
-        /// so a packet's hops reach ring B as a slower burst).
+        /// so a packet's hops reach ring B as a slower burst). With `devocal` it applies only
+        /// while the model runs, and hops take 300 us otherwise.
         hop_us: u64,
+        /// Devocal on at `.0` (with its pre-roll request) and off at `.1`, as the processor
+        /// does it: `WarmingUp` for 69 blocks, `FadingIn` for 7, `Devocal`; off: `FadingOut`
+        /// for 7 blocks, then `Passthrough`. A block's stage is published before the block
+        /// is pushed (as the processing thread does).
+        devocal: Option<(u64, u64)>,
+        /// This many extra frames reach ring B at this time: audio queued beyond what O2
+        /// needs (say, a pre-roll the decay could not skip).
+        extra: Option<(u64, usize)>,
     }
 
     impl EvCfg {
@@ -3023,6 +3103,8 @@ mod tests {
                 preroll_at: None,
                 skip_every: None,
                 hop_us: 300,
+                devocal: None,
+                extra: None,
             }
         }
     }
@@ -3044,6 +3126,10 @@ mod tests {
         /// Largest headroom seen, and when it was released (dropped to 0).
         max_headroom: usize,
         released_at: Option<u64>,
+        /// Wakes that skipped frames as a decay: time and ring B read position before it.
+        skips: Vec<(u64, u64)>,
+        /// Ring B position after the last block of the crossfade back to passthrough.
+        crossfade_end: Option<u64>,
     }
 
     impl EvSim {
@@ -3101,10 +3187,13 @@ mod tests {
         };
         let mut sim = EvSim::default();
         let wake = |r: &mut Renderer, w: Wake, t: u64, sim: &mut EvSim| {
-            let pads = pad_events(r);
+            let (pads, decay, read_pos) = (pad_events(r), decay_frames(r), r.read_pos);
             r.fill_at(w, T0 + t).unwrap();
             if pad_events(r) > pads {
                 sim.pads.push(t);
+            }
+            if decay_frames(r) > decay {
+                sim.skips.push((t, read_pos));
             }
             let h = r.headroom.total();
             if h > sim.max_headroom {
@@ -3120,12 +3209,36 @@ mod tests {
         let mut deadline: Option<u64> = None;
         let mut deadlines = 0u64;
         let mut next_sample = 0u64;
-        let mut preroll_at = cfg.preroll_at;
+        let mut preroll_at = cfg.preroll_at.or(cfg.devocal.map(|d| d.0));
+        let (mut on_at, mut off_at) = (cfg.devocal.map(|d| d.0), cfg.devocal.map(|d| d.1));
+        let mut extra_at = cfg.extra;
+        // The processor's stage and the blocks left in it; frames pushed to ring B.
+        let (mut stage, mut blocks_left, mut written) = (Stage::Passthrough, 0usize, 0u64);
+        let publish = |r: &Renderer, stage: Stage| {
+            r.ctx
+                .stats
+                .stage
+                .store(crate::audio::stage_code(stage), Ordering::Release);
+        };
+        if on_at == Some(0) {
+            // Devocal on before the stream's first fill (attach with devocal on).
+            on_at = None;
+            stage = Stage::WarmingUp;
+            blocks_left = 69;
+            publish(&r, stage);
+        }
         if preroll_at == Some(0) {
             // An "on" accepted before the stream's first fill (attach with devocal on).
             preroll_at = None;
             shared.preroll_request.store(true, Ordering::Release);
         }
+        let hop_time = |stage: Stage| {
+            if cfg.devocal.is_some() && !stage_runs_model(stage) {
+                300
+            } else {
+                hop_us
+            }
+        };
         while next_sample < cfg.len_us {
             let candidates = [
                 Some(next_read),
@@ -3134,6 +3247,9 @@ mod tests {
                 deadline,
                 Some(next_sample),
                 preroll_at,
+                on_at,
+                off_at,
+                extra_at.map(|e| e.0),
             ];
             let (which, t) = candidates
                 .iter()
@@ -3161,19 +3277,39 @@ mod tests {
                     shared.last_input_us.store(T0 + t, Ordering::Release);
                     if busy_until.is_none() && ring_a >= HOP {
                         ring_a -= HOP;
-                        busy_until = Some(t + hop_us);
+                        busy_until = Some(t + hop_time(stage));
                     }
                     k += 1;
                     next_capture = capture_at(k);
                 }
                 2 => {
+                    let crossfade = stage == Stage::FadingOut;
+                    if blocks_left > 0 {
+                        blocks_left -= 1;
+                        if blocks_left == 0 {
+                            stage = match stage {
+                                Stage::WarmingUp => {
+                                    blocks_left = 7;
+                                    Stage::FadingIn
+                                }
+                                Stage::FadingIn => Stage::Devocal,
+                                _ => Stage::Passthrough,
+                            };
+                        }
+                    }
+                    // The stage after this block is published before it is pushed.
+                    publish(&r, stage);
                     for _ in 0..HOP * 2 {
                         tx.push(0.5).unwrap();
+                    }
+                    written += HOP as u64;
+                    if crossfade {
+                        sim.crossfade_end = Some(written);
                     }
                     wake(&mut r, Wake::Data, t, &mut sim);
                     busy_until = if ring_a >= HOP {
                         ring_a -= HOP;
-                        Some(t + hop_us)
+                        Some(t + hop_time(stage))
                     } else {
                         None
                     };
@@ -3189,9 +3325,29 @@ mod tests {
                     sim.queue.push((t, q));
                     next_sample += SAMPLE_US;
                 }
-                _ => {
+                5 => {
                     preroll_at = None;
                     shared.preroll_request.store(true, Ordering::Release);
+                }
+                6 => {
+                    on_at = None;
+                    stage = Stage::WarmingUp;
+                    blocks_left = 69;
+                    publish(&r, stage);
+                }
+                7 => {
+                    off_at = None;
+                    stage = Stage::FadingOut;
+                    blocks_left = 7;
+                    publish(&r, stage);
+                }
+                _ => {
+                    let (_, n) = extra_at.take().unwrap();
+                    for _ in 0..n * 2 {
+                        tx.push(0.5).unwrap();
+                    }
+                    written += n as u64;
+                    wake(&mut r, Wake::Data, t, &mut sim);
                 }
             }
         }
@@ -3361,6 +3517,133 @@ mod tests {
                         "{what}: low {low}, never toggled {base_low}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Ruling 21 (b): an on -> off cycle (devocal on at the stream start or later, hops of 1
+    /// or 2 ms while the model runs, off 2 s in) leaves the queue within one hop of the
+    /// never-toggled queue, in every capture phase, with no starved read, no pad after the
+    /// stream start and no underrun.
+    #[test]
+    fn o2_devocal_off_returns_to_the_never_toggled_queue() {
+        for hop_us in [1_000, 2_000] {
+            for phase in (0..10_000).step_by(500) {
+                let base = simulate_events(EvCfg::new(phase, 4 * SEC));
+                let base_low = base.low(7 * SEC / 2, 4 * SEC);
+                for on in [0, SEC / 2] {
+                    let s = simulate_events(EvCfg {
+                        hop_us,
+                        devocal: Some((on, 2 * SEC)),
+                        ..EvCfg::new(phase, 4 * SEC)
+                    });
+                    let low = s.low(7 * SEC / 2, 4 * SEC);
+                    let what = format!("hop {hop_us} phase {phase} on at {on}");
+                    eprintln!(
+                        "{what}: decay {} skips {:?} low {low} never toggled {base_low} (+{}) \
+                         pads {:?}",
+                        s.decay,
+                        s.skips,
+                        low as i64 - base_low as i64,
+                        s.pads
+                    );
+                    assert!(s.starved.is_empty(), "{what}");
+                    assert_eq!(s.pads_after(50 * MS), 0, "{what}: {:?}", s.pads);
+                    assert_eq!(s.underruns, 0, "{what}");
+                    assert!(
+                        (base_low..=base_low + 128).contains(&low),
+                        "{what}: low {low}, never toggled {base_low}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Ruling 21 (b): audio devocal left queued above the target (here 300 frames reaching
+    /// ring B during devocal, as a pre-roll the decay could not skip would) is released once
+    /// devocal is off: through the decay path (low point at the checks, quiet spot or 1 s,
+    /// fade out, skip, fade in), only after the crossfade back to the passthrough has left
+    /// ring B, back to within one hop of the never-toggled queue, in every capture phase,
+    /// with no starved read, pad or underrun.
+    #[test]
+    fn o2_devocal_off_releases_what_devocal_left_queued_after_the_crossfade() {
+        const OFF: u64 = 2 * SEC;
+        for hop_us in [1_000, 2_000] {
+            for phase in (0..10_000).step_by(500) {
+                let base = simulate_events(EvCfg::new(phase, 4 * SEC));
+                let base_low = base.low(7 * SEC / 2, 4 * SEC);
+                let s = simulate_events(EvCfg {
+                    hop_us,
+                    devocal: Some((0, OFF)),
+                    extra: Some((13 * SEC / 10, 300)),
+                    ..EvCfg::new(phase, 4 * SEC)
+                });
+                let (during, low) = (s.low(16 * SEC / 10, OFF), s.low(7 * SEC / 2, 4 * SEC));
+                let what = format!("hop {hop_us} phase {phase}");
+                let fade_end = s.crossfade_end.expect("a crossfade");
+                let after_off: Vec<_> = s.skips.iter().filter(|&&(t, _)| t >= OFF).collect();
+                eprintln!(
+                    "{what}: decay {} skips {:?} crossfade ends at {fade_end} low during \
+                     devocal {during} after {low} never toggled {base_low} (+{}) pads {:?}",
+                    s.decay,
+                    s.skips,
+                    low as i64 - base_low as i64,
+                    s.pads
+                );
+                assert!(during > base_low + 128, "{what}: queued during devocal");
+                assert!(!after_off.is_empty(), "{what}: released after the off");
+                for &&(t, read_pos) in &after_off {
+                    assert!(
+                        read_pos >= fade_end,
+                        "{what}: skip at {t} from {read_pos}, crossfade ends at {fade_end}"
+                    );
+                }
+                assert!(s.starved.is_empty(), "{what}");
+                assert_eq!(s.pads_after(50 * MS), 0, "{what}: {:?}", s.pads);
+                assert_eq!(s.underruns, 0, "{what}");
+                assert!(
+                    (base_low..=base_low + 128).contains(&low),
+                    "{what}: low {low}, never toggled {base_low}"
+                );
+            }
+        }
+    }
+
+    /// Ruling 21 (b): nothing is skipped while the crossfade back to the passthrough is
+    /// running. Devocal goes off 10 ms before the pre-roll's decay would be forced (1 s after
+    /// its release), so that decision falls inside the crossfade: it waits until the
+    /// crossfade has left ring B (and then observes the passthrough's lows afresh), in every
+    /// capture phase, with no starved read, pad or underrun.
+    #[test]
+    fn o2_no_decay_skips_while_the_crossfade_back_runs() {
+        for hop_us in [1_000, 2_000] {
+            for phase in (0..10_000).step_by(500) {
+                let cfg = EvCfg {
+                    hop_us,
+                    devocal: Some((0, 10 * SEC)),
+                    ..EvCfg::new(phase, 3 * SEC)
+                };
+                let released = simulate_events(cfg).released_at.expect("released");
+                let off = released + SEC - 10 * MS;
+                let s = simulate_events(EvCfg {
+                    devocal: Some((0, off)),
+                    ..cfg
+                });
+                let what = format!("hop {hop_us} phase {phase} off at {off}");
+                let fade_end = s.crossfade_end.expect("a crossfade");
+                eprintln!(
+                    "{what}: decay {} skips {:?} crossfade ends at {fade_end} pads {:?}",
+                    s.decay, s.skips, s.pads
+                );
+                for &(t, read_pos) in s.skips.iter().filter(|&&(t, _)| t >= off) {
+                    assert!(
+                        read_pos >= fade_end,
+                        "{what}: skip at {t} from {read_pos}, crossfade ends at {fade_end}"
+                    );
+                }
+                assert!(s.starved.is_empty(), "{what}");
+                assert_eq!(s.pads_after(50 * MS), 0, "{what}: {:?}", s.pads);
+                assert_eq!(s.underruns, 0, "{what}");
             }
         }
     }

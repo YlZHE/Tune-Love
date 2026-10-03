@@ -1,6 +1,7 @@
 //! Processing thread: takes hop-sized blocks from ring A, runs the `Processor`, times each
-//! block for the `LoadMonitor`, and pushes the output to ring B. Control messages are applied
-//! here, between blocks (caller obligation 4).
+//! block for the `LoadMonitor`, and pushes the output to ring B, signalling
+//! `Shared::render_wake` after each block so the render thread writes it on arrival (O2).
+//! Control messages are applied here, between blocks (caller obligation 4).
 //!
 //! Positions: `in_pos` counts frames taken from ring A (processed or discarded), `out_pos`
 //! frames pushed to ring B. Input frame `x` of a block leaves the processor `latency` frames
@@ -207,6 +208,8 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
         if ctx.output.slots() >= st.hop * 2 {
             let _ = ctx.output.push_entire_slice(&st.out_block);
             st.out_pos += st.hop as u64;
+            // O2: the render thread writes the block to the device on arrival.
+            ctx.shared.render_wake.set();
         } else {
             // Ring B full (render stalled): drop the block, fade around the jump.
             ctx.stats
@@ -468,6 +471,7 @@ mod tests {
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
             wake: OwnedEvent::new().unwrap(),
+            render_wake: OwnedEvent::new().unwrap(),
         });
         let ctx = ProcessingCtx {
             processor,
@@ -488,6 +492,61 @@ mod tests {
         shared.stop.store(true, Ordering::Release);
         shared.wake.set();
         thread.join().unwrap()
+    }
+
+    /// O2: every block pushed to ring B wakes the render thread (no audio device: rings and
+    /// kernel events only).
+    #[test]
+    fn processing_wakes_render_after_each_pushed_block() {
+        use super::super::OwnedEvent;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (mut in_tx, in_rx) = rtrb::RingBuffer::<f32>::new(HOP * 2 * 4);
+        let (_mk_tx, mk_rx) = rtrb::RingBuffer::<InputMarker>::new(8);
+        let (out_tx, out_rx) = rtrb::RingBuffer::<f32>::new(HOP * 2 * 4);
+        let (omk_tx, _omk_rx) = rtrb::RingBuffer::<u64>::new(8);
+        let (_ctl_tx, ctl_rx) = rtrb::RingBuffer::<ProcCommand>::new(8);
+        let shared = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            start_us: now_us(),
+            run_id: 1,
+            last_input_us: AtomicU64::new(0),
+            capture_packet_frames: AtomicU32::new(0),
+            in_ring_frames: AtomicU32::new(0),
+            proc_latency_frames: AtomicU32::new(0),
+            proc_hop: AtomicU32::new(0),
+            output_failed: AtomicBool::new(false),
+            preroll_request: AtomicBool::new(false),
+            underrun_snapshot: AtomicU64::new(0),
+            wake: OwnedEvent::new().unwrap(),
+            render_wake: OwnedEvent::new().unwrap(),
+        });
+        let ctx = ProcessingCtx {
+            processor: Processor::new(None),
+            input: in_rx,
+            in_markers: mk_rx,
+            output: out_tx,
+            out_markers: omk_tx,
+            control: ctl_rx,
+            shared: shared.clone(),
+            stats: Arc::new(AudioStats::default()),
+        };
+        let thread = std::thread::spawn(move || run(ctx));
+        assert!(
+            !shared.render_wake.wait(0),
+            "not signalled before any block"
+        );
+        in_tx.push_entire_slice(&[0.25f32; 2 * HOP * 2]).unwrap();
+        shared.wake.set();
+        assert!(shared.render_wake.wait(100), "woken by the pushed blocks");
+        // Both blocks reach ring B.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        while out_rx.slots() < 2 * HOP * 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(out_rx.slots(), 2 * HOP * 2);
+        shared.stop.store(true, Ordering::Release);
+        shared.wake.set();
+        thread.join().unwrap();
     }
 
     #[test]

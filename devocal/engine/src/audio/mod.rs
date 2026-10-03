@@ -45,8 +45,9 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
-    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, SetEvent,
-    WaitForSingleObject,
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
+    CreateWaitableTimerExW, SetEvent, SetWaitableTimer, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
 };
 
 use devocal_core::protocol::FallbackReason;
@@ -131,7 +132,12 @@ pub struct DiagCounters {
     pub proc_blocks: AtomicU64,
     pub proc_resets: AtomicU64,
     pub proc_ring_b_drops: AtomicU64,
+    /// Every render wake (device, data, deadline and timeout alike).
     pub render_wakes: AtomicU64,
+    /// Render wakes because the processing thread pushed a block to ring B (O2).
+    pub render_data_wakes: AtomicU64,
+    /// Render wakes at the read deadline, just before the device reads (O2).
+    pub render_deadline_wakes: AtomicU64,
     pub render_real_frames: AtomicU64,
     pub render_pad_events: AtomicU64,
     pub render_pad_frames: AtomicU64,
@@ -215,6 +221,8 @@ pub(crate) fn diag_loop_with(
             &d.proc_resets,
             &d.proc_ring_b_drops,
             &d.render_wakes,
+            &d.render_data_wakes,
+            &d.render_deadline_wakes,
             &d.render_real_frames,
             &d.render_pad_events,
             &d.render_pad_frames,
@@ -236,6 +244,8 @@ pub(crate) fn diag_loop_with(
         "proc_resets",
         "proc_b_drops",
         "r_wakes",
+        "r_data",
+        "r_deadline",
         "r_real",
         "r_pad_ev",
         "r_pad_fr",
@@ -255,8 +265,8 @@ pub(crate) fn diag_loop_with(
         "devocal diag: run={run} start t={:.6} unix_ms={unix_ms}",
         last_us as f64 / 1e6
     ));
-    let line = |last: &[u64; 17], now: [u64; 17], t_us: u64, span_us: u64, partial: bool| {
-        let mut fields = [("", 0u64); 17];
+    let line = |last: &[u64; 19], now: [u64; 19], t_us: u64, span_us: u64, partial: bool| {
+        let mut fields = [("", 0u64); 19];
         for (i, f) in fields.iter_mut().enumerate() {
             *f = (names[i], now[i].wrapping_sub(last[i]));
         }
@@ -525,6 +535,9 @@ pub(crate) struct Shared {
     pub underrun_snapshot: AtomicU64,
     /// Wakes the processing thread (capture pushed data, control message, stop).
     pub wake: OwnedEvent,
+    /// Wakes the render thread: set by the processing thread after every block it pushes to
+    /// ring B, so the block is written to the device on arrival (O2).
+    pub render_wake: OwnedEvent,
 }
 
 pub struct AudioHandle {
@@ -581,6 +594,7 @@ impl AudioHandle {
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
             wake: OwnedEvent::new()?,
+            render_wake: OwnedEvent::new()?,
         });
 
         let (in_tx, in_rx) = RingBuffer::<f32>::new(RING_FRAMES * 2);
@@ -980,6 +994,50 @@ impl Drop for OwnedEvent {
     }
 }
 
+/// One-shot high-resolution waitable timer (auto-reset), closed on drop. The render thread
+/// arms it after each device wake for the read deadline (O2). A kernel timer, not an audio
+/// device.
+pub(crate) struct HiResTimer(HANDLE);
+
+// SAFETY: a timer handle may be set and waited on from any thread.
+unsafe impl Send for HiResTimer {}
+unsafe impl Sync for HiResTimer {}
+
+impl HiResTimer {
+    /// `None` where high-resolution timers are unavailable (before Windows 10 1803); the
+    /// renderer then pads on device wakes as before.
+    pub fn new() -> Option<Self> {
+        unsafe {
+            CreateWaitableTimerExW(
+                None,
+                PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+        }
+        .ok()
+        .map(HiResTimer)
+    }
+
+    /// Signals once, `us` microseconds from now (re-arming replaces a pending due time and
+    /// resets the signal). Never allocates or blocks.
+    pub fn arm_in_us(&self, us: u64) {
+        // Relative due time: negative, in 100 ns units.
+        let due = -(us.min(i64::MAX as u64 / 10) as i64 * 10);
+        let _ = unsafe { SetWaitableTimer(self.0, &due, 0, None, None, false) };
+    }
+
+    pub fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for HiResTimer {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,6 +1056,7 @@ mod tests {
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
             wake: OwnedEvent::new().unwrap(),
+            render_wake: OwnedEvent::new().unwrap(),
         }
     }
 
@@ -1111,6 +1170,22 @@ mod tests {
         assert_eq!(edge_fade_frames(), 221);
     }
 
+    /// O2's deadline timer is a kernel timer (not an audio device). Systems without
+    /// high-resolution waitable timers (before Windows 10 1803) skip the check.
+    #[test]
+    fn hires_timer_fires_after_its_delay() {
+        let Some(timer) = HiResTimer::new() else {
+            eprintln!("skipped: CreateWaitableTimerExW(HIGH_RESOLUTION) failed on this system");
+            return;
+        };
+        let t0 = now_us();
+        timer.arm_in_us(2_000);
+        let r = unsafe { WaitForSingleObject(timer.raw(), 50) };
+        let elapsed = now_us() - t0;
+        assert_eq!(r, WAIT_OBJECT_0, "signalled within 50 ms");
+        assert!(elapsed >= 1_500, "{elapsed} us");
+    }
+
     /// Ruling 5: the per-block helpers used by the audio threads never allocate.
     #[test]
     fn per_block_helpers_do_not_allocate() {
@@ -1126,6 +1201,8 @@ mod tests {
         let mut power = 0.0f64;
         let mut block = vec![0.25f32; 441 * 2];
         let mut loud = vec![3.0f32; 441 * 2];
+        let timer = HiResTimer::new();
+        let event = OwnedEvent::new().unwrap();
         let before = alloc_count::this_thread();
         for i in 0..50u64 {
             cond.condition(&mut loud, 1.0, &stats, &follow, |_| {});
@@ -1157,6 +1234,13 @@ mod tests {
             power = render::track_power(power, &block);
             let _ = is_backlogged(true, 128, 128);
             let _ = capture::guard_block(&mut block);
+            let wake = render::wake_from_wait(i as u32 % 4, true);
+            let deadline = render::deadline_mode(timer.is_some(), 441);
+            let _ = render::plan_fill(wake, deadline, i as usize, 300, 4_000, 441, 569);
+            if let Some(t) = &timer {
+                t.arm_in_us(8_500);
+            }
+            event.set();
         }
         assert_eq!(alloc_count::this_thread() - before, 0);
         assert!(power.is_finite());

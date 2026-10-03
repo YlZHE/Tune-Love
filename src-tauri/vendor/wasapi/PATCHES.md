@@ -14,3 +14,7 @@ Activation waiting semantics are unchanged and remain synchronous/unbounded.
 Added `AudioSessionControl::set_display_name` (IAudioSessionControl::SetDisplayName with
 GUID_NULL as the event context), so devocal-engine can name its render session in the
 volume mixer. Nothing else calls it.
+
+Added `Handle::as_raw` (returns the event `HANDLE`, which the `Handle` still owns and closes),
+so devocal-engine's render thread can wait on the device event together with its own events
+(`WaitForMultipleObjects`). Additive only: no existing item changes; nothing else calls it.

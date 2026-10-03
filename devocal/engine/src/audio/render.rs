@@ -5,19 +5,30 @@
 //! - Otherwise: wasapi `EventsShared { autoconvert: true, buffer_duration_hns: 0 }`.
 //!
 //! Queue target = one device period + one hop (+ jitter headroom), device padding plus ring B.
-//! Each wake fills the device up to the target; if that leaves less than one period queued the
-//! device would starve, so the shortfall up to the target is written as silence: the real
-//! frames before it fade out (`fade_edges`), the audio after it fades in, and one underrun is
-//! counted per gap if input kept flowing (`UnderrunJudge`). Ruling 18: an underrun while the
-//! processing thread was not behind is jitter and raises the target by one hop (at most one
-//! capture packet in total); when a user "on" is accepted the output pre-rolls once by about
-//! one capture packet of silence. Both are released again (O1, [`Headroom`]): the pre-roll
-//! once the model has warmed up, the jitter part after 5 s without an underrun (backing off
-//! up to 60 s while jitter keeps returning); the released audio is skipped at a quiet spot
-//! (at most 1 s later), and not at all if nothing extra is queued (paused). A queue more
-//! than 20 ms over target for a whole second is trimmed back. Both skips fade out, skip and
-//! fade in. Output gain is ramped across each write; every sample is clamped to
-//! [-1, 1] (non-finite -> 0) before it reaches the device.
+//! The thread waits on the device event, ring B's data event (`Shared::render_wake`, set by
+//! the processing thread after every block) and, in deadline mode, a high-resolution timer
+//! ([`Wake`]). Every wake writes the ring B frames it has, up to the target ([`plan_fill`]),
+//! so a block reaches the device as soon as it is processed (O2). Silence is padded only at
+//! a check: the read deadline [`DEADLINE_GUARD_US`] before the device's next read (the timer,
+//! armed on each device wake), or a 20 ms wait with no wake at all. Without a timer, or with a
+//! period of at most two guards, every device wake is a check, as before O2. If a check finds
+//! less than one period queued the device would starve at its next read, so the shortfall up
+//! to the target is written as silence: the real frames before it fade out (`fade_edges`),
+//! the audio after it fades in, and one underrun is counted per gap if input kept flowing
+//! (`UnderrunJudge`; a gap ends once a check finds no shortfall after real frames were
+//! written); a short queue at any other wake is not a starvation. Trim watches the queue,
+//! and the latency estimate is published, on device and timeout wakes only. Pre-roll,
+//! headroom release and decay, fades and the underrun judge run on every wake.
+//!
+//! Ruling 18: an underrun while the processing thread was not behind is jitter and raises the
+//! target by one hop (at most one capture packet in total); when a user "on" is accepted the
+//! output pre-rolls once by about one capture packet of silence. Both are released again (O1,
+//! [`Headroom`]): the pre-roll once the model has warmed up, the jitter part after 5 s
+//! without an underrun (backing off up to 60 s while jitter keeps returning); the released
+//! audio is skipped at a quiet spot (at most 1 s later), and not at all if nothing extra is
+//! queued (paused). A queue more than 20 ms over target for a whole second is trimmed back.
+//! Both skips fade out, skip and fade in. Output gain is ramped across each write; every
+//! sample is clamped to [-1, 1] (non-finite -> 0) before it reaches the device.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -29,16 +40,18 @@ use wasapi::{
     AudioClient, AudioRenderClient, Device, Direction, Handle, SampleType, StreamMode, WaveFormat,
 };
 use windows::core::{GUID, HSTRING};
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     IAudioClient3, IAudioRenderClient, IAudioSessionControl, IMMDevice,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
 };
 use windows::Win32::System::Com::CLSCTX_ALL;
+use windows::Win32::System::Threading::WaitForMultipleObjects;
 
 use super::endpoint::{find_render_device, low_latency_eligible, read_mix_format, CoTaskFormat};
 use super::{
     count_underrun, edge_fade_frames, is_backlogged, now_us, pack_starvation, render_open_line,
-    stage_from_code, stage_runs_model, AudioStats, ComGuard, FadeIn, Mmcss, OwnedEvent,
+    stage_from_code, stage_runs_model, AudioStats, ComGuard, FadeIn, HiResTimer, Mmcss, OwnedEvent,
     RenderCommand, Shared, SharedGains, Starvation, INPUT_FLOWING_US, MAX_EXTRA_HEADROOM_FRAMES,
     PREROLL_FRAMES,
 };
@@ -68,6 +81,87 @@ fn note_display_name(result: Result<(), String>, logged: &AtomicBool) -> bool {
     }
 }
 const FAILED_POLL: Duration = Duration::from_millis(10);
+
+/// The read deadline: this long before the device's next read (one period after its wake)
+/// the queue is checked and, if short, padded (O2).
+pub const DEADLINE_GUARD_US: u64 = 1_500;
+
+/// Why the render thread woke.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Wake {
+    /// The device event: the device has just read a period.
+    Device,
+    /// The processing thread pushed a block to ring B.
+    Data,
+    /// The read deadline timer.
+    Deadline,
+    /// Nothing for 20 ms (or the wait failed).
+    Timeout,
+}
+
+/// What one wake writes: `real` frames from ring B, then `silence` frames of padding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct FillPlan {
+    pub real: usize,
+    pub silence: usize,
+}
+
+/// One wake's write, with the queue counted as device `padding` plus ring B (`avail`
+/// frames): real frames up to the `target`, as many as fit and are available. Padding is
+/// checked only at the read deadline in deadline mode, at a timeout, and (outside deadline
+/// mode) at every device wake; a check that finds less than one `period` queued after the
+/// real frames pads with silence up to the target (or the free `room`). Pure.
+pub(crate) fn plan_fill(
+    wake: Wake,
+    deadline_mode: bool,
+    padding: usize,
+    avail: usize,
+    room: usize,
+    period: usize,
+    target: usize,
+) -> FillPlan {
+    let real = target.saturating_sub(padding).min(room).min(avail);
+    let silence = if checks_padding(wake, deadline_mode) && padding + real < period {
+        target.min(padding + room).saturating_sub(padding + real)
+    } else {
+        0
+    };
+    FillPlan { real, silence }
+}
+
+/// Whether a `wake` checks the queue for a shortfall (and pads it): the read deadline in
+/// deadline mode, every device wake outside it, and a timeout in both.
+fn checks_padding(wake: Wake, deadline_mode: bool) -> bool {
+    match wake {
+        Wake::Deadline => deadline_mode,
+        Wake::Device => !deadline_mode,
+        Wake::Timeout => true,
+        Wake::Data => false,
+    }
+}
+
+/// Microseconds of `frames` at the engine rate.
+fn frames_us(frames: usize) -> u64 {
+    frames as u64 * 1_000_000 / u64::from(SAMPLE_RATE)
+}
+
+/// Deadline mode needs the timer and a period longer than two guards (else the deadline
+/// would come too soon after the device wake to be worth a separate check).
+pub(crate) fn deadline_mode(has_timer: bool, period_frames: usize) -> bool {
+    has_timer && frames_us(period_frames) > 2 * DEADLINE_GUARD_US
+}
+
+/// Maps a `WaitForMultipleObjects` result over [device event, data event, timer?] to a
+/// [`Wake`]; the timer is waited on only with `has_timer`. Anything else (timeout, failure)
+/// is a [`Wake::Timeout`].
+pub(crate) fn wake_from_wait(result: u32, has_timer: bool) -> Wake {
+    match result.wrapping_sub(WAIT_OBJECT_0.0) {
+        0 => Wake::Device,
+        1 => Wake::Data,
+        2 if has_timer => Wake::Deadline,
+        _ => Wake::Timeout,
+    }
+}
 
 /// Decides when a persistently over-full queue is trimmed. Pure; times in microseconds.
 pub struct TrimPolicy {
@@ -444,8 +538,8 @@ pub(crate) trait Sink {
     fn period_frames(&self) -> usize;
     fn buffer_frames(&self) -> usize;
     fn padding(&self) -> Result<usize, String>;
-    /// Waits for the device event (bounded).
-    fn wait(&self, timeout_ms: u32);
+    /// The device event (signalled after each device read); owned by the sink.
+    fn event(&self) -> HANDLE;
     /// Writes interleaved stereo; `stereo.len() / 2` frames must fit the free space.
     fn write(&mut self, stereo: &[f32]) -> Result<(), String>;
     fn describe(&self) -> &'static str;
@@ -541,8 +635,8 @@ impl Sink for LowLatencySink {
             .map(|p| p as usize)
             .map_err(|e| format!("render padding: {e}"))
     }
-    fn wait(&self, timeout_ms: u32) {
-        self.event.wait(timeout_ms);
+    fn event(&self) -> HANDLE {
+        self.event.raw()
     }
     fn write(&mut self, stereo: &[f32]) -> Result<(), String> {
         let frames = stereo.len() / 2;
@@ -655,8 +749,8 @@ impl Sink for WasapiSink {
             .map(|p| p as usize)
             .map_err(|e| format!("render padding: {e}"))
     }
-    fn wait(&self, timeout_ms: u32) {
-        let _ = self.event.wait_for_event(timeout_ms);
+    fn event(&self) -> HANDLE {
+        self.event.as_raw()
     }
     fn write(&mut self, stereo: &[f32]) -> Result<(), String> {
         let frames = stereo.len() / 2;
@@ -736,7 +830,12 @@ struct Renderer {
     trim: TrimPolicy,
     drop_pending: usize,
     /// Fed without a shortfall since the last gap; a starvation is judged only when primed.
+    /// Set when a check wake ([`checks_padding`]) finds no shortfall after real frames were
+    /// written since the gap (`fed`), on that wake or an earlier one (O2 writes most real
+    /// frames on data wakes, which never check).
     primed: bool,
+    /// Real frames written since the last gap.
+    fed: bool,
     underruns: UnderrunJudge,
     /// Jitter and pre-roll headroom on top of period + hop (ruling 18, O1).
     headroom: Headroom,
@@ -756,6 +855,10 @@ struct Renderer {
     /// Last frame written (before the output gain), for `decay_from`.
     last_frame: [f32; 2],
     last_gain: f32,
+    /// The read deadline timer (`None` if the system has no high-resolution timers).
+    timer: Option<HiResTimer>,
+    /// Pad only at the read deadline (O2); set each wait from the timer and the period.
+    deadline_mode: bool,
 }
 
 impl Renderer {
@@ -772,6 +875,7 @@ impl Renderer {
             trim: TrimPolicy::new(0),
             drop_pending: 0,
             primed: false,
+            fed: false,
             underruns: UnderrunJudge::new(),
             headroom: Headroom::new(),
             decay_drop: 0,
@@ -783,10 +887,18 @@ impl Renderer {
             preroll_fade: false,
             last_frame: [0.0; 2],
             last_gain: 0.0,
+            timer: None,
+            deadline_mode: false,
         }
     }
 
     fn run(&mut self) {
+        self.timer = HiResTimer::new();
+        if self.timer.is_none() {
+            eprintln!(
+                "devocal audio: high-resolution timer unavailable; render pads on device wakes"
+            );
+        }
         self.after_open();
         while !self.ctx.shared.stop.load(Ordering::Acquire) {
             while let Ok(cmd) = self.ctx.control.pop() {
@@ -801,7 +913,7 @@ impl Renderer {
                 continue;
             }
             match self.fill() {
-                Ok(padding) => self.publish(padding),
+                Ok(()) => {}
                 Err(e) => {
                     eprintln!("devocal audio: output failed: {e}");
                     self.sink = None;
@@ -862,6 +974,7 @@ impl Renderer {
         self.trim.reset();
         self.drop_pending = 0;
         self.primed = false;
+        self.fed = false;
         self.underruns.reset();
         // A new stream starts without learned headroom (which includes any earlier pre-roll),
         // without a pre-roll in progress and without a pending decay; a pending request is
@@ -943,25 +1056,50 @@ impl Renderer {
         self.read_pos += n as u64;
     }
 
-    /// One wake: waits for the device event, then [`Self::fill_at`] the current time.
-    fn fill(&mut self) -> Result<usize, String> {
+    /// One wake: waits (at most [`WAIT_MS`]) for the device event, ring B's data event and,
+    /// in deadline mode, the deadline timer; re-arms the timer after a device wake; then
+    /// [`Self::fill_at`] the current time. The latency estimate is published on device and
+    /// timeout wakes only.
+    fn fill(&mut self) -> Result<(), String> {
         let Some(sink) = self.sink.as_ref() else {
-            return Ok(0);
+            return Ok(());
         };
-        sink.wait(WAIT_MS);
-        self.fill_at(now_us())
+        let period = sink.period_frames();
+        self.deadline_mode = deadline_mode(self.timer.is_some(), period);
+        let timer = self
+            .timer
+            .as_ref()
+            .map_or(HANDLE::default(), HiResTimer::raw);
+        let handles = [sink.event(), self.ctx.shared.render_wake.raw(), timer];
+        let n = if self.deadline_mode { 3 } else { 2 };
+        // SAFETY: the handles are owned by the sink, `Shared` and `self.timer`, all alive.
+        let result = unsafe { WaitForMultipleObjects(&handles[..n], false, WAIT_MS) };
+        let wake = wake_from_wait(result.0, self.deadline_mode);
+        if wake == Wake::Device && self.deadline_mode {
+            if let Some(t) = &self.timer {
+                t.arm_in_us(frames_us(period).saturating_sub(DEADLINE_GUARD_US));
+            }
+        }
+        let padding = self.fill_at(wake, now_us())?;
+        if matches!(wake, Wake::Device | Wake::Timeout) {
+            self.publish(padding);
+        }
+        Ok(())
     }
 
-    /// Fills the device at `now` (microseconds); returns the device padding after the write.
-    fn fill_at(&mut self, now: u64) -> Result<usize, String> {
+    /// Fills the device at `now` (microseconds) for a `wake`; returns the device padding
+    /// after the write.
+    fn fill_at(&mut self, wake: Wake, now: u64) -> Result<usize, String> {
         let Some(sink) = self.sink.as_ref() else {
             return Ok(0);
         };
-        self.ctx
-            .stats
-            .diag
-            .render_wakes
-            .fetch_add(1, Ordering::Relaxed);
+        let diag = &self.ctx.stats.diag;
+        diag.render_wakes.fetch_add(1, Ordering::Relaxed);
+        match wake {
+            Wake::Data => diag.render_data_wakes.fetch_add(1, Ordering::Relaxed),
+            Wake::Deadline => diag.render_deadline_wakes.fetch_add(1, Ordering::Relaxed),
+            Wake::Device | Wake::Timeout => 0,
+        };
         let padding = sink.padding()?;
         let period = sink.period_frames();
         let buffer = sink.buffer_frames().min(self.staging.len() / 2);
@@ -1030,14 +1168,22 @@ impl Renderer {
         let target = (period + hop + self.headroom.total()).min(buffer);
         self.trim.set_target(target);
 
-        if let Some(d) = self.trim.observe(avail + padding, now) {
-            self.drop_pending = d;
-            self.drop_is_decay = false;
+        // Trim watches the queue right after a device read (and at a timeout); a data wake
+        // sees ring B at the peak of a burst.
+        if matches!(wake, Wake::Device | Wake::Timeout) {
+            if let Some(d) = self.trim.observe(avail + padding, now) {
+                self.drop_pending = d;
+                self.drop_is_decay = false;
+            }
         }
         let room = buffer.saturating_sub(padding);
         let need = target.saturating_sub(padding).min(room);
-        let must = period.saturating_sub(padding).min(room);
+        let check = checks_padding(wake, self.deadline_mode);
         if need == 0 {
+            // A check with the device already at the target finds no shortfall.
+            if check && self.fed {
+                self.primed = true;
+            }
             return Ok(padding);
         }
 
@@ -1123,24 +1269,37 @@ impl Renderer {
             self.fade_in.start(0);
             w = k;
         }
-        let real = need.saturating_sub(w).min(avail);
+        // The frames already staged (a trim or decay fade-out) count as real. A decay fade
+        // can exceed the plan (it is bounded by `room`); then nothing more is taken and, the
+        // queue being at the target, nothing is padded.
+        let plan = plan_fill(
+            wake,
+            self.deadline_mode,
+            padding,
+            w + avail,
+            room,
+            period,
+            target,
+        );
+        let real = plan.real.saturating_sub(w);
         self.take(w, real);
         w += real;
         let diag = &self.ctx.stats.diag;
         diag.render_real_frames
             .fetch_add(real as u64, Ordering::Relaxed);
 
-        if w < must {
+        let silence = plan.silence.min(room.saturating_sub(w));
+        if silence > 0 {
             diag.render_pad_events.fetch_add(1, Ordering::Relaxed);
             diag.render_pad_frames
-                .fetch_add((need - w) as u64, Ordering::Relaxed);
-            // The device would starve before the next wake: pad with silence up to the
-            // target (ruling 18), not just one period.
+                .fetch_add(silence as u64, Ordering::Relaxed);
+            // A check found the device would starve at its next read: pad with silence up to
+            // the target (ruling 18), not just one period.
             let k = w.min(self.fade_frames);
             fade_edges(&mut self.staging[(w - k) * 2..w * 2], false, true, k);
-            self.staging[w * 2..need * 2].fill(0.0);
+            self.staging[w * 2..(w + silence) * 2].fill(0.0);
             if w == 0 {
-                let f = self.fade_frames.min(need);
+                let f = self.fade_frames.min(silence);
                 decay_from(self.last_frame, &mut self.staging[..f * 2]);
             }
             if self.primed {
@@ -1153,10 +1312,14 @@ impl Renderer {
                 self.underruns.starved(last_input, now, seen);
             }
             self.primed = false;
+            self.fed = false;
             self.fade_in.start(0);
-            w = need;
-        } else if real > 0 {
-            self.primed = true;
+            w += silence;
+        } else {
+            self.fed |= real > 0;
+            if check && self.fed {
+                self.primed = true;
+            }
         }
         self.write_out(w, padding)
     }
@@ -1258,6 +1421,8 @@ mod tests {
     struct FakeSink {
         padding: Arc<AtomicUsize>,
         out: Arc<Mutex<Vec<f32>>>,
+        /// Stands in for the device event (a plain kernel event, no audio device).
+        event: Arc<OwnedEvent>,
     }
 
     impl FakeSink {
@@ -1265,6 +1430,7 @@ mod tests {
             Self {
                 padding: Arc::new(AtomicUsize::new(padding)),
                 out: Arc::new(Mutex::new(Vec::new())),
+                event: Arc::new(OwnedEvent::new().unwrap()),
             }
         }
     }
@@ -1279,7 +1445,9 @@ mod tests {
         fn padding(&self) -> Result<usize, String> {
             Ok(self.padding.load(Ordering::Relaxed))
         }
-        fn wait(&self, _timeout_ms: u32) {}
+        fn event(&self) -> HANDLE {
+            self.event.raw()
+        }
         fn write(&mut self, stereo: &[f32]) -> Result<(), String> {
             self.padding.fetch_add(stereo.len() / 2, Ordering::Relaxed);
             self.out.lock().unwrap().extend_from_slice(stereo);
@@ -1311,6 +1479,7 @@ mod tests {
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
             wake: OwnedEvent::new().unwrap(),
+            render_wake: OwnedEvent::new().unwrap(),
         });
         let mut r = Renderer::new(RenderCtx {
             endpoint: None,
@@ -1529,9 +1698,9 @@ mod tests {
 
     /// Runs `ms` ms from `t0` in 1 ms steps. Each step `feed(i)` gives `(frames, value)`:
     /// that many frames of `value` arrive in ring B (marked as fresh input, so underruns are
-    /// judged); then the device plays one 441-frame period every 10 ms; then `fill_at` runs,
-    /// every step or, with `period_wakes`, only on the device period (as the real event
-    /// wakes it). Calls `each(r, now, first)` after every fill, `first` being the index in
+    /// judged); then the device plays one 441-frame period every 10 ms; then `fill_at` runs
+    /// as a device wake (the renderer is not in deadline mode, so it pads as before), every
+    /// step or, with `period_wakes`, only on the device period (as the real event wakes it). Calls `each(r, now, first)` after every fill, `first` being the index in
     /// `out` of the first sample that fill wrote.
     #[allow(clippy::too_many_arguments)]
     fn simulate(
@@ -1562,7 +1731,7 @@ mod tests {
                 continue;
             }
             let first = out.lock().unwrap().len();
-            r.fill_at(now).unwrap();
+            r.fill_at(Wake::Device, now).unwrap();
             each(r, now, first);
         }
     }
@@ -1804,7 +1973,7 @@ mod tests {
         r.decay_drop = 441;
         r.decay_since_us = t - 1_500 * MS;
         r.decay_low = 600;
-        r.fill_at(t).unwrap();
+        r.fill_at(Wake::Device, t).unwrap();
         assert_eq!(decay_frames(&r), 0);
         assert_eq!(r.decay_drop, 441, "kept pending");
         // Next wake: enough queued. The 31 spare frames go, behind a full 221-frame fade
@@ -1812,7 +1981,7 @@ mod tests {
         padding.store(500, Ordering::Relaxed);
         push(&mut tx, 400);
         let first = out.lock().unwrap().len();
-        r.fill_at(t + 10 * MS).unwrap();
+        r.fill_at(Wake::Device, t + 10 * MS).unwrap();
         assert_eq!(decay_frames(&r), 31);
         assert_eq!((r.decay_drop, r.decay_low), (0, usize::MAX));
         let o = out.lock().unwrap();
@@ -1827,9 +1996,427 @@ mod tests {
         r.decay_since_us = t - 2_000 * MS;
         r.decay_low = 600;
         assert!(r.ctx.input.slots() / 2 <= fade);
-        r.fill_at(t + 20 * MS).unwrap();
+        r.fill_at(Wake::Device, t + 20 * MS).unwrap();
         assert_eq!(decay_frames(&r), 31);
         assert_eq!(r.decay_drop, 0, "given up");
+    }
+
+    // ---- O2: write on arrival, pad only at the read deadline ----
+
+    /// `plan_fill` with the brief's fixed device: period 441, target 569 (441 + 128, no
+    /// headroom), room 4 000.
+    fn plan(wake: Wake, deadline: bool, padding: usize, avail: usize) -> FillPlan {
+        plan_fill(wake, deadline, padding, avail, 4_000, 441, 569)
+    }
+
+    #[test]
+    fn data_wake_writes_real_frames_only() {
+        assert_eq!(
+            plan(Wake::Data, true, 100, 300),
+            FillPlan {
+                real: 300,
+                silence: 0
+            }
+        );
+    }
+
+    #[test]
+    fn deadline_wake_pads_up_to_target_when_short() {
+        assert_eq!(
+            plan(Wake::Deadline, true, 100, 200),
+            FillPlan {
+                real: 200,
+                silence: 269
+            }
+        );
+    }
+
+    #[test]
+    fn device_wake_in_deadline_mode_never_pads() {
+        assert_eq!(
+            plan(Wake::Device, true, 0, 0),
+            FillPlan {
+                real: 0,
+                silence: 0
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_mode_pads_on_device_wake() {
+        assert_eq!(
+            plan(Wake::Device, false, 100, 200),
+            FillPlan {
+                real: 200,
+                silence: 269
+            }
+        );
+    }
+
+    #[test]
+    fn timeout_wake_pads_like_legacy() {
+        assert_eq!(
+            plan(Wake::Timeout, true, 0, 0),
+            FillPlan {
+                real: 0,
+                silence: 569
+            }
+        );
+    }
+
+    #[test]
+    fn target_caps_real_frames() {
+        assert_eq!(
+            plan(Wake::Data, true, 500, 1_000),
+            FillPlan {
+                real: 69,
+                silence: 0
+            }
+        );
+    }
+
+    #[test]
+    fn deadline_mode_needs_a_timer_and_a_long_enough_period() {
+        assert!(deadline_mode(true, 441));
+        // 128 frames = 2.9 ms, not more than two guards (3 ms).
+        assert!(!deadline_mode(true, 128));
+        assert!(!deadline_mode(false, 441));
+    }
+
+    #[test]
+    fn wake_from_wait_maps_handles() {
+        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        let w0 = WAIT_OBJECT_0.0;
+        assert_eq!(wake_from_wait(w0, true), Wake::Device);
+        assert_eq!(wake_from_wait(w0 + 1, true), Wake::Data);
+        assert_eq!(wake_from_wait(w0 + 2, true), Wake::Deadline);
+        assert_eq!(wake_from_wait(WAIT_TIMEOUT.0, true), Wake::Timeout);
+        // Without a timer only two handles are waited on.
+        assert_eq!(wake_from_wait(w0, false), Wake::Device);
+        assert_eq!(wake_from_wait(w0 + 1, false), Wake::Data);
+        assert_eq!(wake_from_wait(w0 + 2, false), Wake::Timeout);
+        assert_eq!(wake_from_wait(WAIT_TIMEOUT.0, false), Wake::Timeout);
+    }
+
+    /// Pushes `frames` frames of 0.5 into ring B, stamped as input that arrived at `now`.
+    fn arrive(r: &Renderer, tx: &mut Producer<f32>, frames: usize, now: u64) {
+        for _ in 0..frames * 2 {
+            tx.push(0.5).unwrap();
+        }
+        r.ctx.shared.last_input_us.store(now, Ordering::Release);
+    }
+
+    /// The device reads one 441-frame period.
+    fn read_period(padding: &AtomicUsize) {
+        let p = padding.load(Ordering::Relaxed);
+        padding.store(p.saturating_sub(441), Ordering::Relaxed);
+    }
+
+    /// Controller check: in deadline mode a short queue on a data wake is not a starvation;
+    /// only the deadline (just before the device reads) pads, and only then is an underrun
+    /// armed.
+    #[test]
+    fn a_short_queue_on_a_data_wake_neither_pads_nor_counts() {
+        let sink = FakeSink::new(0);
+        let (padding, out) = (sink.padding.clone(), sink.out.clone());
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let t = 10 * SEC;
+        // Fed to the target on a data wake; the deadline finds no shortfall: primed.
+        arrive(&r, &mut tx, 569, t);
+        r.fill_at(Wake::Data, t).unwrap();
+        assert!(!r.primed, "a data wake checks nothing");
+        r.fill_at(Wake::Deadline, t + 8 * MS).unwrap();
+        assert!(r.primed);
+        read_period(&padding);
+        r.fill_at(Wake::Device, t + 10 * MS).unwrap();
+        arrive(&r, &mut tx, 172, t + 11 * MS);
+        r.fill_at(Wake::Data, t + 11 * MS).unwrap();
+        assert_eq!(padding.load(Ordering::Relaxed), 300, "written on arrival");
+        // Nothing new: data and device wakes write nothing and pad nothing.
+        r.fill_at(Wake::Data, t + 12 * MS).unwrap();
+        r.fill_at(Wake::Device, t + 13 * MS).unwrap();
+        assert_eq!(padding.load(Ordering::Relaxed), 300);
+        assert_eq!(pad_events(&r), 0);
+        assert!(r.underruns.starved_at.is_none(), "not judged a starvation");
+        // The deadline sees 300 < 441 queued: pads up to the target, arms the judge.
+        r.fill_at(Wake::Deadline, t + 18 * MS).unwrap();
+        assert_eq!(padding.load(Ordering::Relaxed), 569);
+        assert_eq!(pad_events(&r), 1);
+        assert!(r.underruns.starved_at.is_some());
+        assert_eq!(out.lock().unwrap().len() / 2, 569 + 172 + 269);
+        let diag = &r.ctx.stats.diag;
+        assert_eq!(diag.render_data_wakes.load(Ordering::Relaxed), 3);
+        assert_eq!(diag.render_deadline_wakes.load(Ordering::Relaxed), 2);
+    }
+
+    /// One underrun per gap, as before O2: after a pad, real frames fed on data wakes do not
+    /// re-prime the judge; a check that finds no shortfall does.
+    #[test]
+    fn a_gap_counts_once_until_a_check_passes() {
+        let sink = FakeSink::new(0);
+        let padding = sink.padding.clone();
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let t = 10 * SEC;
+        arrive(&r, &mut tx, 569, t);
+        r.fill_at(Wake::Data, t).unwrap();
+        r.fill_at(Wake::Deadline, t + 8 * MS).unwrap();
+        assert!(r.primed);
+        // Period 1: nothing arrives, the deadline pads and arms; input then keeps flowing
+        // and the next wake counts it.
+        read_period(&padding);
+        r.fill_at(Wake::Device, t + 10 * MS).unwrap();
+        r.ctx
+            .shared
+            .last_input_us
+            .store(t + 15 * MS, Ordering::Release);
+        r.fill_at(Wake::Deadline, t + 18 * MS).unwrap();
+        assert!(r.underruns.starved_at.is_some());
+        arrive(&r, &mut tx, 100, t + 19 * MS);
+        r.fill_at(Wake::Data, t + 19 * MS).unwrap();
+        assert_eq!(underruns(&r), 1);
+        // Period 2: 100 frames fed on a data wake, still short at the deadline: the same
+        // gap, not counted again.
+        read_period(&padding);
+        r.fill_at(Wake::Device, t + 20 * MS).unwrap();
+        assert!(!r.primed);
+        r.fill_at(Wake::Deadline, t + 28 * MS).unwrap();
+        assert_eq!(pad_events(&r), 2);
+        assert!(r.underruns.starved_at.is_none(), "not re-armed");
+        // Period 3: fed to the target, the deadline finds no shortfall: primed again.
+        read_period(&padding);
+        r.fill_at(Wake::Device, t + 30 * MS).unwrap();
+        arrive(&r, &mut tx, 441, t + 31 * MS);
+        r.fill_at(Wake::Data, t + 31 * MS).unwrap();
+        r.fill_at(Wake::Deadline, t + 38 * MS).unwrap();
+        assert!(r.primed);
+        assert_eq!(pad_events(&r), 2);
+        // Period 4: short again, a new gap: armed again.
+        read_period(&padding);
+        r.fill_at(Wake::Device, t + 40 * MS).unwrap();
+        r.ctx
+            .shared
+            .last_input_us
+            .store(t + 45 * MS, Ordering::Release);
+        r.fill_at(Wake::Deadline, t + 48 * MS).unwrap();
+        assert_eq!(pad_events(&r), 3);
+        assert!(r.underruns.starved_at.is_some());
+    }
+
+    /// Trim watches the queue only on device and timeout wakes (a data wake sees the queue
+    /// at a burst peak).
+    #[test]
+    fn trim_watches_only_device_and_timeout_wakes() {
+        let sink = FakeSink::new(0);
+        let (mut r, _shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        for _ in 0..3_000 * 2 {
+            tx.push(0.5).unwrap();
+        }
+        r.fill_at(Wake::Data, 10 * SEC).unwrap();
+        r.fill_at(Wake::Deadline, 10 * SEC + MS).unwrap();
+        assert!(r.trim.over.is_none());
+        r.fill_at(Wake::Device, 10 * SEC + 2 * MS).unwrap();
+        assert!(r.trim.over.is_some());
+    }
+
+    /// `fill` waits on the device event, ring B's data event (and the timer); it publishes
+    /// the latency only on device and timeout wakes.
+    #[test]
+    fn fill_maps_events_to_wakes_and_publishes_on_device_wakes() {
+        let sink = FakeSink::new(0);
+        let device = sink.event.clone();
+        let (mut r, shared, _tx) = test_renderer(Some(sink));
+        r.after_open();
+        shared.render_wake.set();
+        r.fill().unwrap();
+        assert_eq!(
+            r.ctx.stats.diag.render_data_wakes.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(r.ctx.stats.latency_ms_milli.load(Ordering::Relaxed), 0);
+        device.set();
+        r.fill().unwrap();
+        assert_eq!(
+            r.ctx.stats.diag.render_data_wakes.load(Ordering::Relaxed),
+            1
+        );
+        assert!(r.ctx.stats.latency_ms_milli.load(Ordering::Relaxed) > 0);
+    }
+
+    /// Integer-time model of the render path for one capture phase (brief, Task 7).
+    ///
+    /// The device reads 441 frames every 10 000 us (a read with padding < 441 is a starved
+    /// read) and wakes the renderer right after each read, plus once at stream start (t = 0);
+    /// in O2 a deadline wake follows each device wake 8 500 us later. Capture delivers 441
+    /// frames every 10 000 us at `phase` (+ `jitter` from a fixed LCG); processing emits a
+    /// 128-frame hop for every 128 frames gathered, 300 us each, one after the other, and in
+    /// O2 each hop is a data wake. Every wake writes as `plan_fill` says (headroom 0). The
+    /// queue (padding + ring B) is sampled every 100 us for 2 s. The legacy run has device
+    /// wakes only and `deadline_mode = false`. At equal times: device, capture, processing,
+    /// deadline, sample.
+    fn simulate_wakes(phase: u64, o2: bool, jitter_seed: Option<u64>) -> WakeSim {
+        const PERIOD: usize = 441;
+        const TARGET: usize = 441 + 128;
+        const BUFFER: usize = 4_410;
+        const PERIOD_US: u64 = 10_000;
+        const HOP: usize = 128;
+        const HOP_US: u64 = 300;
+        const SAMPLE_US: u64 = 100;
+        const LEN_US: u64 = 2_000_000;
+        const START_US: u64 = 20_000;
+        let mut lcg = jitter_seed.unwrap_or(0);
+        let mut capture_at = |k: u64| -> u64 {
+            let base = phase + k * PERIOD_US;
+            match jitter_seed {
+                None => base,
+                Some(_) => {
+                    lcg = lcg
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let j = ((lcg >> 33) % 1_001) as i64 - 500;
+                    (base as i64 + j).max(0) as u64
+                }
+            }
+        };
+        let (mut padding, mut ring, mut ring_a) = (0usize, 0usize, 0usize);
+        let mut sim = WakeSim::default();
+        let wake = |w: Wake, t: u64, padding: &mut usize, ring: &mut usize, sim: &mut WakeSim| {
+            let p = plan_fill(w, o2, *padding, *ring, BUFFER - *padding, PERIOD, TARGET);
+            *ring -= p.real;
+            *padding += p.real + p.silence;
+            if p.silence > 0 {
+                sim.pads += 1;
+                if t >= START_US {
+                    sim.pads_after_start += 1;
+                }
+            }
+        };
+        let mut next_read = 0u64; // the stream-start wake, no read
+        let mut k = 0u64;
+        let mut next_capture = capture_at(0);
+        let mut busy_until: Option<u64> = None;
+        let mut deadline: Option<u64> = None;
+        let mut next_sample = 0u64;
+        let (mut sum, mut samples) = (0u128, 0u64);
+        while next_sample < LEN_US {
+            let candidates = [
+                Some(next_read),
+                Some(next_capture),
+                busy_until,
+                deadline,
+                Some(next_sample),
+            ];
+            let (which, t) = candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.map(|t| (i, t)))
+                .min_by_key(|&(i, t)| (t, i))
+                .unwrap();
+            match which {
+                0 => {
+                    if t > 0 {
+                        if padding < PERIOD {
+                            sim.starved_reads += 1;
+                        }
+                        padding -= padding.min(PERIOD);
+                    }
+                    wake(Wake::Device, t, &mut padding, &mut ring, &mut sim);
+                    if o2 {
+                        deadline = Some(t + PERIOD_US - DEADLINE_GUARD_US);
+                    }
+                    next_read = t + PERIOD_US;
+                }
+                1 => {
+                    ring_a += PERIOD;
+                    if busy_until.is_none() && ring_a >= HOP {
+                        ring_a -= HOP;
+                        busy_until = Some(t + HOP_US);
+                    }
+                    k += 1;
+                    next_capture = capture_at(k);
+                }
+                2 => {
+                    ring += HOP;
+                    if o2 {
+                        wake(Wake::Data, t, &mut padding, &mut ring, &mut sim);
+                    }
+                    busy_until = if ring_a >= HOP {
+                        ring_a -= HOP;
+                        Some(t + HOP_US)
+                    } else {
+                        None
+                    };
+                }
+                3 => {
+                    deadline = None;
+                    wake(Wake::Deadline, t, &mut padding, &mut ring, &mut sim);
+                }
+                _ => {
+                    sum += (padding + ring) as u128;
+                    samples += 1;
+                    next_sample += SAMPLE_US;
+                }
+            }
+        }
+        sim.mean_queue = sum as f64 / samples as f64;
+        sim
+    }
+
+    #[derive(Default, Debug)]
+    struct WakeSim {
+        mean_queue: f64,
+        starved_reads: u32,
+        pads: u32,
+        pads_after_start: u32,
+    }
+
+    #[test]
+    fn write_on_arrival_never_starves_regular_input() {
+        for phase in (0..10_000).step_by(250) {
+            let s = simulate_wakes(phase, true, None);
+            assert_eq!(s.starved_reads, 0, "phase {phase}: {s:?}");
+            assert!(s.pads_after_start <= 1, "phase {phase}: {s:?}");
+            let j = simulate_wakes(phase, true, Some(0x5eed_0002));
+            eprintln!(
+                "O2 phase {phase:>5} us: starved {} pads {} (after 20 ms {}); jitter starved {} pads {}",
+                s.starved_reads, s.pads, s.pads_after_start, j.starved_reads, j.pads
+            );
+            assert_eq!(j.starved_reads, 0, "phase {phase} with jitter: {j:?}");
+        }
+    }
+
+    #[test]
+    fn write_on_arrival_lowers_the_mean_queue() {
+        let mut drop_sum = 0.0;
+        let mut n = 0.0;
+        for phase in (0..10_000).step_by(250) {
+            let new = simulate_wakes(phase, true, None);
+            let old = simulate_wakes(phase, false, None);
+            eprintln!(
+                "phase {phase:>5} us: mean queue old {:.1} new {:.1} (drop {:.1}); starved old {} new {}",
+                old.mean_queue,
+                new.mean_queue,
+                old.mean_queue - new.mean_queue,
+                old.starved_reads,
+                new.starved_reads
+            );
+            assert!(
+                new.mean_queue <= old.mean_queue + 1.0,
+                "phase {phase}: new {:.1} old {:.1}",
+                new.mean_queue,
+                old.mean_queue
+            );
+            drop_sum += old.mean_queue - new.mean_queue;
+            n += 1.0;
+        }
+        let mean_drop = drop_sum / n;
+        eprintln!("mean drop over all phases: {mean_drop:.1} frames");
+        assert!(mean_drop >= 132.0, "mean drop {mean_drop:.1} frames");
     }
 
     /// Frames to milliseconds at the engine rate.

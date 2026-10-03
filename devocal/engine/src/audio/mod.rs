@@ -138,11 +138,68 @@ pub struct DiagCounters {
     pub render_preroll_frames: AtomicU64,
 }
 
+/// Process-wide run counter: tells apart the logs of successive `AudioHandle::start`s.
+static RUN_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Next run id, monotonic within the process, starting at 1.
+pub(crate) fn next_run_id() -> u32 {
+    RUN_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// One `DEVOCAL_DIAG` line: run id, QPC time `t_us`, the span the deltas cover, the counter
+/// deltas, the free-form `tail`, and a trailing ` partial` when the span is cut short.
+pub(crate) fn diag_line(
+    run: u32,
+    t_us: u64,
+    span_us: u64,
+    fields: &[(&str, u64)],
+    tail: &str,
+    partial: bool,
+) -> String {
+    let mut line = format!(
+        "devocal diag: run={run} t={:.6} span_ms={}",
+        t_us as f64 / 1e6,
+        span_us / 1000
+    );
+    for (name, n) in fields {
+        line.push_str(&format!(" {name}={n}"));
+    }
+    if !tail.is_empty() {
+        line.push(' ');
+        line.push_str(tail);
+    }
+    if partial {
+        line.push_str(" partial");
+    }
+    line
+}
+
+/// The renderer's "stream opened" log line.
+pub(crate) fn render_open_line(run: u32, describe: &str, period: usize, buffer: usize) -> String {
+    format!("devocal audio: run={run} render {describe} (period {period} frames, buffer {buffer})")
+}
+
 /// Env var that turns on the once-a-second diagnostic log.
 pub const DIAG_ENV: &str = "DEVOCAL_DIAG";
 
-/// Logs counter deltas once a second until `shared.stop`.
+/// How often the diag thread looks at the stop flag.
+const DIAG_POLL_MS: u64 = 50;
+
+/// Logs counter deltas once a second until `shared.stop`, then one partial last line.
 fn diag_loop(stats: Arc<AudioStats>, shared: Arc<Shared>, gains: Arc<SharedGains>) {
+    diag_loop_with(stats, shared, gains, 1_000_000, |l| eprintln!("{l}"));
+}
+
+/// [`diag_loop`] with its own interval and sink. Emits a start line, a line every
+/// `interval_us`, and on stop a last line (marked partial) covering the time since the
+/// previous one. Only this detached thread formats strings.
+pub(crate) fn diag_loop_with(
+    stats: Arc<AudioStats>,
+    shared: Arc<Shared>,
+    gains: Arc<SharedGains>,
+    interval_us: u64,
+    mut emit: impl FnMut(String),
+) {
     let d = &stats.diag;
     let read = || {
         [
@@ -183,24 +240,47 @@ fn diag_loop(stats: Arc<AudioStats>, shared: Arc<Shared>, gains: Arc<SharedGains
         "guard",
         "underruns",
     ];
+    let run = shared.run_id;
     let mut last = read();
-    while !shared.stop.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_millis(1000));
-        let now = read();
-        let mut line = String::from("devocal diag:");
-        for ((name, n), l) in names.iter().zip(now).zip(last) {
-            line.push_str(&format!(" {name}={}", n - l));
+    let mut last_us = now_us();
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    emit(format!(
+        "devocal diag: run={run} start t={:.6} unix_ms={unix_ms}",
+        last_us as f64 / 1e6
+    ));
+    let line = |last: &[u64; 16], now: [u64; 16], t_us: u64, span_us: u64, partial: bool| {
+        let mut fields = [("", 0u64); 16];
+        for (i, f) in fields.iter_mut().enumerate() {
+            *f = (names[i], now[i].wrapping_sub(last[i]));
         }
-        line.push_str(&format!(
-            " stage={} in_ring={} headroom={} cap_gain={:.1} out_gain={:.3}",
+        let tail = format!(
+            "stage={} in_ring={} headroom={} cap_gain={:.1} out_gain={:.3} lat_ms={:.1}",
             stats.stage.load(Ordering::Relaxed),
             shared.in_ring_frames.load(Ordering::Relaxed),
             stats.headroom_frames.load(Ordering::Relaxed),
             gains.capture_gain(),
             gains.output_gain(),
-        ));
-        eprintln!("{line}");
+            stats.latency_ms_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        );
+        diag_line(run, t_us, span_us, &fields, &tail, partial)
+    };
+    loop {
+        thread::sleep(Duration::from_millis(DIAG_POLL_MS));
+        let stopping = shared.stop.load(Ordering::Acquire);
+        let t = now_us();
+        let span = t.saturating_sub(last_us);
+        if !stopping && span < interval_us {
+            continue;
+        }
+        let now = read();
+        emit(line(&last, now, t, span, stopping));
         last = now;
+        last_us = t;
+        if stopping {
+            return;
+        }
     }
 }
 
@@ -421,6 +501,8 @@ pub(crate) enum RenderCommand {
 pub(crate) struct Shared {
     pub stop: AtomicBool,
     pub start_us: u64,
+    /// Which `AudioHandle::start` this is ([`next_run_id`]); tags every log line.
+    pub run_id: u32,
     /// `now_us()` of the latest capture packet, 0 before the first.
     pub last_input_us: AtomicU64,
     /// Frames in the latest capture packet (capture period estimate).
@@ -484,6 +566,7 @@ impl AudioHandle {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             start_us: now_us(),
+            run_id: next_run_id(),
             last_input_us: AtomicU64::new(0),
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),
@@ -895,6 +978,93 @@ impl Drop for OwnedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_shared() -> Shared {
+        Shared {
+            stop: AtomicBool::new(false),
+            start_us: now_us(),
+            run_id: next_run_id(),
+            last_input_us: AtomicU64::new(0),
+            capture_packet_frames: AtomicU32::new(0),
+            in_ring_frames: AtomicU32::new(0),
+            proc_latency_frames: AtomicU32::new(0),
+            proc_hop: AtomicU32::new(128),
+            output_failed: AtomicBool::new(false),
+            preroll_request: AtomicBool::new(false),
+            underrun_snapshot: AtomicU64::new(0),
+            wake: OwnedEvent::new().unwrap(),
+        }
+    }
+
+    #[test]
+    fn diag_line_carries_run_time_and_span() {
+        let fields = [("cap_pkts", 100u64), ("underruns", 0)];
+        assert_eq!(
+            diag_line(7, 12_345_678, 1_000_000, &fields, "stage=0", false),
+            "devocal diag: run=7 t=12.345678 span_ms=1000 cap_pkts=100 underruns=0 stage=0"
+        );
+        let partial = diag_line(7, 12_345_678, 420_000, &fields, "stage=0", true);
+        assert!(
+            partial.ends_with("span_ms=420 cap_pkts=100 underruns=0 stage=0 partial"),
+            "{partial}"
+        );
+    }
+
+    #[test]
+    fn run_ids_increase() {
+        let a = next_run_id();
+        let b = next_run_id();
+        assert!(a >= 1 && b > a);
+    }
+
+    #[test]
+    fn render_open_line_names_the_run() {
+        assert_eq!(
+            render_open_line(3, "wasapi autoconvert", 441, 1036),
+            "devocal audio: run=3 render wasapi autoconvert (period 441 frames, buffer 1036)"
+        );
+    }
+
+    #[test]
+    fn diag_loop_emits_a_final_partial_line_after_stop() {
+        let stats = Arc::new(AudioStats::default());
+        let shared = Arc::new(test_shared());
+        let gains = Arc::new(SharedGains::new(1.0, 1.0));
+        let (tx, rx) = mpsc::channel::<String>();
+        let (st, sh, g) = (stats, shared.clone(), gains);
+        let t = thread::spawn(move || {
+            diag_loop_with(st, sh, g, 100_000, move |l| {
+                let _ = tx.send(l);
+            })
+        });
+        thread::sleep(Duration::from_millis(250));
+        shared.stop.store(true, Ordering::Release);
+        let stopped_at = Instant::now();
+        while !t.is_finished() && stopped_at.elapsed() < Duration::from_millis(200) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(t.is_finished(), "diag thread did not stop within 200 ms");
+        t.join().unwrap();
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert!(lines.len() >= 4, "{lines:?}");
+        assert!(lines[0].contains(" start "), "{}", lines[0]);
+        let (last, mid) = lines[1..].split_last().unwrap();
+        assert!(mid.iter().all(|l| !l.contains("partial")), "{lines:?}");
+        assert_eq!(mid.len(), 2, "{lines:?}");
+        assert!(last.ends_with(" partial"), "{last}");
+        let field = |l: &str, key: &str| -> f64 {
+            l.split_whitespace()
+                .find_map(|w| w.strip_prefix(key))
+                .unwrap_or_else(|| panic!("no {key} in {l}"))
+                .parse()
+                .unwrap()
+        };
+        assert!(field(last, "span_ms=") < 100.0, "{last}");
+        let run = format!("run={}", shared.run_id);
+        assert!(lines.iter().all(|l| l.contains(&run)), "{lines:?}");
+        let ts: Vec<f64> = lines.iter().map(|l| field(l, "t=")).collect();
+        assert!(ts.windows(2).all(|w| w[1] > w[0]), "{ts:?}");
+    }
 
     #[test]
     fn idle_input_is_not_an_underrun() {

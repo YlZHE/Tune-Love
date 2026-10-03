@@ -458,6 +458,7 @@ mod tests {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             start_us: now_us(),
+            run_id: 1,
             last_input_us: AtomicU64::new(0),
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),

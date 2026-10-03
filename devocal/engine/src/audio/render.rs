@@ -33,9 +33,10 @@ use windows::Win32::System::Com::CLSCTX_ALL;
 
 use super::endpoint::{find_render_device, low_latency_eligible, read_mix_format, CoTaskFormat};
 use super::{
-    count_underrun, edge_fade_frames, is_backlogged, now_us, pack_starvation, stage_from_code,
-    stage_runs_model, AudioStats, ComGuard, FadeIn, Mmcss, OwnedEvent, RenderCommand, Shared,
-    SharedGains, Starvation, INPUT_FLOWING_US, MAX_EXTRA_HEADROOM_FRAMES, PREROLL_FRAMES,
+    count_underrun, edge_fade_frames, is_backlogged, now_us, pack_starvation, render_open_line,
+    stage_from_code, stage_runs_model, AudioStats, ComGuard, FadeIn, Mmcss, OwnedEvent,
+    RenderCommand, Shared, SharedGains, Starvation, INPUT_FLOWING_US, MAX_EXTRA_HEADROOM_FRAMES,
+    PREROLL_FRAMES,
 };
 use crate::dsp::{fade_edges, frames_for_ms, SAMPLE_RATE};
 
@@ -675,10 +676,13 @@ impl Renderer {
         self.discard_all();
         if let Some(s) = &self.sink {
             eprintln!(
-                "devocal audio: render {} (period {} frames, buffer {})",
-                s.describe(),
-                s.period_frames(),
-                s.buffer_frames()
+                "{}",
+                render_open_line(
+                    self.ctx.shared.run_id,
+                    s.describe(),
+                    s.period_frames(),
+                    s.buffer_frames()
+                )
             );
             // Preallocated here, never on the per-block path.
             self.staging = vec![0.0; s.buffer_frames() * 2];
@@ -1007,6 +1011,7 @@ mod tests {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             start_us: now_us(),
+            run_id: 1,
             last_input_us: AtomicU64::new(0),
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),

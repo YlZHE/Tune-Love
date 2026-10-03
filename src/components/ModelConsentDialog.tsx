@@ -1,3 +1,4 @@
+import { AlertDialog as AlertDialogPrimitive } from "radix-ui";
 import { AlertDialog, Button } from "@radix-ui/themes";
 import { MODEL_MANIFEST, formatMiB, modelTotalBytes, pinnedCommit, type ModelInfo } from "../modelDownload";
 import "./ModelSection.css";
@@ -17,11 +18,11 @@ export function ModelConsentDialog({ model, mirrorPrefix, onAccept, onCancel }: 
   onCancel(): void;
 }) {
   const commit = model ? pinnedCommit(model.files[0]?.origin ?? "") : null;
-  const hosts = [...MODEL_MANIFEST.mirrors.map(hostOf), ...(mirrorPrefix ? [hostOf(mirrorPrefix)] : [])];
+  const mirrorHosts = MODEL_MANIFEST.mirrors.map(hostOf).join("、");
   return <AlertDialog.Root open={model !== null} onOpenChange={open => { if (!open) onCancel(); }}>
     <AlertDialog.Content maxWidth="520px" className="model-consent">
       <AlertDialog.Title>下载去人声模型</AlertDialog.Title>
-      {model && <div className="model-consent-body">
+      {model && <AlertDialogPrimitive.Description asChild><div className="model-consent-body">
         <p>模型：{model.name}。用于实时去人声；模型不随安装包发布，需要下载到本机。</p>
         <p>来源：{model.source}{commit && <>，固定提交 <code>{commit}</code></>}。</p>
         <div>
@@ -34,9 +35,9 @@ export function ModelConsentDialog({ model, mirrorPrefix, onAccept, onCancel }: 
         <p>许可：仓库代码采用 {model.license.code}；{model.license.weights === "pending"
           ? "模型权重的许可作者未单独声明，待确认。" : `模型权重采用 ${model.license.weights}。`}</p>
         <p>训练数据：{model.license.trainingData.join("、")}。本应用免费、非商业，请自行判断使用场景。</p>
-        <p>加速：直连失败时，可能经由第三方 GitHub 加速服务下载（{hosts.join("、")}），它们能看到这次下载请求；文件一律按上面的 SHA-256 校验，不符即删除。</p>
+        <p>加速：直连失败时，可能经由第三方 GitHub 加速服务下载（{mirrorHosts}{mirrorPrefix && `、你填写的 ${hostOf(mirrorPrefix)}`}），它们能看到这次下载请求；文件一律按上面的 SHA-256 校验，不符即删除。</p>
         <p>写入位置：<code>%LOCALAPPDATA%\io.github.ylzhe.tunelove\models\{model.id}\</code></p>
-      </div>}
+      </div></AlertDialogPrimitive.Description>}
       <div className="model-consent-actions">
         <AlertDialog.Cancel><Button variant="soft" color="gray">取消</Button></AlertDialog.Cancel>
         <AlertDialog.Action><Button onClick={onAccept}>同意并下载</Button></AlertDialog.Action>

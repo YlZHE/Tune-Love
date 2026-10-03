@@ -12,7 +12,8 @@ function MirrorPrefixField() {
   const [value, setValue] = useState(readMirrorPrefix);
   const trimmed = value.trim();
   const invalid = trimmed !== "" && !isValidMirrorPrefix(trimmed);
-  const commit = () => { if (!invalid) saveMirrorPrefix(trimmed); };
+  // Invalid text is never stored, and it also clears a previously saved prefix so the old one is not still sent.
+  const commit = () => saveMirrorPrefix(invalid ? "" : trimmed);
   return <details className="model-advanced">
     <summary>高级</summary>
     <div className="model-advanced-field">
@@ -21,7 +22,7 @@ function MirrorPrefixField() {
         color={invalid ? "red" : undefined} aria-invalid={invalid}
         onChange={e => setValue(e.target.value)} onBlur={commit}
         onKeyDown={e => { if (e.key === "Enter") commit(); }} />
-      {invalid && <p role="alert" className="color-error">须以 https:// 开头、以 / 结尾</p>}
+      {invalid && <p role="alert" className="color-error">须以 https:// 开头、以 / 结尾；未保存，不使用自定义前缀</p>}
     </div>
   </details>;
 }

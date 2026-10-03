@@ -269,7 +269,7 @@ test("mirror prefix: invalid input is flagged and not sent; a valid one is sent 
   await expect(input).toHaveAttribute("placeholder", "https://example.com/");
   await input.fill("http://x/");
   await input.blur();
-  await expect(page.getByRole("alert").filter({ hasText: "须以 https:// 开头、以 / 结尾" })).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: "须以 https:// 开头、以 / 结尾；未保存，不使用自定义前缀" })).toBeVisible();
   await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "同意并下载", exact: true }).click();
   await expect.poll(async () => (await requests(page)).length).toBe(1);
@@ -281,8 +281,33 @@ test("mirror prefix: invalid input is flagged and not sent; a valid one is sent 
   await expect(page.getByRole("alert").filter({ hasText: "须以 https:// 开头" })).toHaveCount(0);
   await page.evaluate(() => localStorage.removeItem("helper-model-consent-v1"));
   await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
-  await expect(page.getByRole("alertdialog")).toContainText("my.proxy");
+  await expect(page.getByRole("alertdialog")).toContainText("ghproxy.vip、你填写的 my.proxy");
   await page.getByRole("alertdialog").getByRole("button", { name: "同意并下载", exact: true }).click();
   await expect.poll(async () => (await requests(page)).length).toBe(2);
   expect((await requests(page))[1].mirrorPrefix).toBe("https://my.proxy/");
+});
+
+test("mirror prefix: an invalid edit after a valid one clears the saved prefix", async ({ page }) => {
+  const row = await prepare(page);
+  await page.getByText("高级", { exact: true }).click();
+  const input = page.getByLabel("下载加速前缀（可选）");
+  await input.fill("https://a.proxy/");
+  await input.blur();
+  await input.fill("http://b/");
+  await input.blur();
+  await expect(page.getByRole("alert").filter({ hasText: "未保存，不使用自定义前缀" })).toBeVisible();
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(1);
+  expect((await requests(page))[0].mirrorPrefix).toBeNull();
+});
+
+test("retry goes through the consent box too", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings", { consent: false, models: [{ ...MISSING, phase: "failed", error: "timeout" }] });
+  await row.getByRole("button", { name: "重试", exact: true }).click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog).toBeVisible();
+  expect(await requests(page)).toEqual([]);
+  await dialog.getByRole("button", { name: "同意并下载", exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(1);
+  expect(await requests(page)).toEqual([request("download")]);
 });

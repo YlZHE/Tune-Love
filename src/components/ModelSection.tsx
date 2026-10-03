@@ -43,16 +43,17 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
   const [consent, setConsent] = useState<{ mirrorPrefix: string } | null>(null);
   // Only a non-empty, valid prefix is ever sent or listed.
   const savedPrefix = () => { const p = readMirrorPrefix(); return p && isValidMirrorPrefix(p) ? p : ""; };
-  const sendDownload = () => run("download", { mirrorPrefix: savedPrefix() });
+  const sendDownload = (mirrorPrefix: string) => run("download", { mirrorPrefix });
   const showConsent = () => setConsent({ mirrorPrefix: savedPrefix() });
   // Download, resume and retry all go through here: with consent already given for this
   // model's hashes the request goes out, otherwise the box opens first.
   const startDownload = () => {
     if (busy) return;
-    if (hasModelConsent(model)) sendDownload(); else showConsent();
+    if (hasModelConsent(model)) sendDownload(savedPrefix()); else showConsent();
   };
   // run() takes the row's busy lock in the same tick, so there is no gap between agreeing and sending.
-  const acceptConsent = () => { rememberModelConsent(model); setConsent(null); sendDownload(); };
+  // The prefix sent is the one the box disclosed when it opened, not a fresh read.
+  const acceptConsent = () => { if (!consent) return; rememberModelConsent(model); setConsent(null); sendDownload(consent.mirrorPrefix); };
 
   const total = status && status.totalBytes > 0 ? status.totalBytes : modelTotalBytes(model);
   const partial = status ? `已下载 ${formatMiB(status.receivedBytes)} / ${formatMiB(total)} MB` : "";

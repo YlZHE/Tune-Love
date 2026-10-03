@@ -76,7 +76,7 @@ npm run tauri -- build --debug --no-bundle --config src-tauri/tauri.verify.conf.
 一次运行的步骤，`<evidence>` 为不入库的证据目录，`<state>` 取 `a`/`b`/`c`，`<n>` 为 1 到 5：
 
 1. 把播放器置于要测的状态（按第 3 节），确认 `held = true`，`phase` 符合；核验播放器身份（第 2 节）。
-2. 摘录诊断日志的当前 `run=` 编号，记下渲染打开行（形如 `devocal audio: run=<n> render <描述> (period <P_frames> frames, buffer <B>)`），换算周期毫秒数：`P_ms = P_frames / 采样率 * 1000`（采样率取自 `device_periods` 的 `mixRate`，通常 48000）。
+2. 摘录诊断日志的当前 `run=` 编号，记下渲染打开行（形如 `devocal audio: run=<n> render <描述> (period <P_frames> frames, buffer <B>)`），换算周期毫秒数：`P_ms = P_frames / 44100 * 1000`。渲染打开行的周期以引擎帧计，即 44.1 kHz，与端点的混音采样率无关：自动转换路径把设备默认周期按 44.1 kHz 换算（向上取整），低延迟路径只在混音格式正是 44.1 kHz 时使用。所以**不要**用 `device_periods` 的 `mixRate`（通常 48000）换算，例如 `period 441 frames` 是 10 ms。
 3. 启动探针：
 
    ```
@@ -92,7 +92,7 @@ npm run tauri -- build --debug --no-bundle --config src-tauri/tauri.verify.conf.
    ```
 
    两次结果应一致。`--analyze` 只读转储，不需要 `--pid`、不需要设备，且只能与 `--out` 同用。报告里应有且仅有一次可信的跳变；没有跳变（只有一个片段）、出现多于一次的跳变、或跳变对应的前后片段过短，则本次作废。
-6. 运行后再从诊断日志摘录该 `run=` 在释放前最后 5 s 的几行：`lat_ms`（引擎自报的站立延迟，它已含旧的 3 个周期）、`headroom`（渲染余量帧数）、以及是否出现 `underruns`。运行前后的渲染打开行也记下，确认运行中周期未变。
+6. 运行后再从诊断日志摘录该 `run=` 在释放前最后 5 s 的几行：`lat_ms`（引擎自报的站立延迟，含系统段 `system_path_ms(P)`，见第 9 节；当前构建为 3.2 个周期，P0 测量所用的 4115cde 构建为旧的 3 个周期）、`headroom`（渲染余量帧数）、以及是否出现 `underruns`。运行前后的渲染打开行也记下，确认运行中周期未变。
 7. 释放之后，由用户（A）或测试者（B）再次接管并回到下一次运行所需的状态；每次运行都按第 2 节重新核验身份。
 
 ### 状态 (a)、(b)、(c) 的取得
@@ -141,7 +141,7 @@ split_probe --pid <根PID> --seconds 20 --endpoint <该端点 id> --small-period
 device_periods --out <evidence>\devices.json
 ```
 
-对每个活动渲染端点输出：`name`、`mixRate`、`channels`、`defaultFrames`、`fundamentalFrames`、`minFrames`、`maxFrames`、`minMs`、`lowLatencyCapable`（出错的端点只有 `error` 一列，其余仍列出）。把输出表原样写进报告“校准输入”的 `devices` 行。第 5 节渲染打开行的 `P_frames` 与此表的 `defaultFrames` 对照，确认应用实际用的周期。
+对每个活动渲染端点输出：`name`、`mixRate`、`channels`、`defaultFrames`、`fundamentalFrames`、`minFrames`、`maxFrames`、`minMs`、`lowLatencyCapable`（出错的端点只有 `error` 一列，其余仍列出）。把输出表原样写进报告“校准输入”的 `devices` 行。第 5 节渲染打开行的 `P_frames` 与此表的 `defaultFrames` 对照，确认应用实际用的周期。两者采样率不同，须先换算：`P_frames` 是 44.1 kHz 引擎帧，`defaultFrames` 是该端点 `mixRate` 下的帧，应有 `P_frames ≈ defaultFrames × 44100 / mixRate`（自动转换路径向上取整）。例如 480 帧 @ 48 kHz 对应 441 帧，都是 10 ms。
 
 ## 8. 收尾
 
@@ -165,8 +165,28 @@ device_periods --out <evidence>\devices.json
 |---|---|
 | `P_frames`、`P_ms` | 渲染周期（渲染打开行），换算成毫秒 |
 | `M_a`、`M_b`、`M_c` | 状态 (a)(b)(c) 各 5 次 `releaseLatencyMs` 绝对值的中位数（ms），并列出最大值 |
-| `E_a`、`E_b`、`E_c` | 同一批运行中，释放前 5 s 内诊断行 `lat_ms` 的中位数（ms；它已含旧的 3 个周期） |
+| `E_a`、`E_b`、`E_c` | 同一批运行中，释放前 5 s 内诊断行 `lat_ms` 的中位数（ms；含产生它的构建的系统段 `system_path_ms(P)`，见下文） |
 | `S`、`S_small` | `split_probe` 的 `deliveryOffsetUs.median`（µs），分别为不开、开小周期流；附两次的源包大小直方图。无可用小周期端点时 `S_small` 记 N/A |
 | `devices` | `device_periods` 输出的表 |
+
+### `lat_ms` 的系统段与重新校准
+
+引擎自报的 `lat_ms` = 采集包 + 环 A + 环 B + 设备缓冲 + 模型延迟 + 系统段。系统段（音频引擎把播放器的混音交给进程回环、我们的输出再混音一次）按周期估算：
+
+```
+system_path_ms(P) = SYSTEM_PATH_FIXED_US / 1000 + SYSTEM_PATH_PERIOD_TENTHS / 10 × P_ms
+```
+
+当前（自提交 3341de9 起，按 P0 测量校准）`SYSTEM_PATH_FIXED_US = 0`、`SYSTEM_PATH_PERIOD_TENTHS = 32`，即 3.2 个周期；P = 10 ms 时为 32 ms。更早的构建（含 P0 测量所用的 4115cde）固定按 3 个周期计。
+
+重新校准时，先用**产生该 `E` 的构建**所含的系统段扣出我们自身的部分，再与实测跳变比较：
+
+```
+our = E − system_path_ms(P)          （当前构建：E − 3.2 × P_ms；4115cde：E − 3 × P_ms）
+sys = M − our                        （各状态分别算，应彼此接近）
+SYSTEM_PATH_PERIOD_TENTHS = round(10 × sys / P_ms)   （SYSTEM_PATH_FIXED_US 仍为 0 时）
+```
+
+`SYSTEM_PATH_FIXED_US` 只有在拆分探测证明交付偏移与周期无关（`|S − S_small| < 2000 µs`）时才改为 `S`，并相应扣减按周期的部分；`S_small` 为 N/A 时保持 0。
 
 报告必须如实记录作废的运行、异常与未完成项，不得用单次数字、未复核的数字或 `runValid` 为 false 的运行填表。

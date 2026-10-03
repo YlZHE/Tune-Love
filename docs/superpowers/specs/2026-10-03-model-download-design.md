@@ -13,6 +13,7 @@
 1. 作者确认权重许可前，公开安装包也提供应用内下载，但必须写清“权重许可待作者确认”和训练数据的非商业条款，由用户同意后才下载。
 2. 来源：直连作者仓库优先；失败时自动依次换第三方 GitHub 加速服务；一律按原始 SHA-256 校验。
 3. 若下载是从“未找到去人声模型”进来的（用户点开关被拒），完成后自动开启去人声；在设置里主动下载的，完成后不自动开。
+4. 下载与清单从一开始就支持多个模型（用户 2026-10-03）。本子项目只实际上架 StemgenRT。其他模型（bytesep、HTDemucs 等可选高质量档）的接入、运行时切换和选择界面，属于后续的“模型选择”子项目；但它们只需要在清单里加条目，下载这一层不必返工。
 
 ## 3. 来源与清单
 
@@ -20,14 +21,39 @@
 
 ```json
 {
-  "id": "stemgenrt-hop128",
-  "file": "stemgenrt-hop128.onnx",
-  "bytes": 37529132,
-  "sha256": "77164d6a581fafb2a31f53fd8ffde44c07cf618472952a4cdba14e68dda3b8b9",
-  "origin": "https://github.com/sweetspotsoundsystem/stemgen-rt/raw/61df8f4aa1555ef110308d01ea92b54ace770979/model/model.onnx",
-  "mirrors": ["https://ghfast.top/", "https://ghproxy.net/", "https://ghproxy.vip/"]
+  "version": 1,
+  "mirrors": ["https://ghfast.top/", "https://ghproxy.net/", "https://ghproxy.vip/"],
+  "models": [
+    {
+      "id": "stemgenrt-hop128",
+      "name": "StemgenRT（低延迟）",
+      "tier": "realtime",
+      "files": [
+        {
+          "file": "model.onnx",
+          "bytes": 37529132,
+          "sha256": "77164d6a581fafb2a31f53fd8ffde44c07cf618472952a4cdba14e68dda3b8b9",
+          "origin": "https://github.com/sweetspotsoundsystem/stemgen-rt/raw/61df8f4aa1555ef110308d01ea92b54ace770979/model/model.onnx",
+          "mirrorable": true
+        }
+      ],
+      "sampleRate": 44100,
+      "latencyMs": 5.8,
+      "runtime": "cpu",
+      "license": { "code": "MIT", "weights": "pending", "trainingData": ["MUSDB18-HQ（仅教育用途）", "MoisesDB（CC BY-NC-SA 4.0）"] },
+      "source": "https://github.com/sweetspotsoundsystem/stemgen-rt"
+    }
+  ]
 }
 ```
+
+- **多模型的约定**：
+  - 每个模型可以有多个文件（有的模型还附带滤波器等辅助文件）；每个文件各有大小、哈希和来源。
+  - 只有 GitHub 上的来源才套用镜像前缀（`mirrorable`），其他平台（如 Zenodo）的文件只走原始地址。
+  - `tier` 取 `realtime` 或 `quality`：`quality` 表示需要前瞻的高质量档，选择它时界面必须提示延迟和歌词可能不同步（AGENTS.md，2026-10-03 例外条款）。
+  - `runtime` 取 `cpu` 或 `cuda`：需要 CUDA 运行库的模型，以后在模型选择子项目里另行处理。
+- **目录**：`models/<id>/<file>`，例如 `models/stemgenrt-hop128/model.onnx`。旧的扁平文件 `models/stemgenrt-hop128.onnx` 如果存在且校验通过，在第一次启动时移到新位置。环境变量 `TUNE_LOVE_STEMGENRT_ONNX` 仍然只对 StemgenRT 生效。
+- **把模型交给引擎**：`model_path` 改为 `model_files(id)`，返回这个模型所有已安装文件的路径。去人声目前只用 StemgenRT；以后由模型选择子项目决定当前用哪个模型。
 
 - **镜像的用法**：镜像是加在 `origin` 前面的前缀，即“前缀 + 原始地址”。
 - **实测记录（2026-10-03）**：
@@ -46,7 +72,7 @@
   3. 内置镜像，按列表顺序。
 
   每个来源最多重试 2 次。连接超时 10 s，读超时 30 s。连接失败、超时、5xx、429 时换下一个来源；返回网页（`content-type: text/html`）或大小不对时，立即弃用该来源。
-- **断点续传**：数据写到 `models\stemgenrt-hop128.onnx.part`，旁边的 `.part.json` 记录来源和已写入的字节数。
+- **断点续传**：数据写到 `models\<id>\<file>.part`，旁边的 `.part.json` 记录来源和已写入的字节数。
   - 换来源或重启后，带 `Range` 继续下载：只有返回 `206`、且总大小一致时才追加；返回 `200` 则从头开始。
   - 由于整份文件最终要校验哈希，即使不同来源拼接出错也一定会被发现；校验失败就删除 `.part`，重新完整下载一次。
 - **校验与安装**：下载时同时计算 SHA-256，完成后先比大小、再比哈希，都通过才 `sync_all` 并 `rename` 成正式文件名。
@@ -60,9 +86,11 @@
   - 取消：每处理完一个分块检查一次取消标志，取消时保留 `.part`，下次可以续传。
   - 用户点“删除已下载部分”时，才清理 `.part`。
 - **命令**：
-  - `get_model_status()` 返回：`phase`（`missing / downloading / verifying / installed / failed`）、`receivedBytes`、`totalBytes`、`source`（`origin / custom / mirror:<host> / import / env`）、`path`、`error`（机器码）。
-  - `model_command({ action: "download" | "cancel" | "import" | "delete", autoEnable?: boolean })`。
-  - 两者都沿用现有的轮询方式（前端每 500 ms 查一次），不改 capabilities。
+  - `get_model_status()` 返回一个数组，每个清单里的模型一项：`id`、`phase`（`missing / downloading / verifying / installed / failed`）、`receivedBytes`、`totalBytes`、`source`（`origin / custom / mirror:<host> / import / env`）、`path`、`error`（机器码）。
+  - `model_command({ id, action: "download" | "cancel" | "import" | "delete", autoEnable?: boolean })`。
+  - 同一时间最多只有一个下载任务。下载 A 时请求下载 B，返回 `already_running`。
+  - 两个命令都沿用现有的轮询方式（前端每 500 ms 查一次），不改 capabilities。
+  - 状态与 `.part` 文件都按模型分开，放在各自目录下。
 
 ## 5. 与去人声衔接
 
@@ -92,7 +120,7 @@
 ## 7. 不做
 
 - 首次引导页（以后复用本设计的状态、确认框和“完成后自动开启”参数）；
-- 第二个模型；
+- 上架第二个模型，以及模型的运行时切换和选择界面（属于“模型选择”子项目；本子项目的清单、目录和状态已经为多模型做好准备）。设置页的“模型”区域按清单列出所有模型；本子项目里，清单中只有 StemgenRT 一项；
 - 我们自己托管或转存权重；
 - 后台静默下载；
 - 安装时下载。

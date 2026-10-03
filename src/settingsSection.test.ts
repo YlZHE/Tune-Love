@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { nextSectionRequest, parseSettingsSection } from "./settingsSection";
+import { nextSectionRequest, parseSettingsSection, urlWithoutSection } from "./settingsSection";
 
 describe("parseSettingsSection", () => {
   it("accepts only known sections", () => {
@@ -25,5 +25,15 @@ describe("nextSectionRequest", () => {
     expect(nextSectionRequest(previous, undefined)).toBe(previous);
     expect(nextSectionRequest(previous, 3)).toBe(previous);
     expect(nextSectionRequest(null, "colors")).toBeNull();
+  });
+});
+
+describe("urlWithoutSection", () => {
+  it("drops only the section parameter", () => {
+    expect(urlWithoutSection("http://127.0.0.1:1420/?view=settings&section=devocal-model")).toBe("/?view=settings");
+    expect(urlWithoutSection("http://tauri.localhost/index.html?section=devocal-model&view=settings&x=1#top")).toBe("/index.html?view=settings&x=1#top");
+  });
+  it("leaves an address without a section alone", () => {
+    expect(urlWithoutSection("http://127.0.0.1:1420/?view=settings")).toBeNull();
   });
 });

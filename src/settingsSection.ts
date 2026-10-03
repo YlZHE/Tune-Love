@@ -25,12 +25,27 @@ export function nextSectionRequest(previous: SettingsSectionRequest | null, payl
   return { section, seq: (previous?.seq ?? 0) + 1 };
 }
 
+// The address with `section` removed and everything else kept, or null if it has none.
+export function urlWithoutSection(href: string): string | null {
+  const url = new URL(href);
+  if (!url.searchParams.has("section")) return null;
+  url.searchParams.delete("section");
+  return url.pathname + url.search + url.hash;
+}
+
 // The latest request to open settings, from the address of a new window and then from events.
 export function useSettingsSectionRequest(): SettingsSectionRequest | null {
   const [request, setRequest] = useState<SettingsSectionRequest | null>(() => {
     const section = parseSettingsSection(new URLSearchParams(window.location.search).get("section"));
     return section ? { section, seq: 1 } : null;
   });
+  // The window is hidden on close, not destroyed, and keeps its address: a reload must not
+  // replay the request it was created with. (An effect, not the initializer: StrictMode runs
+  // initializers twice, and the second run would no longer see the section.)
+  useEffect(() => {
+    const stripped = urlWithoutSection(window.location.href);
+    if (stripped !== null) history.replaceState(history.state, "", stripped);
+  }, []);
   useEffect(() => {
     if (!isTauri()) return;
     let disposed = false;

@@ -43,7 +43,8 @@ export function DevocalSettings({ request = null }: { request?: SettingsSectionR
   useEffect(() => {
     if (!seq) return;
     setAutoEnablePending(fromHint);
-    if (!fromHint) return;
+    // A plain open also cancels a focus still waiting for the model status.
+    if (!fromHint) { setFocusSeq(0); return; }
     section.current?.scrollIntoView({ block: "start" });
     setFocusSeq(seq);
   }, [seq, fromHint]);

@@ -453,3 +453,16 @@ test("an import that leaves the model missing keeps the pending auto-enable", as
   await expect(row.getByRole("progressbar")).toBeVisible();
   expect(await requests(page)).toEqual([{ ...request("import"), autoEnable: true }, { ...request("download"), autoEnable: true }]);
 });
+
+test("a reload of a settings window opened from the hint does not re-arm auto-enable", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings&section=devocal-model");
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  // The section is read once and then dropped from the address.
+  await expect.poll(() => new URL(page.url()).search).toBe("?view=settings");
+  await page.reload();
+  await expect(row.getByRole("button", { name: DOWNLOAD, exact: true })).toBeVisible();
+  await expect(row.getByText(AUTO_ENABLE_NOTE)).toHaveCount(0);
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(1);
+  expect(await requests(page)).toEqual([request("download")]);
+});

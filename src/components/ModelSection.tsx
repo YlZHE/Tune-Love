@@ -57,10 +57,11 @@ function ModelRow({ model, status, send, autoEnable, onAutoEnableConsumed, focus
       .finally(() => setBusy(false));
   };
 
-  // Focus waits for the first status: until then the row has no buttons.
+  // Focus waits for the first status: until then the row has no buttons. It is tried once,
+  // on the first render with a status, button or not; `focusSeq` 0 (a plain open) cancels it.
   const row = useRef<HTMLDivElement>(null);
   const focusWanted = useRef(false);
-  useEffect(() => { if (focusSeq) focusWanted.current = true; }, [focusSeq]);
+  useEffect(() => { focusWanted.current = focusSeq !== 0; }, [focusSeq]);
   useEffect(() => {
     if (!focusWanted.current || !status) return;
     focusWanted.current = false;

@@ -1,6 +1,7 @@
 """chromatic-gate-01: calibrate the Chromatic-when-uncertain gate on used songs, then test it on unused songs.
 
   dev   grid over (ENTER, EXIT, EXIT_HOLD_SECONDS, MIN_SECONDS) on every song used in an earlier round
+  dev2  chromatic-gate-02: top-out / ratio statistics, Pareto front, default point, 5-fold cross-validation
   test  frozen values vs the current majmin production path on the first --limit never-used songs (SHA-256 order)
   used  list which files of --songs were used in earlier rounds (from the evidence json files)
 
@@ -31,6 +32,16 @@ EXIT_HOLD = [3.0, 6.0, 10.0]
 MIN_SECONDS = [3.0, 6.0, 10.0]
 GRID = [GateParams(e, x, h, m) for e, x, h, m in itertools.product(ENTER, EXIT, EXIT_HOLD, MIN_SECONDS) if x < e]
 TIE = 0.002  # 0.2 percentage points of mispull
+
+# chromatic-gate-02: gate on the strongest single out-of-set note (top) or its ratio to the weakest in-set note
+TOP_ENTER, TOP_EXIT = [0.03, 0.04, 0.05, 0.07, 0.10], [0.015, 0.02, 0.03, 0.04]
+RATIO_ENTER, RATIO_EXIT = [1.0, 1.5, 2.0, 3.0], [0.5, 0.75, 1.0, 1.5]
+GRID2 = ([GateParams(e, x, h, m, "top") for e, x, h, m in itertools.product(TOP_ENTER, TOP_EXIT, [3.0, 10.0], [3.0, 10.0])
+          if x < e]
+         + [GateParams(e, x, h, 3.0, "ratio") for e, x, h in itertools.product(RATIO_ENTER, RATIO_EXIT, [3.0, 10.0])
+            if x < e])
+COVERAGE_FLOOR = 0.85
+FOLDS = 5
 
 
 def title(path):
@@ -114,7 +125,29 @@ def choose(table):
     return max(near, key=lambda t: (t["first"]["coverage"], -table.index(t)))
 
 
-def dev(args):
+def pareto_front(points):
+    """Indices of points no other point beats on both first-play mispull (lower) and coverage (higher)."""
+    m = [(p["first"]["mispull"], p["first"]["coverage"]) for p in points]
+    return [i for i, (a, b) in enumerate(m)
+            if not any(c <= a and d >= b and (c < a or d > b) for c, d in m)]
+
+
+def choose_default(table, floor=COVERAGE_FLOOR):
+    """Preregistered default: lowest first-play mispull among points with coverage >= floor (ties: higher
+    coverage, then grid order); with no such point, the highest coverage (ties: lower mispull, grid order)."""
+    f = [t["first"] for t in table]
+    ok = [i for i, x in enumerate(f) if x["coverage"] >= floor]
+    if ok:
+        return min(ok, key=lambda i: (f[i]["mispull"], -f[i]["coverage"], i))
+    return min(range(len(f)), key=lambda i: (-f[i]["coverage"], f[i]["mispull"], i))
+
+
+def folds(n, k=FOLDS):
+    """k contiguous blocks of positions 0..n-1 (the caller orders songs by SHA-256)."""
+    return [list(map(int, part)) for part in np.array_split(np.arange(n), k)]
+
+
+def load_dev_songs(args):
     songs, excluded = [], []
     for path in sorted(Path(args.songs).glob("*.mp3")):
         if sha256(path) not in args.used:  # same-title duplicates of pilot songs stay out, as in earlier rounds
@@ -126,6 +159,11 @@ def dev(args):
             continue
         songs.append(song)
         print("loaded", path.name, flush=True)
+    return songs, excluded
+
+
+def dev(args):
+    songs, excluded = load_dev_songs(args)
     base = [{k: score(s, v) for k, v in baseline_tracks(s).items()} for s in songs]
     memo, table = {}, []
     for params in GRID:
@@ -138,6 +176,45 @@ def dev(args):
     return {"songs": [s["name"] for s in songs], "excluded": excluded,
             "majmin": {k: aggregate([b[k] for b in base]) for k in ("first", "cached")},
             "grid": table, "chosen": choose(table)}
+
+
+def dev2(args):
+    """chromatic-gate-02: grid over GRID2, Pareto front, preregistered default point, 5-fold cross-validation."""
+    songs, excluded = load_dev_songs(args)
+    songs.sort(key=lambda s: s["sha256"])
+    base = [{k: score(s, v) for k, v in baseline_tracks(s).items()} for s in songs]
+    memo, table, per_setting = {}, [], []
+    for params in GRID2:
+        per = []
+        for i, s in enumerate(songs):
+            tracks = gate_tracks(s, params)
+            per.append({k: memo.setdefault((i, k, v.tobytes()), score(s, v)) for k, v in tracks.items()})
+        per_setting.append(per)
+        table.append({"params": params._asdict(), **{k: aggregate([p[k] for p in per]) for k in ("first", "cached")}})
+        print("grid", tuple(params), table[-1]["first"]["mispull"], table[-1]["first"]["coverage"], flush=True)
+    cv = []
+    for held in folds(len(songs)):
+        train = [i for i in range(len(songs)) if i not in held]
+        sub = [{"first": aggregate([per[i]["first"] for i in train])} for per in per_setting]
+        pick = choose_default(sub)
+        cv.append({"heldOut": [songs[i]["name"] for i in held], "params": GRID2[pick]._asdict(), "index": pick,
+                   "trainFirst": sub[pick]["first"],
+                   "first": [per_setting[pick][i]["first"] for i in held],
+                   "cached": [per_setting[pick][i]["cached"] for i in held]})
+    pooled = {k: aggregate([x for c in cv for x in c[k]]) for k in ("first", "cached")}
+    for c in cv:
+        c["heldOutFirst"], c["heldOutCached"] = aggregate(c.pop("first")), aggregate(c.pop("cached"))
+    return {"songs": [s["name"] for s in songs], "excluded": excluded,
+            "majmin": {k: aggregate([b[k] for b in base]) for k in ("first", "cached")},
+            "round1Frozen": _round1_point(songs), "grid": table, "pareto": pareto_front(table),
+            "default": choose_default(table), "crossValidation": {"folds": cv, "pooled": pooled}}
+
+
+def _round1_point(songs):
+    """The chromatic-gate-01 frozen point on the same songs, for reference."""
+    p = GateParams(0.08, 0.05, 3.0, 3.0)
+    per = [{k: score(s, v) for k, v in gate_tracks(s, p).items()} for s in songs]
+    return {"params": p._asdict(), **{k: aggregate([x[k] for x in per]) for k in ("first", "cached")}}
 
 
 def test(args):
@@ -165,7 +242,7 @@ def test(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["dev", "test", "used"])
+    parser.add_argument("mode", choices=["dev", "dev2", "test", "used"])
     parser.add_argument("--songs", required=True)
     parser.add_argument("--cache", required=True)
     parser.add_argument("--evidence", required=True, help="evidence root holding earlier rounds' json files")
@@ -184,10 +261,11 @@ def main():
         parser.error("test needs the frozen values: --enter --exit --exit-hold --min-seconds")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
-    result = dev(args) if args.mode == "dev" else test(args)
+    result = {"dev": dev, "dev2": dev2, "test": test}[args.mode](args)
     (out / f"chromatic-gate-{args.mode}.json").write_text(json.dumps(result, ensure_ascii=False, indent=1),
                                                           encoding="utf-8")
-    print(json.dumps(result.get("chosen") or result.get("summary"), indent=1))
+    print(json.dumps(result.get("chosen") or result.get("summary") or result.get("crossValidation", {}).get("pooled"),
+                     indent=1))
 
 
 if __name__ == "__main__":

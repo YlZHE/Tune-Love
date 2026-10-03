@@ -4,7 +4,10 @@ The Rust implementation must follow exactly this definition.
 
   weights   = matcher.normalized(evidence, alpha)   (evidence + alpha/12) / (seconds + alpha)
   S         = the matcher's current set (hysteresis rule, first evidence commits)
-  uncovered = sum of weights over pitch classes outside S
+  uncovered = the gate statistic (`statistic`, default "total"):
+    total  sum of weights over pitch classes outside S              (chromatic-gate-01)
+    top    max of weights over pitch classes outside S              (chromatic-gate-02)
+    ratio  top / min of weights over pitch classes inside S         (chromatic-gate-02)
   state `chromatic` starts True:
     chromatic and seconds >= MIN_SECONDS and uncovered < EXIT: hold += step; hold >= EXIT_HOLD_SECONDS -> False
     chromatic otherwise: hold = 0
@@ -27,16 +30,34 @@ PRODUCTION_PARAMS = dataclasses.replace(FROZEN["S1"], family="majmin")  # what p
 STEP = 1.0
 
 
+STATISTICS = ("total", "top", "ratio")
+
+
 class GateParams(NamedTuple):
     enter: float
     exit: float
     exit_hold: float
     min_seconds: float
+    statistic: str = "total"
+
+
+def gate_statistic(name, weights, set_index):
+    weights = np.asarray(weights)
+    mask = matcher.MASKS[set_index]
+    outside = weights[~mask]
+    if name == "total":
+        return float(outside.sum())
+    top = float(outside.max()) if len(outside) else 0.0
+    if name == "top":
+        return top
+    return top / float(weights[mask].min())  # name == "ratio"; the prior keeps the in-set minimum above 0
 
 
 class Gate:
-    def __init__(self, enter, exit, exit_hold, min_seconds):
-        self.params = GateParams(enter, exit, exit_hold, min_seconds)
+    def __init__(self, enter, exit, exit_hold, min_seconds, statistic="total"):
+        if statistic not in STATISTICS:
+            raise ValueError(f"unknown gate statistic {statistic!r}")
+        self.params = GateParams(enter, exit, exit_hold, min_seconds, statistic)
         self.chromatic = True
         self.hold = 0.0
         self.seconds = 0.0
@@ -48,7 +69,7 @@ class Gate:
         p = self.params
         self.seconds += step_seconds
         self.set_index = set_index
-        self.uncovered = float(np.asarray(weights)[~matcher.MASKS[set_index]].sum())
+        self.uncovered = gate_statistic(p.statistic, weights, set_index)
         if self.chromatic:
             if self.seconds >= p.min_seconds and self.uncovered < p.exit:
                 self.hold += step_seconds

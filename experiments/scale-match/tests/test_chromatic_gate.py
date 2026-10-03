@@ -79,6 +79,70 @@ class GateTests(unittest.TestCase):
         self.assertTrue(run(gate, [PARAMS.enter + 1e-6])[0])
 
 
+def settled(params):
+    """A gate of the given params that has already left Chromatic on clean in-set evidence."""
+    gate = Gate(*params)
+    run(gate, [0.0] * 8)
+    assert not gate.chromatic
+    return gate
+
+
+def leaky_weights():
+    """Diffuse leakage: 1.5% on each of five out-of-set notes (7.5% in total, no single note stands out)."""
+    inside = matcher.MASKS[C_MAJOR]
+    w = np.where(inside, (1.0 - 0.075) / 7, 0.015)
+    return w
+
+
+def borrowed_weights():
+    """One genuinely borrowed note: D-flat at 8% in a C major set, the other out-of-set notes near zero."""
+    inside = matcher.MASKS[C_MAJOR]
+    w = np.where(inside, 0.12, 0.0025)
+    w[1] = 0.08
+    return w / w.sum()
+
+
+class TopOutStatisticTests(unittest.TestCase):
+    TOP = GateParams(enter=0.05, exit=0.03, exit_hold=3.0, min_seconds=3.0, statistic="top")
+    TOTAL = GateParams(enter=0.06, exit=0.04, exit_hold=3.0, min_seconds=3.0, statistic="total")
+
+    def test_default_statistic_is_total(self):
+        self.assertEqual(GateParams(0.1, 0.05, 3.0, 3.0).statistic, "total")
+
+    def test_diffuse_leakage_does_not_trigger_top(self):
+        gate = settled(self.TOP)
+        for _ in range(10):
+            self.assertFalse(gate.update(leaky_weights(), C_MAJOR, 1.0))
+        self.assertAlmostEqual(gate.uncovered, 0.015)  # the single strongest out-of-set note
+
+    def test_same_diffuse_leakage_does_trigger_total(self):
+        gate = settled(self.TOTAL)
+        self.assertTrue(gate.update(leaky_weights(), C_MAJOR, 1.0))  # 7.5% in total > ENTER
+
+    def test_strong_borrowed_note_triggers_top(self):
+        gate = settled(self.TOP)
+        self.assertTrue(gate.update(borrowed_weights(), C_MAJOR, 1.0))
+        self.assertGreater(gate.uncovered, self.TOP.enter)
+
+    def test_diffuse_leakage_lets_a_chromatic_gate_exit(self):
+        gate = Gate(*self.TOP)
+        out = [gate.update(leaky_weights(), C_MAJOR, 1.0) for _ in range(8)]
+        self.assertTrue(out[0] and out[1])
+        self.assertFalse(out[-1])  # 1.5% < EXIT, so it leaves after MIN_SECONDS + hold
+
+    def test_ratio_is_top_out_over_weakest_in_set_note(self):
+        gate = Gate(1.5, 0.75, 3.0, 3.0, "ratio")
+        w = np.where(matcher.MASKS[C_MAJOR], 0.12, 0.0)
+        w[1] = 0.06   # strongest out-of-set note
+        w[0] = 0.03   # weakest in-set note
+        gate.update(w, C_MAJOR, 1.0)
+        self.assertAlmostEqual(gate.uncovered, 2.0)
+
+    def test_unknown_statistic_is_rejected(self):
+        with self.assertRaises(ValueError):
+            Gate(0.1, 0.05, 3.0, 3.0, "median")
+
+
 class ProductionChromaticTests(unittest.TestCase):
     @staticmethod
     def rows(n, pcs):

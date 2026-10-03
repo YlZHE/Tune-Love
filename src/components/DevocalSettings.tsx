@@ -3,7 +3,7 @@ import { Button, TextField } from "@radix-ui/themes";
 import { UserSound } from "@phosphor-icons/react";
 import { isValidMirrorPrefix, readMirrorPrefix, saveMirrorPrefix } from "../modelDownload";
 import { useDevocal } from "../useDevocal";
-import type { SettingsSection } from "../settingsSection";
+import type { SettingsSectionRequest } from "../settingsSection";
 import { ModelSection } from "./ModelSection";
 import "./DevocalSettings.css";
 
@@ -28,22 +28,25 @@ function MirrorPrefixField() {
   </details>;
 }
 
-// `request` comes from the main window's missing-model hint (absent when settings were opened
-// from the settings button). Each new request scrolls here, focuses the model row and makes the
-// row's next download or import turn de-vocal on once the model is installed.
-export function DevocalSettings({ request = null }: { request?: { section: SettingsSection; seq: number } | null }) {
+// `request` says how settings were last opened. From the main window's missing-model hint
+// ("devocal-model") it scrolls here, focuses the model row and makes the row's next started
+// download or import turn de-vocal on once the model is installed. A plain open of the already
+// open window (section null) drops that, without scrolling or focusing.
+export function DevocalSettings({ request = null }: { request?: SettingsSectionRequest | null }) {
   const { status, release } = useDevocal();
   const [error, setError] = useState("");
   const section = useRef<HTMLElement>(null);
   const [autoEnablePending, setAutoEnablePending] = useState(false);
   const [focusSeq, setFocusSeq] = useState(0);
-  const seq = request?.section === "devocal-model" ? request.seq : 0;
+  const seq = request?.seq ?? 0;
+  const fromHint = request?.section === "devocal-model";
   useEffect(() => {
     if (!seq) return;
+    setAutoEnablePending(fromHint);
+    if (!fromHint) return;
     section.current?.scrollIntoView({ block: "start" });
-    setAutoEnablePending(true);
     setFocusSeq(seq);
-  }, [seq]);
+  }, [seq, fromHint]);
   return <section ref={section} className="devocal-settings" aria-labelledby="devocal-settings-title">
     <div className="color-heading"><UserSound size={21} aria-hidden="true" />
       <div><h2 id="devocal-settings-title">去人声</h2>

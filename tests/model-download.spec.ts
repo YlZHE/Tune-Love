@@ -17,6 +17,8 @@ async function prepare(page: Page, view = "/?view=settings", opts: { models?: Re
     state.modelRequests = [];
     state.modelFailure = null;
     state.modelDelayMs = 0;
+    // false: the import file picker is closed without a choice, so nothing changes.
+    state.importPicks = true;
     state.devocal = { ...OFF, ...devocal };
     state.openSettingsCalls = [];
     // Event bridge, shaped like @tauri-apps/api 2.x: listen() passes the id returned by
@@ -39,7 +41,7 @@ async function prepare(page: Page, view = "/?view=settings", opts: { models?: Re
             if (m.id !== id) return m;
             if (action === "download") return { ...m, phase: "downloading", receivedBytes: 12_897_485, source: "mirror:ghfast.top", error: null };
             if (action === "cancel") return { ...m, phase: "missing", error: null };
-            if (action === "import") return { ...m, phase: "installed", receivedBytes: m.totalBytes, source: "import", error: null };
+            if (action === "import") return state.importPicks ? { ...m, phase: "installed", receivedBytes: m.totalBytes, source: "import", error: null } : m;
             if (action === "delete") return { ...m, phase: "missing", receivedBytes: 0, source: null, path: null, error: null };
             return m;
           });
@@ -409,4 +411,45 @@ test("a settings-section event in an open settings window focuses the model row"
   await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
   await expect.poll(async () => (await requests(page)).length).toBe(1);
   expect(await requests(page)).toEqual([{ ...request("download"), autoEnable: true }]);
+});
+
+test("a plain open of the already open settings window drops the pending auto-enable", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings&section=devocal-model");
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  await expect(row.getByRole("button", { name: DOWNLOAD, exact: true })).toBeFocused();
+  await expect.poll(() => page.evaluate(() => [...(window as any).listeners.values()]
+    .filter((l: any) => l.event === "settings-section").length)).toBe(1);
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  // The settings button on an open window sends a null section: no scroll, no focus, no auto-enable.
+  await emitEvent(page, "settings-section", null);
+  await expect(row.getByText(AUTO_ENABLE_NOTE)).toHaveCount(0);
+  await expect(row.getByRole("button", { name: DOWNLOAD, exact: true })).not.toBeFocused();
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(1);
+  expect(await requests(page)).toEqual([request("download")]);
+});
+
+test("a rejected download keeps the pending auto-enable for the retry", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings&section=devocal-model");
+  await page.evaluate(() => { (window as any).modelFailure = "network_unreachable"; });
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect(row.getByRole("alert")).toBeVisible();
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  await page.evaluate(() => { (window as any).modelFailure = null; });
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect(row.getByRole("progressbar")).toBeVisible();
+  expect(await requests(page)).toEqual([{ ...request("download"), autoEnable: true }, { ...request("download"), autoEnable: true }]);
+  await expect(row.getByText(AUTO_ENABLE_NOTE)).toHaveCount(0);
+});
+
+test("an import that leaves the model missing keeps the pending auto-enable", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings&section=devocal-model");
+  await page.evaluate(() => { (window as any).importPicks = false; });
+  await row.getByRole("button", { name: "从本地文件导入…", exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(1);
+  await expect(row.getByRole("button", { name: "从本地文件导入…", exact: true })).toBeEnabled();
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect(row.getByRole("progressbar")).toBeVisible();
+  expect(await requests(page)).toEqual([{ ...request("import"), autoEnable: true }, { ...request("download"), autoEnable: true }]);
 });

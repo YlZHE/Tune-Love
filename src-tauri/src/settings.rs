@@ -19,7 +19,8 @@ pub fn settings_url(section: Option<&str>) -> Result<String, String> {
 // Only the main window can request this one locally configured settings page.
 // Serializing creation makes even concurrent requests reuse the same window.
 // A new window reads `section` from its address; an open one gets it as a
-// `settings-section` event.
+// `settings-section` event, with a null payload for a plain open so a request
+// left over from an earlier visit is dropped.
 #[tauri::command]
 pub async fn open_settings(
     app: AppHandle,
@@ -34,10 +35,8 @@ pub async fn open_settings(
     let _guard = state.0.lock().await;
     let settings = match app.get_webview_window("settings") {
         Some(settings) => {
-            if let Some(section) = &section {
-                app.emit_to("settings", "settings-section", section)
-                    .map_err(|error| error.to_string())?;
-            }
+            app.emit_to("settings", "settings-section", section.as_deref())
+                .map_err(|error| error.to_string())?;
             settings
         }
         None => {

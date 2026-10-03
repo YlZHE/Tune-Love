@@ -10,9 +10,10 @@ const POLL_MS = 500;
 // null until the first reply. A poll that began before a command finished may carry the
 // pre-command state, so commands bump an epoch and stale poll results are dropped. Commands
 // reject with a Chinese message so callers can show it; the polled status stays the truth.
+// A command resolves to the statuses it returned (null if the reply was not understood).
 export function useModelDownload(): {
   statuses: ModelStatus[] | null;
-  send(id: string, action: ModelAction, options?: { autoEnable?: boolean; mirrorPrefix?: string }): Promise<void>;
+  send(id: string, action: ModelAction, options?: { autoEnable?: boolean; mirrorPrefix?: string }): Promise<ModelStatus[] | null>;
 } {
   const [statuses, setStatuses] = useState<ModelStatus[] | null>(null);
   const mounted = useRef(true);
@@ -42,6 +43,7 @@ export function useModelDownload(): {
         request: { id, action, autoEnable: options?.autoEnable ?? false, mirrorPrefix: options?.mirrorPrefix || null },
       }));
       if (mounted.current && next) setStatuses(next);
+      return next;
     } catch (reason) {
       throw new Error(modelErrorText(String(reason)));
     } finally {

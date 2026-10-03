@@ -102,7 +102,7 @@ PCM 为 48 kHz、双声道 f32，后台只保留最近最多 8 秒的内存缓�
 - 升级前请先关闭本程序和已连接的宿主，否则 agent 文件被占用，无法覆盖。
 - 最低系统要求：Windows 10 版本 2004（build 19041）或更新。
 - VC++ 运行库（`msvcp140.dll`、`msvcp140_1.dll`、`vcruntime140.dll`、`vcruntime140_1.dll`）随安装包放在安装目录，无需另装 Visual C++ Redistributable。
-- StemgenRT 权重不随包发布，开发阶段用 `npm run fetch:stemgenrt -- --accept` 下载到本机。
+- StemgenRT 权重不随包发布：在设置里下载（需同意来源与许可说明），或者开发时用 `npm run fetch:stemgenrt -- --accept`。两种方式都放到 `%LOCALAPPDATA%io.github.ylzhe.tunelovemodelsstemgenrt-hop128model.onnx`，并校验 SHA-256；旧位置 `modelsstemgenrt-hop128.onnx` 会在启动时自动迁移。
 
 ## 从源码构建
 

@@ -33,8 +33,9 @@
 //! saw beyond the target, and not at all if nothing extra is queued (paused). A pre-roll
 //! writes exactly the silence it adds to the headroom. A queue more than 20 ms over target
 //! for a whole second is trimmed back. Both skips fade out, skip and fade in; a decay skip
-//! larger than ring B goes on discarding arriving frames until it is done. Output gain is ramped across each write; every
-//! sample is clamped to [-1, 1] (non-finite -> 0) before it reaches the device.
+//! larger than ring B goes on discarding arriving frames until it is done. Output gain is
+//! ramped across each write; every sample is clamped to [-1, 1] (non-finite -> 0) before it
+//! reaches the device.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -3068,8 +3069,9 @@ mod tests {
     /// Ruling 17 (1): under O2 the decay's low point is taken at check wakes only; a device
     /// wake sees the queue right after a read, about one period below what the next read
     /// finds, which used to cancel the decay. A real underrun (the capture stalls 12 ms at
-    /// about 1 s: two packets arrive late, together) grows the headroom by a hop; 5 s later it is released and skipped whole, in every
-    /// capture phase, with no starved read and no further pad or underrun.
+    /// about 1 s: two packets arrive late, together) grows the headroom by a hop; 5 s later
+    /// it is released and skipped whole, in every capture phase, with no starved read and no
+    /// further pad or underrun.
     #[test]
     fn o2_decay_skips_the_released_jitter_headroom_in_every_phase() {
         for phase in (0..10_000).step_by(500) {

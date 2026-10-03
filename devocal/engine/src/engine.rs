@@ -24,10 +24,11 @@
 //! audio threads (process loopback of the player tree, output on the player's endpoint) and
 //! only then, on a later tick, calls `Holder::begin_attach` with that tick's time, so the
 //! 30 ms volume ramp is not compressed by the audio start-up and nothing is lowered when the
-//! audio cannot start. The first tick after the start stamps the start time; `begin_attach`
-//! waits until the capture has delivered [`ATTACH_REF_FRAMES`] (three 441-frame packets,
-//! 30 ms, recorded at the player's original volume: the reference for R2's level check,
-//! which needs at least 20 ms of full chunks) or [`ATTACH_REF_WAIT_US`]
+//! audio cannot start (nor when the player exited meanwhile: `begin_attach` refuses it and
+//! the engine is back to idle). The first tick after the start stamps the start time;
+//! `begin_attach` waits until the capture has delivered [`ATTACH_REF_FRAMES`] (three
+//! 441-frame packets, 30 ms, recorded at the player's original volume: the reference for
+//! R2's level check, which needs at least 20 ms of full chunks) or [`ATTACH_REF_WAIT_US`]
 //! (100 ms) have passed since that stamp, whichever comes first. During the wait the player
 //! plays at its own volume and the engine's output gain is still 0, so nothing is audible
 //! twice. A default render device change seen during the wait (the Holder is still idle and
@@ -53,7 +54,9 @@
 //!    Holder's parked sessions;
 //! 6. `SharedGains` from the Holder (after the tick and follow, so the audio threads see the
 //!    gain that matches the volumes just set), then the attach ramp steps issued so far
-//!    (`Holder::attach_ramp`, `None` outside the clean 150 ms window);
+//!    (`Holder::attach_ramp`, `None` outside the clean 150 ms window; a follow pass that
+//!    changed nothing keeps it open). When a published window ends, one line logs why
+//!    (`Holder::attach_ramp_end`: timeout, follow changed sessions, device change, ...);
 //! 7. `Metrics` once per second;
 //! 8. a `State` event whenever phase, mode, fallback reason or attached pid changed.
 //!
@@ -91,7 +94,7 @@ use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCES
 use crate::audio::endpoint::session_endpoint;
 use crate::audio::{now_us, AudioConfig, AudioHandle, SharedGains};
 use crate::dsp::SAMPLE_RATE;
-use crate::holder::{Holder, HolderPhase, CONFIRM_WINDOW_US};
+use crate::holder::{AttachRamp, Holder, HolderPhase, CONFIRM_WINDOW_US};
 use crate::notify::{SessionSignals, SessionWatcher};
 use crate::pipe::{pipe_name, Accepted, PipeServer};
 use crate::processor::{Processor, Stage};
@@ -305,6 +308,10 @@ pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     /// A notification asked for a follow pass that has not run yet (it arrived while
     /// attaching).
     event_follow: bool,
+    /// The R2 window being published, and the tick it was first published at.
+    r2_window: Option<(AttachRamp, u64)>,
+    /// Why the last R2 window ended (also logged): `Holder::attach_ramp_end`, or a new epoch.
+    r2_window_end: Option<&'static str>,
 }
 
 impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
@@ -337,6 +344,8 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             exit_requested: false,
             signals: Arc::new(SessionSignals::default()),
             event_follow: false,
+            r2_window: None,
+            r2_window_end: None,
         }
     }
 
@@ -446,7 +455,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         self.periodic(now_us, &mut ev);
         self.gains
             .set(self.holder.capture_gain(now_us), self.holder.output_gain());
-        self.gains.set_attach(self.holder.attach_ramp(now_us));
+        self.publish_attach_ramp(now_us);
         if self.audio_stop_at.is_some_and(|t| now_us >= t) {
             self.stop_audio();
         }
@@ -725,8 +734,9 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             return;
         };
         // R2: wait for 30 ms of audio captured at the player's own volume (the level check's
-        // reference, ATTACH_REF_FRAMES), at most ATTACH_REF_WAIT_US. Meanwhile the player plays at its original
-        // volume and our output gain is 0, so nothing is heard twice or louder.
+        // reference, ATTACH_REF_FRAMES), at most ATTACH_REF_WAIT_US. Meanwhile the player
+        // plays at its original volume and our output gain is 0, so nothing is heard twice
+        // or louder.
         let started_us = *pending.started_us.get_or_insert(now_us);
         if self.audio.input_frames() < ATTACH_REF_FRAMES
             && now_us < started_us.saturating_add(ATTACH_REF_WAIT_US)
@@ -817,6 +827,36 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             }
             _ => {}
         }
+    }
+
+    /// Publishes the attach ramp steps issued so far (R2) and logs why a published window
+    /// ended (a timeout, the holder's reason for `None`, or a new epoch).
+    fn publish_attach_ramp(&mut self, now_us: u64) {
+        let ramp = self.holder.attach_ramp(now_us);
+        if let Some((open, since)) = self.r2_window {
+            let end = match ramp {
+                None => Some(self.holder.attach_ramp_end(now_us)),
+                Some(a) if a.epoch != open.epoch => Some("new epoch"),
+                Some(_) => None,
+            };
+            if let Some(reason) = end {
+                eprintln!(
+                    "devocal engine: R2 window {} ended after {} ms ({} steps): {reason}",
+                    open.epoch,
+                    now_us.saturating_sub(since) / 1_000,
+                    open.steps
+                );
+                self.r2_window_end = Some(reason);
+                self.r2_window = None;
+            }
+        }
+        if let Some(a) = ramp {
+            match &mut self.r2_window {
+                Some((open, _)) => *open = a,
+                None => self.r2_window = Some((a, now_us)),
+            }
+        }
+        self.gains.set_attach(ramp);
     }
 
     fn schedule_audio_stop(&mut self, now_us: u64) {
@@ -2774,6 +2814,125 @@ mod tests {
             "the periodic follow at +150 ms"
         );
         assert_eq!(gains.attach(), None);
+    }
+
+    /// Attaches with the reference wait pending (no captured audio yet); returns the gains.
+    fn waiting_attach(tag: &str) -> (Rig, Arc<SharedGains>) {
+        let mut r = Rig::new(tag);
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.audio().set_input_frames(0);
+        r.send(attach());
+        r.run(5);
+        assert_eq!(r.core.phase(), Phase::Attaching);
+        let gains = r.audio().st().gains.clone().unwrap();
+        (r, gains)
+    }
+
+    /// Ruling 17 (3): a new-session notification latched during the reference wait (our own
+    /// render stream opening, say) runs a follow pass once active that finds nothing to do;
+    /// the R2 window stays published for its whole 150 ms and ends by timeout.
+    #[test]
+    fn a_notification_during_the_reference_wait_keeps_the_r2_window() {
+        let (mut r, gains) = waiting_attach("ref-wait-notify");
+        r.core.signals().notify_session_created();
+        r.run(5);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        let t1 = r.now;
+        while r.now < t1 + CONFIRM_WINDOW_US {
+            r.core.tick(r.now);
+            let ms = (r.now - t1) / MS;
+            assert!(gains.attach().is_some(), "+{ms} ms: published");
+            r.now += MS;
+        }
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert!(!r.core.event_follow, "the event follow ran");
+        r.core.tick(r.now);
+        assert_eq!(gains.attach(), None);
+        assert_eq!(r.core.r2_window_end, Some("timeout"));
+    }
+
+    /// The same notification with a real new session: the follow lowers it and ends the
+    /// window at once.
+    #[test]
+    fn a_follow_that_lowers_a_new_session_ends_the_r2_window() {
+        let (mut r, gains) = waiting_attach("ref-wait-notify-new");
+        const NEW: &str = "ep1|player|2%b100";
+        r.core.signals().notify_session_created();
+        r.run(5);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        let t1 = r.now;
+        let mut ended = None;
+        while r.now < t1 + CONFIRM_WINDOW_US {
+            r.core.tick(r.now);
+            if r.now == t1 {
+                // Appears after `begin_attach`, so the ramp does not cover it.
+                r.core
+                    .sessions()
+                    .add_session(session(NEW, "ep1"), 0.9, false);
+            }
+            if gains.attach().is_none() && ended.is_none() {
+                ended = Some((r.now - t1) / MS);
+            }
+            r.now += MS;
+        }
+        let ended = ended.expect("the window ended early");
+        assert!((30..=31).contains(&ended), "ended at +{ended} ms (active)");
+        assert_eq!(r.volume(NEW), HELD_VOLUME);
+        assert_eq!(r.core.r2_window_end, Some("follow changed sessions"));
+    }
+
+    /// Minor: a release during the reference wait lowers nothing and goes back to idle; the
+    /// audio arriving later starts nothing.
+    #[test]
+    fn release_during_the_reference_wait_lowers_nothing() {
+        let (mut r, gains) = waiting_attach("ref-wait-release");
+        let mut ev = r.send(Command::Release);
+        ev.extend(r.run(50));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        r.run(200);
+        assert_eq!(r.core.phase(), Phase::Idle);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert_eq!(r.volume(SESSION), 0.8);
+        assert!(!r.restore.exists());
+        assert_eq!(r.audio().st().stops, 1);
+        assert_eq!(gains.attach(), None);
+    }
+
+    /// Minor: an audio failure during the reference wait reports it, lowers nothing and goes
+    /// back to idle.
+    #[test]
+    fn audio_failure_during_the_reference_wait_lowers_nothing() {
+        let (mut r, _gains) = waiting_attach("ref-wait-failure");
+        r.audio().set_capture_failed();
+        let mut ev = r.run(1);
+        assert_eq!(errors(&ev), vec![ErrorCode::CaptureFailed]);
+        ev.extend(r.run(50));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        r.run(200);
+        assert_eq!(r.core.phase(), Phase::Idle);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert!(!r.restore.exists());
+        assert_eq!(r.audio().st().stops, 1);
+    }
+
+    /// Minor: the player exits during the reference wait (its process and sessions are gone):
+    /// nothing is lowered and the engine goes back to idle.
+    #[test]
+    fn player_exit_during_the_reference_wait_lowers_nothing() {
+        let (mut r, _gains) = waiting_attach("ref-wait-exit");
+        r.core.sessions().remove_session(SESSION);
+        r.core.sessions().set_process_created(PID, None);
+        let mut ev = r.run(5);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        ev.extend(r.run(300));
+        assert_eq!(r.core.phase(), Phase::Idle, "{ev:?}");
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert!(!r.restore.exists());
+        assert_eq!(r.audio().st().stops, 1);
+        assert_eq!(states(&ev).last(), Some(&IDLE));
     }
 
     #[test]

@@ -2,6 +2,19 @@
 //! autoconvert to 44.1 kHz float32 stereo). Every packet is multiplied by the capture gain,
 //! passed through the safety guard and pushed to ring A; packet discontinuities and ring
 //! overflows push a reset marker first.
+//!
+//! Capture gain per packet: the conservative gain (`SharedGains::capture_gain`, the Holder's
+//! 100 ms `GainHistory`), raised during the attach by R2 ([`LevelConfirm`]): each
+//! [`CONFIRM_FRAMES`] chunk (about 2.5 ms) whose raw level, compared with the reference
+//! recorded before the attach, matches a volume step already issued (within +-6 dB) gets that
+//! step's make-up gain, capped so the chunk's RMS and peak stay at or below the reference's.
+//! R2 falls back to the conservative gain for the whole attach when the reference is shorter
+//! than 20 ms or below -60 dBFS (silence, a paused player); per chunk when the level matches
+//! no issued step; and from the moment the Holder stops publishing the ramp (degraded, a
+//! `follow`, a device change, 150 ms after the ramp start) or 150 ms after the window opened.
+//! A conservative gain of 0 (device-change mute) is never raised. The safety guard still
+//! judges every 10 ms block after the gain. Confirmed and fallen-back chunks are counted in
+//! `DiagCounters::{capture_confirm_chunks, capture_fallback_chunks}`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -10,6 +23,7 @@ use std::sync::Arc;
 use rtrb::Producer;
 use wasapi::{AudioClient, Direction, SampleType, StreamMode, WasapiError, WaveFormat};
 
+use super::confirm::{LevelConfirm, CONFIRM_FRAMES};
 use super::{
     edge_fade_frames, now_us, AudioStats, ComGuard, FadeIn, InputMarker, Mmcss, Shared, SharedGains,
 };
@@ -51,21 +65,39 @@ impl Conditioner {
         }
     }
 
-    /// Multiplies `samples` (interleaved stereo) by `gain`, then guards each 10 ms block. A
-    /// silenced block counts in `stats.unattenuated_blocks` and sets `follow_now`. A gap is
-    /// faded out over the 5 ms before it (`fade_edges`) when those frames are in this packet;
-    /// when the gap starts at the packet's first frame, `gap_at(0)` is called so the render
-    /// thread fades the already-queued frames. Audio after a gap fades in over 5 ms.
+    /// Multiplies `samples` (interleaved stereo) by `gain`, then guards each 10 ms block; see
+    /// [`Conditioner::condition_with`].
     pub fn condition(
         &mut self,
         samples: &mut [f32],
         gain: f32,
         stats: &AudioStats,
         follow_now: &AtomicBool,
+        gap_at: impl FnMut(usize),
+    ) {
+        self.condition_with(samples, |_| gain, stats, follow_now, gap_at);
+    }
+
+    /// Multiplies each [`CONFIRM_FRAMES`] chunk of `samples` (interleaved stereo; the last
+    /// chunk may be shorter) by `gain_for(chunk)`, which sees the chunk's raw samples, then
+    /// guards each 10 ms block. A silenced block counts in `stats.unattenuated_blocks` and
+    /// sets `follow_now`. A gap is faded out over the 5 ms before it (`fade_edges`) when those
+    /// frames are in this packet; when the gap starts at the packet's first frame, `gap_at(0)`
+    /// is called so the render thread fades the already-queued frames. Audio after a gap
+    /// fades in over 5 ms.
+    pub fn condition_with<F: FnMut(&[f32]) -> f32>(
+        &mut self,
+        samples: &mut [f32],
+        mut gain_for: F,
+        stats: &AudioStats,
+        follow_now: &AtomicBool,
         mut gap_at: impl FnMut(usize),
     ) {
-        for s in samples.iter_mut() {
-            *s *= gain;
+        for chunk in samples.chunks_mut(CONFIRM_FRAMES * 2) {
+            let gain = gain_for(chunk);
+            for s in chunk.iter_mut() {
+                *s *= gain;
+            }
         }
         let frames = samples.len() / 2;
         let mut start = 0;
@@ -171,6 +203,7 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
     let mut bytes = vec![0u8; MAX_PACKET_FRAMES * 8];
     let mut samples = vec![0.0f32; MAX_PACKET_FRAMES * 2];
     let mut conditioner = Conditioner::new();
+    let mut confirm = LevelConfirm::new();
     let mut pushed: u64 = 0;
     let mut pending_reset = false;
     let mut error = None;
@@ -220,7 +253,8 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
             if n == 0 {
                 break;
             }
-            ctx.shared.last_input_us.store(now_us(), Ordering::Release);
+            let now = now_us();
+            ctx.shared.last_input_us.store(now, Ordering::Release);
             ctx.shared
                 .capture_packet_frames
                 .store(n as u32, Ordering::Relaxed);
@@ -233,11 +267,34 @@ fn capture(mut ctx: CaptureCtx, ready: &Sender<Result<(), String>>) -> Result<()
             if pending_reset && ctx.markers.push(InputMarker::Discontinuity(pushed)).is_ok() {
                 pending_reset = false;
             }
-            let gain = ctx.gains.capture_gain();
+            // R2: the ramp is read before the gain. The engine publishes the gain first, so
+            // the gain read here is at least as new as the ramp (a device-change mute, gain 0,
+            // is never paired with an older gain).
+            confirm.observe(ctx.gains.attach(), now);
+            let conservative = ctx.gains.capture_gain();
             let markers = &mut ctx.markers;
-            conditioner.condition(pkt, gain, &ctx.stats, &ctx.follow_now, |offset| {
-                let _ = markers.push(InputMarker::GuardGap(pushed + offset as u64));
-            });
+            conditioner.condition_with(
+                pkt,
+                |raw| confirm.chunk_gain(raw, conservative),
+                &ctx.stats,
+                &ctx.follow_now,
+                |offset| {
+                    let _ = markers.push(InputMarker::GuardGap(pushed + offset as u64));
+                },
+            );
+            let (confirmed, fallback) = confirm.take_counts();
+            if confirmed > 0 {
+                ctx.stats
+                    .diag
+                    .capture_confirm_chunks
+                    .fetch_add(confirmed, Ordering::Relaxed);
+            }
+            if fallback > 0 {
+                ctx.stats
+                    .diag
+                    .capture_fallback_chunks
+                    .fetch_add(fallback, Ordering::Relaxed);
+            }
             let written_frames = push_frames(&mut ctx.output, pkt);
             pushed += written_frames as u64;
             if written_frames < n {
@@ -394,6 +451,67 @@ mod tests {
         assert_eq!(left[3 * n - 1], 0.5);
         assert_eq!(stats.unattenuated_blocks.load(Ordering::Relaxed), 1);
         assert!(left.iter().all(|s| s.abs() <= 0.5));
+    }
+
+    /// R2: one gain per `CONFIRM_FRAMES` chunk, each asked for with the chunk's raw samples;
+    /// the safety guard still judges 441-frame blocks.
+    #[test]
+    fn conditioner_applies_a_gain_per_confirm_chunk() {
+        let stats = AudioStats::default();
+        let follow = AtomicBool::new(false);
+        let mut c = Conditioner::new();
+        let mut pkt = vec![0.01f32; 441 * 2];
+        let mut asked = Vec::new();
+        c.condition_with(
+            &mut pkt,
+            |raw| {
+                assert!(raw.iter().all(|&s| s == 0.01), "raw, before any gain");
+                asked.push(raw.len() / 2);
+                asked.len() as f32
+            },
+            &stats,
+            &follow,
+            |_| {},
+        );
+        assert_eq!(
+            asked,
+            vec![110, 110, 110, 110, 1],
+            "the last chunk is 1 frame"
+        );
+        for (i, f) in pkt.chunks(2).enumerate() {
+            let want = 0.01 * (i / CONFIRM_FRAMES + 1) as f32;
+            assert_eq!(f, [want, want], "frame {i}");
+        }
+        assert_eq!(stats.unattenuated_blocks.load(Ordering::Relaxed), 0);
+
+        // A chunk raised too far trips the guard for its whole 441-frame block only.
+        let mut pkt = vec![0.01f32; 882 * 2];
+        let mut chunk = 0;
+        c.condition_with(
+            &mut pkt,
+            |_| {
+                chunk += 1;
+                if chunk == 6 {
+                    200.0
+                } else {
+                    1.0
+                }
+            },
+            &stats,
+            &follow,
+            |_| {},
+        );
+        assert_eq!(stats.unattenuated_blocks.load(Ordering::Relaxed), 1);
+        assert!(
+            pkt[441 * 2..].iter().all(|&s| s == 0.0),
+            "second block silenced"
+        );
+        let fade = edge_fade_frames();
+        assert!(
+            pkt[..(441 - fade) * 2].iter().all(|&s| s == 0.01),
+            "first block kept (up to the fade-out before the gap)"
+        );
+        assert!(follow.load(Ordering::Acquire));
     }
 
     #[test]

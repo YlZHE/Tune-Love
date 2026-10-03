@@ -29,6 +29,7 @@
 //! gains are read from atomics. The [`Holder`](crate::holder::Holder) is never touched here.
 
 pub mod capture;
+mod confirm;
 pub mod endpoint;
 mod processing;
 pub mod render;
@@ -130,6 +131,11 @@ pub struct DiagCounters {
     pub capture_flag_discontinuity: AtomicU64,
     pub capture_flag_timestamp: AtomicU64,
     pub capture_ring_overflow_frames: AtomicU64,
+    /// R2: capture chunks (about 2.5 ms) whose level confirmed an attach step's gain.
+    pub capture_confirm_chunks: AtomicU64,
+    /// R2: capture chunks inside a confirmation window that kept the conservative gain (no
+    /// usable reference, or the level matched no issued step).
+    pub capture_fallback_chunks: AtomicU64,
     pub proc_blocks: AtomicU64,
     pub proc_resets: AtomicU64,
     pub proc_ring_b_drops: AtomicU64,
@@ -224,6 +230,8 @@ pub(crate) fn diag_loop_with(
             &d.capture_flag_discontinuity,
             &d.capture_flag_timestamp,
             &d.capture_ring_overflow_frames,
+            &d.capture_confirm_chunks,
+            &d.capture_fallback_chunks,
             &d.proc_blocks,
             &d.proc_resets,
             &d.proc_ring_b_drops,
@@ -249,6 +257,8 @@ pub(crate) fn diag_loop_with(
         "cap_disc",
         "cap_ts_err",
         "cap_overflow",
+        "r2_ok",
+        "r2_fb",
         "proc_blocks",
         "proc_resets",
         "proc_b_drops",
@@ -276,8 +286,8 @@ pub(crate) fn diag_loop_with(
         "devocal diag: run={run} start t={:.6} unix_ms={unix_ms}",
         last_us as f64 / 1e6
     ));
-    let line = |last: &[u64; 21], now: [u64; 21], t_us: u64, span_us: u64, partial: bool| {
-        let mut fields = [("", 0u64); 21];
+    let line = |last: &[u64; 23], now: [u64; 23], t_us: u64, span_us: u64, partial: bool| {
+        let mut fields = [("", 0u64); 23];
         for (i, f) in fields.iter_mut().enumerate() {
             *f = (names[i], now[i].wrapping_sub(last[i]));
         }
@@ -1307,10 +1317,30 @@ mod tests {
             steps: 2,
             original: 0.5,
         }));
+        let mut confirm = confirm::LevelConfirm::new();
+        let quiet = vec![0.002f32; 441 * 2];
+        let mut lowered = vec![0.002f32; 441 * 2];
         let before = alloc_count::this_thread();
         for i in 0..50u64 {
             cond.condition(&mut loud, 1.0, &stats, &follow, |_| {});
             cond.condition(&mut block, 1.0, &stats, &follow, |_| {});
+            // R2: reference (no ramp), then a window, then the ramp gone again.
+            let ramp = (i % 25 >= 10).then_some(AttachRamp {
+                epoch: (i / 25) as u32,
+                steps: 2,
+                original: 0.5,
+            });
+            confirm.observe(ramp, i * 10_000);
+            let _ = confirm.chunk_gain(&quiet[..110 * 2], 1.0);
+            lowered.fill(0.00024); // about step 1 of original 0.5
+            cond.condition_with(
+                &mut lowered,
+                |raw| confirm.chunk_gain(raw, 1.0),
+                &stats,
+                &follow,
+                |_| {},
+            );
+            let _ = confirm.take_counts();
             fade.start(10);
             fade.apply(&mut block);
             let _ = mk_tx.push(i * 441 + 300);

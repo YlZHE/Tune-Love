@@ -26,6 +26,7 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_dialog::init())
         .manage(media)
         .manage(media::transport::TransportState::default())
         .manage(audio)
@@ -33,6 +34,12 @@ pub fn run() {
         .manage(settings::SettingsWindowState::default())
         .manage(autotune::AutotuneState::default())
         .manage(devocal)
+        .manage(devocal::model::state::ModelState::new(
+            devocal::model::manifest::bundled(),
+            std::env::var_os(devocal::MODEL_ENV)
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from),
+        ))
         .setup(|app| {
             use tauri::Manager;
             // First: give back any player volume a crashed app/engine left lowered.
@@ -47,6 +54,8 @@ pub fn run() {
                 if !migrated.is_empty() {
                     eprintln!("models: migrated legacy file(s): {}", migrated.join(", "));
                 }
+                app.state::<devocal::model::state::ModelState>()
+                    .set_models_dir(dir.join("models"));
             }
             app.state::<audio::AudioState>().start();
             // Installed builds ship the bridge and Python under the resource dir.
@@ -104,7 +113,9 @@ pub fn run() {
             settings::open_settings,
             autotune::autotune_command,
             devocal::get_devocal_status,
-            devocal::devocal_command
+            devocal::devocal_command,
+            devocal::model::get_model_status,
+            devocal::model::model_command
         ])
         .build(tauri::generate_context!())
         .expect("Could not start Tune Love")

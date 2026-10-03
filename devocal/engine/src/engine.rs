@@ -29,7 +29,11 @@
 //! player's original volume, the reference for R2's level check) or [`ATTACH_REF_WAIT_US`]
 //! (100 ms) have passed since that stamp, whichever comes first. During the wait the player
 //! plays at its own volume and the engine's output gain is still 0, so nothing is audible
-//! twice.
+//! twice. A default render device change seen during the wait (the Holder is still idle and
+//! ignores it) is remembered and replayed right after `begin_attach`, so the capture is
+//! silenced as for a change while attaching. After a successful `begin_attach` the next
+//! periodic follow is not due before the end of the R2 confirm window
+//! ([`CONFIRM_WINDOW_US`] after the ramp start); event-driven follows still run at once.
 //!
 //! Every tick (1 ms in [`run`]):
 //! 1. a finished model load (installed or reported);
@@ -86,7 +90,7 @@ use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCES
 use crate::audio::endpoint::session_endpoint;
 use crate::audio::{now_us, AudioConfig, AudioHandle, SharedGains};
 use crate::dsp::SAMPLE_RATE;
-use crate::holder::{Holder, HolderPhase};
+use crate::holder::{Holder, HolderPhase, CONFIRM_WINDOW_US};
 use crate::notify::{SessionSignals, SessionWatcher};
 use crate::pipe::{pipe_name, Accepted, PipeServer};
 use crate::processor::{Processor, Stage};
@@ -241,13 +245,16 @@ struct PendingLoad {
 type StateKey = (Phase, Option<Mode>, Option<FallbackReason>, Option<u32>);
 
 /// An attach whose audio is running and whose `begin_attach` has not run yet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PendingAttach {
     pid: u32,
     created_at: u64,
     /// When the audio was running: the time of the first tick after the start (the attach
     /// command's own time predates a start that may block for tens of milliseconds).
     started_us: Option<u64>,
+    /// The latest default render device change seen while waiting (the holder is still idle
+    /// and ignores it): replayed right after `begin_attach` (ruling 10).
+    device_changed: Option<Option<String>>,
 }
 
 pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
@@ -277,7 +284,11 @@ pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     /// (stage before the last forwarded toggle, until when the requested mode is reported).
     toggle_settle: Option<(Stage, u64)>,
     bound_endpoint: Option<String>,
+    /// Next output endpoint check.
     next_check_us: Option<u64>,
+    /// Next periodic `Holder::follow` (every 0.5 s; after an attach not before the end of the
+    /// R2 confirm window).
+    next_follow_us: Option<u64>,
     next_metrics_us: Option<u64>,
     overridden_total: u64,
     last_state: StateKey,
@@ -312,6 +323,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             toggle_settle: None,
             bound_endpoint: None,
             next_check_us: None,
+            next_follow_us: None,
             next_metrics_us: None,
             overridden_total: 0,
             last_state: (Phase::Idle, None, None, None),
@@ -529,6 +541,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
                     pid,
                     created_at,
                     started_us: None,
+                    device_changed: None,
                 });
                 // A fresh processor: apply the user's current toggle once.
                 self.sync_toggle(now_us);
@@ -715,12 +728,28 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         {
             return;
         }
-        let PendingAttach {
-            pid, created_at, ..
-        } = *pending;
-        self.pending_attach = None;
+        let Some(PendingAttach {
+            pid,
+            created_at,
+            device_changed,
+            ..
+        }) = self.pending_attach.take()
+        else {
+            return;
+        };
         match self.holder.begin_attach(pid, created_at, now_us) {
             Ok(report) => {
+                if let Some(endpoint) = device_changed {
+                    // Ruling 10: the change the idle holder ignored silences the capture now.
+                    self.holder.default_device_changed(now_us, endpoint);
+                }
+                // Ruling 11: no periodic follow inside the R2 confirm window (it would end the
+                // published ramp); event-driven follows still run at once.
+                let window_end = now_us.saturating_add(CONFIRM_WINDOW_US);
+                self.next_follow_us = Some(
+                    self.next_follow_us
+                        .map_or(window_end, |t| t.max(window_end)),
+                );
                 if report.restore_failed > 0 || report.restore_corrupt {
                     ev.push(error(
                         ErrorCode::AttachFailed,
@@ -797,6 +826,10 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         if due {
             self.next_check_us = Some(now_us + CHECK_INTERVAL_US);
         }
+        let follow_due = self.next_follow_us.is_none_or(|t| now_us >= t);
+        if follow_due {
+            self.next_follow_us = Some(now_us + CHECK_INTERVAL_US);
+        }
         // Notifications are taken every pass; they matter only while holding.
         // A new session, or a watched (parked) session turned active.
         let created = self.signals.take_session_created() | self.signals.take_state_changed();
@@ -807,6 +840,11 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
                 self.event_follow = true;
             }
             if let Some(endpoint) = default_changed {
+                if let Some(p) = self.pending_attach.as_mut() {
+                    // The holder is still idle (reference wait) and would drop it: replayed
+                    // after `begin_attach` (ruling 10).
+                    p.device_changed = Some(endpoint.clone());
+                }
                 // Silent (never amplified) until the player is held on the new endpoint.
                 self.holder.default_device_changed(now_us, endpoint);
             }
@@ -815,7 +853,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         }
         let requested = self.audio_live() && self.audio.take_follow_request();
         let event = self.event_follow && self.phase == Phase::Active;
-        if (due || requested || event) && self.phase == Phase::Active {
+        if (follow_due || requested || event) && self.phase == Phase::Active {
             self.event_follow = false;
             self.follow(now_us, ev);
         }
@@ -2670,6 +2708,65 @@ mod tests {
         r.run(40);
         assert_eq!(r.core.phase(), Phase::Active);
         assert_eq!(r.volume(SESSION), HELD_VOLUME);
+    }
+
+    /// Ruling 10: a default device change during the reference wait (holder still idle) is
+    /// replayed once `begin_attach` ran, so the capture stays silent.
+    #[test]
+    fn default_device_change_during_the_reference_wait_mutes_after_attach() {
+        let mut r = Rig::new("ref-wait-device");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.audio().set_input_frames(0);
+        r.send(attach());
+        r.run(5);
+        r.core.signals().notify_default_changed(Some("ep2".into()));
+        r.run(5);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0, "still waiting");
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        r.run(1);
+        assert_eq!(r.core.sessions().set_volume_calls(), 1, "attached");
+        let gains = r.audio().st().gains.clone().unwrap();
+        assert_eq!(gains.capture_gain(), 0.0, "device mute replayed");
+        assert_eq!(gains.attach(), None);
+        // The player has not moved to ep2: still silent once held.
+        r.run(40);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert_eq!(gains.capture_gain(), 0.0);
+        assert_eq!(gains.attach(), None);
+    }
+
+    /// Ruling 11: the periodic follow waits for the end of the R2 confirm window.
+    #[test]
+    fn periodic_follow_waits_for_the_confirm_window() {
+        let mut r = Rig::new("confirm-window-follow");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        // Idle ticks: the first one makes the periodic check due at T0 + 500 ms.
+        r.run(400);
+        let t1 = r.now;
+        r.send(attach());
+        let gains = r.audio().st().gains.clone().unwrap();
+        r.run(10);
+        // A session appears without a notification: only a periodic follow lowers it.
+        const LATE: &str = "ep1|player|2%b100";
+        r.core
+            .sessions()
+            .add_session(session(LATE, "ep1"), 0.9, false);
+        while r.now < t1 + CONFIRM_WINDOW_US {
+            r.core.tick(r.now);
+            let ms = (r.now - t1) / MS;
+            assert!(gains.attach().is_some(), "+{ms} ms: published");
+            assert_eq!(r.volume(LATE), 0.9, "+{ms} ms: no periodic follow yet");
+            r.now += MS;
+        }
+        r.core.tick(r.now);
+        assert_eq!(
+            r.volume(LATE),
+            HELD_VOLUME,
+            "the periodic follow at +150 ms"
+        );
+        assert_eq!(gains.attach(), None);
     }
 
     #[test]

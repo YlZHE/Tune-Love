@@ -3,4 +3,5 @@ pub mod download;
 pub mod fake;
 pub mod fetch;
 pub mod manifest;
+pub mod state;
 pub mod verify;

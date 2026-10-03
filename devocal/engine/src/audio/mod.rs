@@ -29,11 +29,12 @@
 //! gains are read from atomics. The [`Holder`](crate::holder::Holder) is never touched here.
 
 pub mod capture;
+mod confirm;
 pub mod endpoint;
 mod processing;
 pub mod render;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -45,13 +46,15 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
-    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, SetEvent,
-    WaitForSingleObject,
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CancelWaitableTimer,
+    CreateEventW, CreateWaitableTimerExW, SetEvent, SetWaitableTimer, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
 };
 
 use devocal_core::protocol::FallbackReason;
 
 use crate::dsp::{frames_for_ms, SAMPLE_RATE};
+use crate::holder::AttachRamp;
 use crate::processor::{Processor, Stage};
 use crate::separator::Separator;
 
@@ -94,8 +97,9 @@ pub struct AudioStats {
     /// `LoadMonitor::ratio() * 1000` while the model runs, 0 otherwise.
     pub load_ratio_milli: AtomicU32,
     /// Estimated end-to-end added latency in microseconds (milli-milliseconds): capture
-    /// packet + ring A + ring B + device padding + processor latency + 3 render periods for
-    /// the system path (see `render::SYSTEM_PATH_PERIODS`).
+    /// packet + ring A (with the block being processed) + ring B + device padding + processor
+    /// latency + the calibrated system
+    /// path (about 3.2 render periods, see `render::SYSTEM_PATH_PERIOD_TENTHS`).
     pub latency_ms_milli: AtomicU32,
     /// Capture packets flagged discontinuous / timestamp error, plus ring overflows.
     pub discontinuities: AtomicU64,
@@ -106,8 +110,9 @@ pub struct AudioStats {
     pub stage: AtomicU8,
     /// Processor fallback reason ([`reason_code`]: 0 none, 1 Overload, 2 ModelError).
     pub fallback_reason: AtomicU8,
-    /// Extra render headroom in frames added after jitter underruns (on top of
-    /// one period + one hop; at most [`MAX_EXTRA_HEADROOM_FRAMES`]).
+    /// Extra render headroom in frames (on top of one period + one hop; at most
+    /// [`MAX_EXTRA_HEADROOM_FRAMES`]): jitter growth plus a pre-roll, as
+    /// `render::Headroom::total`; both decay again (O1).
     pub headroom_frames: AtomicU32,
     /// A thread ended without being stopped (error or panic). `capture_failed` also covers
     /// process loopback errors; render device errors are `AudioHandle::output_failed`
@@ -127,22 +132,310 @@ pub struct DiagCounters {
     pub capture_flag_discontinuity: AtomicU64,
     pub capture_flag_timestamp: AtomicU64,
     pub capture_ring_overflow_frames: AtomicU64,
+    /// R2: capture chunks (about 2.5 ms) raised above the conservative gain because their
+    /// level matched an issued attach step.
+    pub capture_confirm_chunks: AtomicU64,
+    /// R2: capture chunks inside a confirmation window that kept the conservative gain (no
+    /// usable reference, or the level matched no issued step).
+    pub capture_fallback_chunks: AtomicU64,
     pub proc_blocks: AtomicU64,
     pub proc_resets: AtomicU64,
     pub proc_ring_b_drops: AtomicU64,
+    /// Every render wake (device, data, deadline and timeout alike).
     pub render_wakes: AtomicU64,
+    /// Render wakes because the processing thread pushed a block to ring B (O2).
+    pub render_data_wakes: AtomicU64,
+    /// Render wakes at the read deadline, just before the device reads (O2).
+    pub render_deadline_wakes: AtomicU64,
+    /// Render wakes after 20 ms with nothing signalled. Device wakes are `render_wakes`
+    /// minus data, deadline and timeout wakes.
+    pub render_timeout_wakes: AtomicU64,
+    /// Device wakes that found their deadline still armed (it never fired). An isolated
+    /// miss checks only whether the device ran dry (ruling 17). Close to the device wakes:
+    /// deadlines are being missed.
+    pub render_missed_deadlines: AtomicU64,
+    /// Streams switched to checking on device wakes (legacy, until reopened) after
+    /// [`render::MISSED_DEADLINE_LIMIT`] missed deadlines within
+    /// [`render::MISSED_DEADLINE_WINDOW_US`].
+    pub render_legacy_switches: AtomicU64,
     pub render_real_frames: AtomicU64,
     pub render_pad_events: AtomicU64,
     pub render_pad_frames: AtomicU64,
     pub render_trim_frames: AtomicU64,
     pub render_preroll_frames: AtomicU64,
+    /// Ring B frames skipped when released headroom decays (O1); not in `render_trim_frames`.
+    pub render_decay_frames: AtomicU64,
+    // Ruling 24 columns, appended after `lat_ms` (gauges are reset by every diag line).
+    /// Longest `process_block` since the last line, us (gauge).
+    pub proc_block_max_us: AtomicU64,
+    /// Blocks whose `process_block` took over 2, 3 and 5 ms (counters).
+    pub proc_over_2ms: AtomicU64,
+    pub proc_over_3ms: AtomicU64,
+    pub proc_over_5ms: AtomicU64,
+    /// Longest time between two capture packets, us (gauge).
+    pub capture_gap_max_us: AtomicU64,
+    /// Lowest queue a check wake found, minus a period (gauge; see
+    /// [`DiagCounters::note_check_margin`]).
+    check_margin_low: AtomicU64,
+    /// Latest a deadline wake came after its due time, us (gauge).
+    pub deadline_late_max_us: AtomicU64,
+}
+
+/// [`DiagCounters::check_margin_low`] holds `MARGIN_BIAS - margin` so `fetch_max` keeps the
+/// lowest margin; 0 means no check since the last reset.
+const MARGIN_BIAS: i64 = 1 << 32;
+
+impl DiagCounters {
+    /// A check wake found `margin` frames above one period queued (negative: short).
+    pub fn note_check_margin(&self, margin: i64) {
+        let v = (MARGIN_BIAS - margin.clamp(1 - MARGIN_BIAS, MARGIN_BIAS - 1)) as u64;
+        self.check_margin_low.fetch_max(v, Ordering::Relaxed);
+    }
+
+    /// The lowest margin noted since the last call (`None` if no check), and resets it.
+    pub fn take_check_margin(&self) -> Option<i64> {
+        match self.check_margin_low.swap(0, Ordering::Relaxed) {
+            0 => None,
+            v => Some(MARGIN_BIAS - v as i64),
+        }
+    }
+
+    /// One processed block took `us`.
+    pub fn note_block_time(&self, us: u64) {
+        self.proc_block_max_us.fetch_max(us, Ordering::Relaxed);
+        for (limit, n) in [
+            (2_000, &self.proc_over_2ms),
+            (3_000, &self.proc_over_3ms),
+            (5_000, &self.proc_over_5ms),
+        ] {
+            if us > limit {
+                n.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// What one starvation looked like beyond [`Starvation`] (ruling 24 log): written by the
+/// render thread with each counted underrun, logged by the engine with a forced fallback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StarvationDetail {
+    pub at_us: u64,
+    /// The wake that padded: 0 device, 1 data, 2 deadline, 3 timeout.
+    pub wake: u64,
+    /// Device padding and ring B frames when the check started, and how many frames short
+    /// of a period the queue was after the real frames written.
+    pub padding: u64,
+    pub ring_b: u64,
+    pub shortfall: u64,
+    pub since_capture_us: u64,
+    pub since_push_us: u64,
+    /// How long the block being processed had been running (0: none in flight).
+    pub block_busy_us: u64,
+    /// How late the deadline wake was (0 for other wakes).
+    pub check_late_us: u64,
+    pub headroom: u64,
+    /// The overload judgement (`render::Verdict::code`).
+    pub verdict: u64,
+}
+
+const DETAIL_FIELDS: usize = 11;
+
+impl StarvationDetail {
+    fn to_words(self) -> [u64; DETAIL_FIELDS] {
+        [
+            self.at_us,
+            self.wake,
+            self.padding,
+            self.ring_b,
+            self.shortfall,
+            self.since_capture_us,
+            self.since_push_us,
+            self.block_busy_us,
+            self.check_late_us,
+            self.headroom,
+            self.verdict,
+        ]
+    }
+
+    fn from_words(w: [u64; DETAIL_FIELDS]) -> Self {
+        Self {
+            at_us: w[0],
+            wake: w[1],
+            padding: w[2],
+            ring_b: w[3],
+            shortfall: w[4],
+            since_capture_us: w[5],
+            since_push_us: w[6],
+            block_busy_us: w[7],
+            check_late_us: w[8],
+            headroom: w[9],
+            verdict: w[10],
+        }
+    }
+}
+
+/// Ruling 24 log of forced fallbacks and overload retries (atomics only; the engine loop
+/// formats the line). The render thread writes each counted underrun's detail; the
+/// processing thread copies it into `forced_detail` when that underrun forces the fallback,
+/// before it bumps `forced`, so a later underrun cannot overwrite what is logged.
+#[derive(Debug, Default)]
+pub(crate) struct FallbackLog {
+    detail: [AtomicU64; DETAIL_FIELDS],
+    forced_detail: [AtomicU64; DETAIL_FIELDS],
+    /// The fallback's trigger: 1 underrun, 2 load.
+    pub trigger: AtomicU8,
+    pub forced_at_us: AtomicU64,
+    pub load_milli: AtomicU32,
+    /// The processor's stage just before it was forced ([`stage_code`]).
+    pub stage: AtomicU8,
+    /// A retry was scheduled for this fallback.
+    pub retry_armed: AtomicBool,
+    /// Forced fallbacks so far; incremented (Release) after the fields above are written.
+    pub forced: AtomicU32,
+    /// Overload retries started so far.
+    pub retries: AtomicU32,
+}
+
+impl FallbackLog {
+    pub fn set_detail(&self, d: StarvationDetail) {
+        for (a, v) in self.detail.iter().zip(d.to_words()) {
+            a.store(v, Ordering::Relaxed);
+        }
+    }
+
+    pub fn detail(&self) -> StarvationDetail {
+        StarvationDetail::from_words(self.detail.each_ref().map(|a| a.load(Ordering::Relaxed)))
+    }
+
+    /// Keeps the latest counted underrun's detail as the forced fallback's (processing
+    /// thread, before `forced` is bumped).
+    pub fn keep_forced_detail(&self) {
+        for (to, from) in self.forced_detail.iter().zip(&self.detail) {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    pub fn forced_detail(&self) -> StarvationDetail {
+        StarvationDetail::from_words(
+            self.forced_detail
+                .each_ref()
+                .map(|a| a.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+/// The engine log line for a forced fallback (ruling 24).
+pub(crate) fn fallback_line(run: u32, log: &FallbackLog, now_us: u64) -> String {
+    let trigger = log.trigger.load(Ordering::Acquire);
+    let at = log.forced_at_us.load(Ordering::Relaxed);
+    let mut l = format!(
+        "devocal audio: run={run} forced fallback (overload) {} ms ago: trigger={} load={:.3} \
+         stage={} retry={}",
+        now_us.saturating_sub(at) / 1000,
+        if trigger == 2 { "load" } else { "underrun" },
+        log.load_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+        log.stage.load(Ordering::Relaxed),
+        if log.retry_armed.load(Ordering::Relaxed) {
+            "scheduled"
+        } else {
+            "none"
+        },
+    );
+    if trigger != 2 {
+        let d = log.forced_detail();
+        l.push_str(&format!(
+            " | starved {} ms before: verdict={} wake={} padding={} ring_b={} shortfall={} \
+             since_capture_us={} since_push_us={} block_busy_us={} check_late_us={} headroom={}",
+            at.saturating_sub(d.at_us) / 1000,
+            render::Verdict::name(d.verdict),
+            ["device", "data", "deadline", "timeout"]
+                .get(d.wake as usize)
+                .unwrap_or(&"?"),
+            d.padding,
+            d.ring_b,
+            d.shortfall,
+            d.since_capture_us,
+            d.since_push_us,
+            d.block_busy_us,
+            d.check_late_us,
+            d.headroom,
+        ));
+    }
+    l
+}
+
+/// Process-wide run counter: tells apart the logs of successive `AudioHandle::start`s.
+static RUN_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Next run id, monotonic within the process, starting at 1.
+pub(crate) fn next_run_id() -> u32 {
+    RUN_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// One `DEVOCAL_DIAG` line: run id, QPC time `t_us`, the span the deltas cover, the counter
+/// deltas, the free-form `tail`, and a trailing ` partial` when the span is cut short.
+pub(crate) fn diag_line(
+    run: u32,
+    t_us: u64,
+    span_us: u64,
+    fields: &[(&str, u64)],
+    tail: &str,
+    partial: bool,
+) -> String {
+    let mut line = format!(
+        "devocal diag: run={run} t={:.6} span_ms={}",
+        t_us as f64 / 1e6,
+        span_us / 1000
+    );
+    for (name, n) in fields {
+        line.push_str(&format!(" {name}={n}"));
+    }
+    if !tail.is_empty() {
+        line.push(' ');
+        line.push_str(tail);
+    }
+    if partial {
+        line.push_str(" partial");
+    }
+    line
+}
+
+/// The renderer's "stream opened" log line.
+pub(crate) fn render_open_line(run: u32, describe: &str, period: usize, buffer: usize) -> String {
+    format!("devocal audio: run={run} render {describe} (period {period} frames, buffer {buffer})")
 }
 
 /// Env var that turns on the once-a-second diagnostic log.
 pub const DIAG_ENV: &str = "DEVOCAL_DIAG";
 
-/// Logs counter deltas once a second until `shared.stop`.
+/// How often the diag thread looks at the stop flag.
+const DIAG_POLL_MS: u64 = 50;
+
+/// Logs counter deltas once a second until `shared.stop`, then one partial last line.
 fn diag_loop(stats: Arc<AudioStats>, shared: Arc<Shared>, gains: Arc<SharedGains>) {
+    diag_loop_with(
+        stats,
+        shared,
+        gains,
+        1_000_000,
+        || thread::sleep(Duration::from_millis(DIAG_POLL_MS)),
+        now_us,
+        |l| eprintln!("{l}"),
+    );
+}
+
+/// [`diag_loop`] with its own interval, poll wait, clock (microseconds) and sink. Emits a
+/// start line, a line every `interval_us`, and on stop a last line (marked partial) covering
+/// the time since the previous one. Only this detached thread formats strings.
+pub(crate) fn diag_loop_with(
+    stats: Arc<AudioStats>,
+    shared: Arc<Shared>,
+    gains: Arc<SharedGains>,
+    interval_us: u64,
+    mut wait: impl FnMut(),
+    mut clock: impl FnMut() -> u64,
+    mut emit: impl FnMut(String),
+) {
     let d = &stats.diag;
     let read = || {
         [
@@ -151,15 +444,23 @@ fn diag_loop(stats: Arc<AudioStats>, shared: Arc<Shared>, gains: Arc<SharedGains
             &d.capture_flag_discontinuity,
             &d.capture_flag_timestamp,
             &d.capture_ring_overflow_frames,
+            &d.capture_confirm_chunks,
+            &d.capture_fallback_chunks,
             &d.proc_blocks,
             &d.proc_resets,
             &d.proc_ring_b_drops,
             &d.render_wakes,
+            &d.render_data_wakes,
+            &d.render_deadline_wakes,
+            &d.render_timeout_wakes,
+            &d.render_missed_deadlines,
+            &d.render_legacy_switches,
             &d.render_real_frames,
             &d.render_pad_events,
             &d.render_pad_frames,
             &d.render_trim_frames,
             &d.render_preroll_frames,
+            &d.render_decay_frames,
             &stats.unattenuated_blocks,
             &stats.underruns,
         ]
@@ -171,36 +472,92 @@ fn diag_loop(stats: Arc<AudioStats>, shared: Arc<Shared>, gains: Arc<SharedGains
         "cap_disc",
         "cap_ts_err",
         "cap_overflow",
+        "r2_ok",
+        "r2_fb",
         "proc_blocks",
         "proc_resets",
         "proc_b_drops",
         "r_wakes",
+        "r_data",
+        "r_deadline",
+        "r_timeout",
+        "r_missed",
+        "r_legacy",
         "r_real",
         "r_pad_ev",
         "r_pad_fr",
         "r_trim",
         "r_preroll",
+        "r_decay",
         "guard",
         "underruns",
     ];
+    let run = shared.run_id;
     let mut last = read();
-    while !shared.stop.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_millis(1000));
-        let now = read();
-        let mut line = String::from("devocal diag:");
-        for ((name, n), l) in names.iter().zip(now).zip(last) {
-            line.push_str(&format!(" {name}={}", n - l));
+    let mut last_us = clock();
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    emit(format!(
+        "devocal diag: run={run} start t={:.6} unix_ms={unix_ms}",
+        last_us as f64 / 1e6
+    ));
+    // Ruling 24 columns: counters as deltas, gauges read and reset per line.
+    let over = || {
+        [&d.proc_over_2ms, &d.proc_over_3ms, &d.proc_over_5ms].map(|a| a.load(Ordering::Relaxed))
+    };
+    let mut last_over = over();
+    let mut gauges = move || {
+        let now = over();
+        let margin = d
+            .take_check_margin()
+            .map_or_else(|| "-".to_string(), |m| m.to_string());
+        let s = format!(
+            " proc_max_us={} proc_over2={} proc_over3={} proc_over5={} cap_gap_max_us={} \
+             chk_margin_min={margin} dl_late_max_us={}",
+            d.proc_block_max_us.swap(0, Ordering::Relaxed),
+            now[0].wrapping_sub(last_over[0]),
+            now[1].wrapping_sub(last_over[1]),
+            now[2].wrapping_sub(last_over[2]),
+            d.capture_gap_max_us.swap(0, Ordering::Relaxed),
+            d.deadline_late_max_us.swap(0, Ordering::Relaxed),
+        );
+        last_over = now;
+        s
+    };
+    let line =
+        |last: &[u64; 24], now: [u64; 24], t_us: u64, span_us: u64, partial: bool, extra: &str| {
+            let mut fields = [("", 0u64); 24];
+            for (i, f) in fields.iter_mut().enumerate() {
+                *f = (names[i], now[i].wrapping_sub(last[i]));
+            }
+            let tail = format!(
+                "stage={} in_ring={} headroom={} cap_gain={:.1} out_gain={:.3} lat_ms={:.1}{extra}",
+                stats.stage.load(Ordering::Relaxed),
+                shared.in_ring_frames.load(Ordering::Relaxed),
+                stats.headroom_frames.load(Ordering::Relaxed),
+                gains.capture_gain(),
+                gains.output_gain(),
+                stats.latency_ms_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+            );
+            diag_line(run, t_us, span_us, &fields, &tail, partial)
+        };
+    loop {
+        wait();
+        let stopping = shared.stop.load(Ordering::Acquire);
+        let t = clock();
+        let span = t.saturating_sub(last_us);
+        if !stopping && span < interval_us {
+            continue;
         }
-        line.push_str(&format!(
-            " stage={} in_ring={} headroom={} cap_gain={:.1} out_gain={:.3}",
-            stats.stage.load(Ordering::Relaxed),
-            shared.in_ring_frames.load(Ordering::Relaxed),
-            stats.headroom_frames.load(Ordering::Relaxed),
-            gains.capture_gain(),
-            gains.output_gain(),
-        ));
-        eprintln!("{line}");
+        let now = read();
+        let extra = gauges();
+        emit(line(&last, now, t, span, stopping, &extra));
         last = now;
+        last_us = t;
+        if stopping {
+            return;
+        }
     }
 }
 
@@ -255,32 +612,48 @@ pub fn reason_from_code(code: u8) -> Option<FallbackReason> {
 }
 
 /// What the render thread saw when the output starved; carried with a counted underrun.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Starvation {
     /// The processor's stage ran the model.
     pub ran_model: bool,
     /// Unprocessed input waiting in ring A, in frames.
     pub backlog_frames: usize,
+    /// The stage was `WarmingUp` (its output is the passthrough): never forces a fallback.
+    pub warming: bool,
+    /// Set by the render thread when the underrun is counted: the overload judgement
+    /// (ruling 24, `render::OverloadJudge`) says this one forces `Fallback(Overload)`.
+    pub force: bool,
 }
 
 const SNAPSHOT_MODEL_BIT: u64 = 1 << 63;
+const SNAPSHOT_WARMING_BIT: u64 = 1 << 62;
+const SNAPSHOT_FORCE_BIT: u64 = 1 << 61;
+const SNAPSHOT_BACKLOG_MASK: u64 = SNAPSHOT_FORCE_BIT - 1;
 
-/// Packs a [`Starvation`] into one word (bit 63 = model ran, low bits = backlog frames) so
-/// the render thread publishes it atomically, without a torn pair across two underruns.
+/// Packs a [`Starvation`] into one word (bit 63 = model ran, 62 = warming, 61 = force, low
+/// bits = backlog frames) so the render thread publishes it atomically, without a torn set
+/// across two underruns.
 pub fn pack_starvation(s: Starvation) -> u64 {
-    let backlog = (s.backlog_frames as u64).min(SNAPSHOT_MODEL_BIT - 1);
-    if s.ran_model {
-        backlog | SNAPSHOT_MODEL_BIT
-    } else {
-        backlog
+    let mut w = (s.backlog_frames as u64).min(SNAPSHOT_BACKLOG_MASK);
+    for (on, bit) in [
+        (s.ran_model, SNAPSHOT_MODEL_BIT),
+        (s.warming, SNAPSHOT_WARMING_BIT),
+        (s.force, SNAPSHOT_FORCE_BIT),
+    ] {
+        if on {
+            w |= bit;
+        }
     }
+    w
 }
 
 /// Inverse of [`pack_starvation`].
 pub fn unpack_starvation(word: u64) -> Starvation {
     Starvation {
         ran_model: word & SNAPSHOT_MODEL_BIT != 0,
-        backlog_frames: (word & !SNAPSHOT_MODEL_BIT) as usize,
+        backlog_frames: (word & SNAPSHOT_BACKLOG_MASK) as usize,
+        warming: word & SNAPSHOT_WARMING_BIT != 0,
+        force: word & SNAPSHOT_FORCE_BIT != 0,
     }
 }
 
@@ -299,7 +672,7 @@ pub const MAX_EXTRA_HEADROOM_FRAMES: usize = 441;
 pub const PREROLL_FRAMES: usize = 441;
 /// Devocal latency budget (50 ms at 44.1 kHz). Covers the engine-internal part only (capture
 /// packet, ring A, model latency, render target); the published latency estimate adds
-/// `render::SYSTEM_PATH_PERIODS` render periods for the system path on top of it.
+/// the calibrated system path (`render::SYSTEM_PATH_PERIOD_TENTHS`) on top of it.
 pub const LATENCY_BUDGET_FRAMES: usize = 2_205;
 
 /// Gains as `f32` bit patterns; published by the engine loop from the Holder every 1 ms.
@@ -307,14 +680,69 @@ pub const LATENCY_BUDGET_FRAMES: usize = 2_205;
 pub struct SharedGains {
     pub capture_gain_bits: AtomicU32,
     pub output_gain_bits: AtomicU32,
+    /// The Holder's [`AttachRamp`] (R2) packed as [`ATTACH_VALID`] | epoch << 16 | steps;
+    /// 0 = none. Written after `attach_original_bits` (see [`SharedGains::set_attach`]).
+    attach_word: AtomicU64,
+    /// [`AttachRamp::original`] as `f32` bits, valid only with the word around it.
+    attach_original_bits: AtomicU32,
 }
+
+/// Set in a published [`SharedGains::attach_word`].
+const ATTACH_VALID: u64 = 1 << 63;
+/// Low bits of the attach word holding [`AttachRamp::steps`] (at most `RAMP_STEPS`).
+const ATTACH_STEPS_MASK: u64 = 0xFFFF;
+const ATTACH_EPOCH_SHIFT: u32 = 16;
 
 impl SharedGains {
     pub fn new(capture_gain: f32, output_gain: f32) -> Self {
         Self {
             capture_gain_bits: AtomicU32::new(capture_gain.to_bits()),
             output_gain_bits: AtomicU32::new(output_gain.to_bits()),
+            attach_word: AtomicU64::new(0),
+            attach_original_bits: AtomicU32::new(0),
         }
+    }
+
+    /// Publishes the Holder's attach ramp (engine loop, every tick). `original` is written
+    /// first, then the word (Release), so a reader that sees the word sees its original.
+    /// When the original changes the word is cleared first, so a reader can never pair a new
+    /// original with an old word.
+    pub fn set_attach(&self, r: Option<AttachRamp>) {
+        let Some(r) = r else {
+            self.attach_word.store(0, Ordering::Release);
+            return;
+        };
+        let bits = r.original.to_bits();
+        if self.attach_original_bits.load(Ordering::Relaxed) != bits {
+            self.attach_word.store(0, Ordering::Relaxed);
+            fence(Ordering::Release);
+            self.attach_original_bits.store(bits, Ordering::Relaxed);
+        }
+        let steps = u64::from(r.steps).min(ATTACH_STEPS_MASK);
+        let word = ATTACH_VALID | (u64::from(r.epoch) << ATTACH_EPOCH_SHIFT) | steps;
+        self.attach_word.store(word, Ordering::Release);
+    }
+
+    /// The published attach ramp; lock-free and allocation-free (capture thread). Reads the
+    /// word, the original, then the word again: `None` when the two words differ (a write in
+    /// between), when nothing is published, or when the original is not finite and positive.
+    pub fn attach(&self) -> Option<AttachRamp> {
+        let word = self.attach_word.load(Ordering::Acquire);
+        if word & ATTACH_VALID == 0 {
+            return None;
+        }
+        let original = f32::from_bits(self.attach_original_bits.load(Ordering::Acquire));
+        if self.attach_word.load(Ordering::Acquire) != word {
+            return None;
+        }
+        if !original.is_finite() || original <= 0.0 {
+            return None;
+        }
+        Some(AttachRamp {
+            epoch: (word >> ATTACH_EPOCH_SHIFT) as u32,
+            steps: (word & ATTACH_STEPS_MASK) as u32,
+            original,
+        })
     }
 
     pub fn set(&self, capture_gain: f32, output_gain: f32) {
@@ -421,12 +849,18 @@ pub(crate) enum RenderCommand {
 pub(crate) struct Shared {
     pub stop: AtomicBool,
     pub start_us: u64,
+    /// Which `AudioHandle::start` this is ([`next_run_id`]); tags every log line.
+    pub run_id: u32,
     /// `now_us()` of the latest capture packet, 0 before the first.
     pub last_input_us: AtomicU64,
     /// Frames in the latest capture packet (capture period estimate).
     pub capture_packet_frames: AtomicU32,
     /// Frames waiting in ring A (published by the processing thread).
     pub in_ring_frames: AtomicU32,
+    /// Frames the processing thread has taken from ring A and not yet pushed to ring B: one
+    /// hop while it processes a block (for the model, most of a hop's time), else 0. Part of
+    /// the latency estimate; without it a device wake during inference reads one hop low.
+    pub proc_in_flight_frames: AtomicU32,
     /// Processor latency and hop (published by the processing thread).
     pub proc_latency_frames: AtomicU32,
     pub proc_hop: AtomicU32,
@@ -436,8 +870,18 @@ pub(crate) struct Shared {
     /// Snapshot taken when the output starved ([`pack_starvation`]), published with each
     /// counted underrun before `AudioStats::underruns` is incremented.
     pub underrun_snapshot: AtomicU64,
+    /// `now_us()` when the processing thread finished the block it last pushed to ring B
+    /// (0 before the first); ruling 24 log.
+    pub last_push_us: AtomicU64,
+    /// `now_us()` when the block being processed started, 0 when none; ruling 24 log.
+    pub block_start_us: AtomicU64,
+    /// Forced fallbacks and overload retries, for the engine log (ruling 24).
+    pub fallback_log: FallbackLog,
     /// Wakes the processing thread (capture pushed data, control message, stop).
     pub wake: OwnedEvent,
+    /// Wakes the render thread: set by the processing thread after every block it pushes to
+    /// ring B, so the block is written to the device on arrival (O2).
+    pub render_wake: OwnedEvent,
 }
 
 pub struct AudioHandle {
@@ -449,6 +893,9 @@ pub struct AudioHandle {
     proc_ctl: Mutex<Producer<ProcCommand>>,
     render_ctl: Mutex<Producer<RenderCommand>>,
     workers: Vec<Worker>,
+    /// Forced fallbacks and retries already logged ([`AudioHandle::take_fallback_log`]).
+    logged_forced: AtomicU32,
+    logged_retries: AtomicU32,
 }
 
 impl AudioHandle {
@@ -484,15 +931,21 @@ impl AudioHandle {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             start_us: now_us(),
+            run_id: next_run_id(),
             last_input_us: AtomicU64::new(0),
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),
+            proc_in_flight_frames: AtomicU32::new(0),
             proc_latency_frames: AtomicU32::new(processor.latency_frames() as u32),
             proc_hop: AtomicU32::new(processor.hop() as u32),
             output_failed: AtomicBool::new(false),
             preroll_request: AtomicBool::new(false),
             underrun_snapshot: AtomicU64::new(0),
+            last_push_us: AtomicU64::new(0),
+            block_start_us: AtomicU64::new(0),
+            fallback_log: FallbackLog::default(),
             wake: OwnedEvent::new()?,
+            render_wake: OwnedEvent::new()?,
         });
 
         let (in_tx, in_rx) = RingBuffer::<f32>::new(RING_FRAMES * 2);
@@ -509,6 +962,8 @@ impl AudioHandle {
             proc_ctl: Mutex::new(proc_ctl_tx),
             render_ctl: Mutex::new(render_ctl_tx),
             workers: Vec::new(),
+            logged_forced: AtomicU32::new(0),
+            logged_retries: AtomicU32::new(0),
         };
 
         let ctx = processing::ProcessingCtx {
@@ -627,6 +1082,25 @@ impl AudioHandle {
     /// Processor fallback reason (for the status mapping, caller obligation 5).
     pub fn fallback_reason(&self) -> Option<FallbackReason> {
         reason_from_code(self.stats.fallback_reason.load(Ordering::Acquire))
+    }
+
+    /// The next engine log line about a forced fallback or an overload retry not logged yet
+    /// (ruling 24); the engine loop calls it every tick.
+    pub fn take_fallback_log(&self) -> Option<String> {
+        let log = &self.shared.fallback_log;
+        let run = self.shared.run_id;
+        let forced = log.forced.load(Ordering::Acquire);
+        if forced != self.logged_forced.swap(forced, Ordering::Relaxed) {
+            return Some(fallback_line(run, log, now_us()));
+        }
+        let retries = log.retries.load(Ordering::Acquire);
+        if retries != self.logged_retries.swap(retries, Ordering::Relaxed) {
+            return Some(format!(
+                "devocal audio: run={run} overload retry {retries}: devocal on again (with \
+                 pre-roll)"
+            ));
+        }
+        None
     }
 
     /// Returns and clears the safety guard's request to run `Holder::follow()` now.
@@ -892,9 +1366,236 @@ impl Drop for OwnedEvent {
     }
 }
 
+/// One-shot high-resolution waitable timer (auto-reset), closed on drop. The render thread
+/// arms it after each device wake for the read deadline (O2). A kernel timer, not an audio
+/// device.
+pub(crate) struct HiResTimer(HANDLE);
+
+// SAFETY: a timer handle may be set and waited on from any thread.
+unsafe impl Send for HiResTimer {}
+unsafe impl Sync for HiResTimer {}
+
+impl HiResTimer {
+    /// `None` where high-resolution timers are unavailable (before Windows 10 1803); the
+    /// renderer then pads on device wakes as before.
+    pub fn new() -> Option<Self> {
+        unsafe {
+            CreateWaitableTimerExW(
+                None,
+                PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+        }
+        .ok()
+        .map(HiResTimer)
+    }
+
+    /// Signals once, `us` microseconds from now (re-arming replaces a pending due time and
+    /// resets the signal). Never allocates or blocks.
+    pub fn arm_in_us(&self, us: u64) {
+        // Relative due time: negative, in 100 ns units.
+        let due = -(us.min(i64::MAX as u64 / 10) as i64 * 10);
+        let _ = unsafe { SetWaitableTimer(self.0, &due, 0, None, None, false) };
+    }
+
+    /// Stops a pending due time and clears a signal not yet waited on, so nothing armed
+    /// before fires afterwards. Not on the per-block path (a new stream).
+    pub fn cancel(&self) {
+        let _ = unsafe { CancelWaitableTimer(self.0) };
+        // An auto-reset timer that already fired stays signalled until a wait takes it.
+        let _ = unsafe { WaitForSingleObject(self.0, 0) };
+    }
+
+    pub fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for HiResTimer {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_shared() -> Shared {
+        Shared {
+            stop: AtomicBool::new(false),
+            start_us: now_us(),
+            run_id: next_run_id(),
+            last_input_us: AtomicU64::new(0),
+            capture_packet_frames: AtomicU32::new(0),
+            in_ring_frames: AtomicU32::new(0),
+            proc_in_flight_frames: AtomicU32::new(0),
+            proc_latency_frames: AtomicU32::new(0),
+            proc_hop: AtomicU32::new(128),
+            output_failed: AtomicBool::new(false),
+            preroll_request: AtomicBool::new(false),
+            underrun_snapshot: AtomicU64::new(0),
+            last_push_us: AtomicU64::new(0),
+            block_start_us: AtomicU64::new(0),
+            fallback_log: FallbackLog::default(),
+            wake: OwnedEvent::new().unwrap(),
+            render_wake: OwnedEvent::new().unwrap(),
+        }
+    }
+
+    #[test]
+    fn diag_line_carries_run_time_and_span() {
+        let fields = [("cap_pkts", 100u64), ("underruns", 0)];
+        assert_eq!(
+            diag_line(7, 12_345_678, 1_000_000, &fields, "stage=0", false),
+            "devocal diag: run=7 t=12.345678 span_ms=1000 cap_pkts=100 underruns=0 stage=0"
+        );
+        let partial = diag_line(7, 12_345_678, 420_000, &fields, "stage=0", true);
+        assert!(
+            partial.ends_with("span_ms=420 cap_pkts=100 underruns=0 stage=0 partial"),
+            "{partial}"
+        );
+    }
+
+    #[test]
+    fn run_ids_increase() {
+        let a = next_run_id();
+        let b = next_run_id();
+        assert!(a >= 1 && b > a);
+    }
+
+    #[test]
+    fn render_open_line_names_the_run() {
+        assert_eq!(
+            render_open_line(3, "wasapi autoconvert", 441, 1036),
+            "devocal audio: run=3 render wasapi autoconvert (period 441 frames, buffer 1036)"
+        );
+    }
+
+    /// Ruling 17 (4): the loop runs on the test thread against a simulated clock (each poll
+    /// wait advances it 50 ms; the stop comes after the fifth), so machine load cannot shift
+    /// the lines: start, full lines at 100 and 200 ms, a partial one of 50 ms at 250 ms.
+    #[test]
+    fn diag_loop_emits_a_final_partial_line_after_stop() {
+        use std::cell::Cell;
+        let stats = Arc::new(AudioStats::default());
+        let shared = Arc::new(test_shared());
+        let gains = Arc::new(SharedGains::new(1.0, 1.0));
+        let t0 = 7_000_000u64;
+        let clock = Cell::new(t0);
+        let polls = Cell::new(0u32);
+        let mut lines = Vec::new();
+        diag_loop_with(
+            stats.clone(),
+            shared.clone(),
+            gains,
+            100_000,
+            || {
+                clock.set(clock.get() + 50_000);
+                polls.set(polls.get() + 1);
+                stats.diag.render_wakes.fetch_add(3, Ordering::Relaxed);
+                if polls.get() == 5 {
+                    shared.stop.store(true, Ordering::Release);
+                }
+            },
+            || clock.get(),
+            |l| lines.push(l),
+        );
+        assert_eq!(polls.get(), 5, "returns at the first poll after the stop");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].contains(" start "), "{}", lines[0]);
+        let field = |l: &str, key: &str| -> f64 {
+            l.split_whitespace()
+                .find_map(|w| w.strip_prefix(key))
+                .unwrap_or_else(|| panic!("no {key} in {l}"))
+                .parse()
+                .unwrap()
+        };
+        let (last, full) = lines[1..].split_last().unwrap();
+        assert!(!full.is_empty(), "at least one full line: {lines:?}");
+        for l in full {
+            assert!(!l.contains("partial"), "{l}");
+            assert_eq!(field(l, "span_ms="), 100.0, "{l}");
+            assert_eq!(field(l, "r_wakes="), 6.0, "two polls' counts: {l}");
+        }
+        assert!(last.ends_with(" partial"), "{last}");
+        assert!(field(last, "span_ms=") < 100.0, "{last}");
+        assert_eq!(field(last, "span_ms="), 50.0, "{last}");
+        let run = format!("run={}", shared.run_id);
+        assert!(lines.iter().all(|l| l.contains(&run)), "{lines:?}");
+        let ts: Vec<f64> = lines.iter().map(|l| field(l, "t=")).collect();
+        assert!(ts.windows(2).all(|w| w[1] > w[0]), "{ts:?}");
+        assert_eq!(ts, vec![7.0, 7.1, 7.2, 7.25]);
+    }
+
+    /// Ruling 24: the new columns come after `lat_ms` (existing order unchanged, ` partial`
+    /// still last); counters are per-line deltas, gauges are reset by every line.
+    #[test]
+    fn diag_lines_end_with_the_ruling_24_columns() {
+        use std::cell::Cell;
+        let stats = Arc::new(AudioStats::default());
+        let shared = Arc::new(test_shared());
+        let gains = Arc::new(SharedGains::new(1.0, 1.0));
+        let clock = Cell::new(7_000_000u64);
+        let polls = Cell::new(0u32);
+        let mut lines = Vec::new();
+        diag_loop_with(
+            stats.clone(),
+            shared.clone(),
+            gains,
+            100_000,
+            || {
+                clock.set(clock.get() + 50_000);
+                polls.set(polls.get() + 1);
+                let d = &stats.diag;
+                d.note_block_time(2_500);
+                match polls.get() {
+                    1 => {
+                        d.note_block_time(5_200);
+                        d.capture_gap_max_us.fetch_max(10_400, Ordering::Relaxed);
+                        d.note_check_margin(120);
+                        d.deadline_late_max_us.fetch_max(30, Ordering::Relaxed);
+                    }
+                    3 => {
+                        d.note_check_margin(-16);
+                        d.note_check_margin(7);
+                    }
+                    5 => shared.stop.store(true, Ordering::Release),
+                    _ => {}
+                }
+            },
+            || clock.get(),
+            |l| lines.push(l),
+        );
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        let tail = |l: &str| l[l.find(" lat_ms=").unwrap()..].to_string();
+        assert!(
+            tail(&lines[1]).ends_with(
+                " proc_max_us=5200 proc_over2=3 proc_over3=1 proc_over5=1 \
+                 cap_gap_max_us=10400 chk_margin_min=120 dl_late_max_us=30"
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            tail(&lines[2]).ends_with(
+                " proc_max_us=2500 proc_over2=2 proc_over3=0 proc_over5=0 cap_gap_max_us=0 \
+                 chk_margin_min=-16 dl_late_max_us=0"
+            ),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            lines[3].ends_with(" chk_margin_min=- dl_late_max_us=0 partial"),
+            "{}",
+            lines[3]
+        );
+        // Existing columns keep their order, the new ones follow `lat_ms`.
+        let l = &lines[1];
+        let at = |k: &str| l.find(k).unwrap_or_else(|| panic!("{k} in {l}"));
+        assert!(at(" underruns=") < at(" stage=") && at(" lat_ms=") < at(" proc_max_us="));
+    }
 
     #[test]
     fn idle_input_is_not_an_underrun() {
@@ -934,6 +1635,46 @@ mod tests {
         assert_eq!(edge_fade_frames(), 221);
     }
 
+    /// O2's deadline timer is a kernel timer (not an audio device). Systems without
+    /// high-resolution waitable timers (before Windows 10 1803) skip the check.
+    #[test]
+    fn hires_timer_fires_after_its_delay() {
+        let Some(timer) = HiResTimer::new() else {
+            eprintln!("skipped: CreateWaitableTimerExW(HIGH_RESOLUTION) failed on this system");
+            return;
+        };
+        let t0 = now_us();
+        timer.arm_in_us(2_000);
+        let r = unsafe { WaitForSingleObject(timer.raw(), 50) };
+        let elapsed = now_us() - t0;
+        assert_eq!(r, WAIT_OBJECT_0, "signalled within 50 ms");
+        assert!(elapsed >= 1_500, "{elapsed} us");
+    }
+
+    /// `cancel` drops both a pending due time and a signal that already fired.
+    #[test]
+    fn hires_timer_cancel_clears_pending_and_fired() {
+        let Some(timer) = HiResTimer::new() else {
+            eprintln!("skipped: CreateWaitableTimerExW(HIGH_RESOLUTION) failed on this system");
+            return;
+        };
+        timer.arm_in_us(2_000);
+        timer.cancel();
+        assert_ne!(
+            unsafe { WaitForSingleObject(timer.raw(), 20) },
+            WAIT_OBJECT_0,
+            "pending due time cancelled"
+        );
+        timer.arm_in_us(500);
+        thread::sleep(Duration::from_millis(10));
+        timer.cancel();
+        assert_ne!(
+            unsafe { WaitForSingleObject(timer.raw(), 0) },
+            WAIT_OBJECT_0,
+            "fired signal cleared"
+        );
+    }
+
     /// Ruling 5: the per-block helpers used by the audio threads never allocate.
     #[test]
     fn per_block_helpers_do_not_allocate() {
@@ -945,12 +1686,51 @@ mod tests {
         let mut gaps = render::GapFader::new(edge_fade_frames());
         let (mut mk_tx, mut mk_rx) = RingBuffer::<u64>::new(8);
         let mut trim = render::TrimPolicy::new(1_000);
+        let mut headroom = render::Headroom::new();
+        let mut missed = render::MissedDeadlines::new();
+        let mut power = 0.0f64;
         let mut block = vec![0.25f32; 441 * 2];
         let mut loud = vec![3.0f32; 441 * 2];
+        let timer = HiResTimer::new();
+        let event = OwnedEvent::new().unwrap();
+        let gains = SharedGains::new(1.0, 1.0);
+        gains.set_attach(Some(AttachRamp {
+            epoch: 1,
+            steps: 2,
+            original: 0.5,
+        }));
+        let mut confirm = confirm::LevelConfirm::new();
+        // Reference at 0.1; the lowered packet at step 1 of original 0.5 (about -18.5 dB).
+        let reference = vec![0.1f32; 441 * 2];
+        let mut lowered = vec![0.0f32; 441 * 2];
+        let mut confirmed = 0u64;
+        let mut overload = render::OverloadJudge::new();
+        let fallback_log = FallbackLog::default();
         let before = alloc_count::this_thread();
         for i in 0..50u64 {
             cond.condition(&mut loud, 1.0, &stats, &follow, |_| {});
             cond.condition(&mut block, 1.0, &stats, &follow, |_| {});
+            // R2: reference (no ramp), then a window, then the ramp gone again.
+            let ramp = (i % 25 >= 10).then_some(AttachRamp {
+                epoch: (i / 25) as u32,
+                steps: 2,
+                original: 0.5,
+            });
+            let in_window = ramp.is_some();
+            confirm.observe(ramp, i * 10_000);
+            if in_window {
+                lowered.fill(0.0119);
+            } else {
+                lowered.copy_from_slice(&reference);
+            }
+            cond.condition_with(
+                &mut lowered,
+                |raw| confirm.chunk_gain(raw, 1.0),
+                &stats,
+                &follow,
+                |_| {},
+            );
+            confirmed += confirm.take_counts().0;
             fade.start(10);
             fade.apply(&mut block);
             let _ = mk_tx.push(i * 441 + 300);
@@ -965,14 +1745,50 @@ mod tests {
                 Starvation {
                     ran_model: true,
                     backlog_frames: 0,
+                    warming: false,
+                    force: false,
                 },
             );
             let _ = judge.poll(i + 20, i + 30);
             let _ = render::grow_headroom(i as usize, 128, MAX_EXTRA_HEADROOM_FRAMES);
+            headroom.on_underrun(i % 2 == 0, 128, MAX_EXTRA_HEADROOM_FRAMES, i * 3_000_000);
+            headroom.add_preroll(64, i * 3_000_000 + 1);
+            let _ = headroom.release(Stage::WarmingUp, i * 3_000_000 + 2);
+            let _ = headroom.release(Stage::Devocal, i * 3_000_000 + 2_900_000);
+            let _ = headroom.total();
+            let _ = render::decay_now(0.3, 0.5, i * 100_000);
+            power = render::track_power(power, &block);
             let _ = is_backlogged(true, 128, 128);
+            // Ruling 24: the overload judgement, the starvation detail and the diag gauges.
+            let seen = Starvation {
+                ran_model: true,
+                backlog_frames: (i as usize) * 7,
+                ..Starvation::default()
+            };
+            let v = overload.judge(seen, 128, i % 3 == 0, i * 4_000_000);
+            fallback_log.set_detail(StarvationDetail {
+                verdict: v.code(),
+                ..StarvationDetail::default()
+            });
+            stats.diag.note_block_time(i * 900);
+            stats.diag.note_check_margin(i as i64 - 50);
             let _ = capture::guard_block(&mut block);
+            let wake = render::wake_from_wait(i as u32 % 4, true);
+            let deadline = render::deadline_mode(timer.is_some(), 441);
+            let _ = render::plan_fill(wake, deadline, i as usize, 300, 4_000, 441, 569);
+            let _ = missed.miss(i * 700_000);
+            if i % 10 == 0 {
+                missed.reset();
+            }
+            if let Some(t) = &timer {
+                t.arm_in_us(8_500);
+            }
+            event.set();
+            let _ = gains.attach();
         }
         assert_eq!(alloc_count::this_thread() - before, 0);
+        assert!(power.is_finite());
+        assert!(confirmed > 0, "the confirmed branch ran");
     }
 
     #[test]
@@ -1012,14 +1828,20 @@ mod tests {
             Starvation {
                 ran_model: true,
                 backlog_frames: 0,
+                warming: false,
+                force: false,
             },
             Starvation {
                 ran_model: false,
                 backlog_frames: 44_100,
+                warming: false,
+                force: false,
             },
             Starvation {
                 ran_model: true,
                 backlog_frames: 300,
+                warming: false,
+                force: false,
             },
         ] {
             assert_eq!(unpack_starvation(pack_starvation(s)), s);
@@ -1047,5 +1869,38 @@ mod tests {
         assert_eq!(g.output_gain(), 0.0);
         g.set(f32::INFINITY, 1.0);
         assert_eq!(g.capture_gain(), 0.0);
+    }
+
+    #[test]
+    fn attach_ramp_round_trips_through_shared_gains() {
+        let g = SharedGains::new(1.0, 0.0);
+        assert_eq!(g.attach(), None, "nothing published yet");
+        let r = AttachRamp {
+            epoch: 7,
+            steps: 3,
+            original: 0.5,
+        };
+        g.set_attach(Some(r));
+        assert_eq!(g.attach(), Some(r));
+        let r2 = AttachRamp {
+            epoch: u32::MAX,
+            steps: 4,
+            original: 0.25,
+        };
+        g.set_attach(Some(r2));
+        assert_eq!(g.attach(), Some(r2));
+        g.set_attach(None);
+        assert_eq!(g.attach(), None);
+        g.set_attach(Some(AttachRamp {
+            original: f32::NAN,
+            ..r
+        }));
+        assert_eq!(g.attach(), None, "NaN original");
+        g.set_attach(Some(AttachRamp { original: 0.0, ..r }));
+        assert_eq!(g.attach(), None, "zero original");
+        g.set_attach(Some(r));
+        assert_eq!(g.attach(), Some(r));
+        // The gains themselves are untouched.
+        assert_eq!((g.capture_gain(), g.output_gain()), (1.0, 0.0));
     }
 }

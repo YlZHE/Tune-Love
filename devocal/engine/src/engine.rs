@@ -22,13 +22,24 @@
 //!
 //! Attach order: `attach` stages the model (or starts that background reload), starts the
 //! audio threads (process loopback of the player tree, output on the player's endpoint) and
-//! only then, on the next tick, calls `Holder::begin_attach` with that tick's time, so the
+//! only then, on a later tick, calls `Holder::begin_attach` with that tick's time, so the
 //! 30 ms volume ramp is not compressed by the audio start-up and nothing is lowered when the
-//! audio cannot start.
+//! audio cannot start (nor when the player exited meanwhile: `begin_attach` refuses it and
+//! the engine is back to idle). The first tick after the start stamps the start time;
+//! `begin_attach` waits until the capture has delivered [`ATTACH_REF_FRAMES`] (three
+//! 441-frame packets, 30 ms, recorded at the player's original volume: the reference for
+//! R2's level check, which needs at least 20 ms of full chunks) or [`ATTACH_REF_WAIT_US`]
+//! (100 ms) have passed since that stamp, whichever comes first. During the wait the player
+//! plays at its own volume and the engine's output gain is still 0, so nothing is audible
+//! twice. A default render device change seen during the wait (the Holder is still idle and
+//! ignores it) is remembered and replayed right after `begin_attach`, so the capture is
+//! silenced as for a change while attaching. After a successful `begin_attach` the next
+//! periodic follow is not due before the end of the R2 confirm window
+//! ([`CONFIRM_WINDOW_US`] after the ramp start); event-driven follows still run at once.
 //!
 //! Every tick (1 ms in [`run`]):
 //! 1. a finished model load (installed or reported);
-//! 2. a pending `begin_attach` (see above);
+//! 2. a pending `begin_attach` once its reference audio is in (see above);
 //! 3. audio thread failure (`capture_failed` -> `CaptureFailed`, other `failed` ->
 //!    `RenderFailed`) while attaching/active: release first, then report;
 //! 4. `Holder::tick`: `Held` while attaching -> `AttachDone`; `Failed` while attaching ->
@@ -42,7 +53,10 @@
 //!    turned active counts as a notification; [`run`] keeps the watches on exactly the
 //!    Holder's parked sessions;
 //! 6. `SharedGains` from the Holder (after the tick and follow, so the audio threads see the
-//!    gain that matches the volumes just set);
+//!    gain that matches the volumes just set), then the attach ramp steps issued so far
+//!    (`Holder::attach_ramp`, `None` outside the clean 150 ms window; a follow pass that
+//!    changed nothing keeps it open). When a published window ends, one line logs why
+//!    (`Holder::attach_ramp_end`: timeout, follow changed sessions, device change, ...);
 //! 7. `Metrics` once per second;
 //! 8. a `State` event whenever phase, mode, fallback reason or attached pid changed.
 //!
@@ -80,7 +94,7 @@ use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCES
 use crate::audio::endpoint::session_endpoint;
 use crate::audio::{now_us, AudioConfig, AudioHandle, SharedGains};
 use crate::dsp::SAMPLE_RATE;
-use crate::holder::{Holder, HolderPhase};
+use crate::holder::{AttachRamp, Holder, HolderPhase, CONFIRM_WINDOW_US};
 use crate::notify::{SessionSignals, SessionWatcher};
 use crate::pipe::{pipe_name, Accepted, PipeServer};
 use crate::processor::{Processor, Stage};
@@ -106,6 +120,16 @@ pub const EXIT_RELEASE_TIMEOUT_US: u64 = 2_000_000;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the writer may take to flush the last events at exit.
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
+/// R2: captured frames the engine waits for before `begin_attach`, so the level check has a
+/// reference recorded at the player's original volume: three 441-frame packets (30 ms). The
+/// level check needs 8 full 110-frame chunks (880 frames, about 20 ms) and records only the
+/// four full chunks of each packet (not its 1-frame remainder), so two packets would leave no
+/// margin at all; the third covers a packet whose chunks are not recorded yet when the engine
+/// reads the count, or a partial packet.
+pub const ATTACH_REF_FRAMES: u64 = 1_323;
+/// R2: longest wait for [`ATTACH_REF_FRAMES`] after the audio started (a paused player sends
+/// nothing); the attach then proceeds without a reference.
+pub const ATTACH_REF_WAIT_US: u64 = 100_000;
 
 /// Audio statistics as plain values.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -141,7 +165,13 @@ pub trait AudioPort {
     fn fallback_reason(&self) -> Option<FallbackReason>;
     /// The safety guard asks for an immediate `Holder::follow` (cleared by the call).
     fn take_follow_request(&self) -> bool;
+    /// The next log line about a forced fallback or an overload retry (ruling 24).
+    fn take_fallback_log(&self) -> Option<String> {
+        None
+    }
     fn stats(&self) -> AudioSnapshot;
+    /// Frames captured from the player since the audio started (0 while stopped).
+    fn input_frames(&self) -> u64;
     /// Stops the audio and returns the model it held (if it came back).
     fn stop(&mut self) -> Option<Box<dyn Separator>>;
 }
@@ -226,6 +256,19 @@ struct PendingLoad {
 
 type StateKey = (Phase, Option<Mode>, Option<FallbackReason>, Option<u32>);
 
+/// An attach whose audio is running and whose `begin_attach` has not run yet.
+#[derive(Debug, Clone)]
+struct PendingAttach {
+    pid: u32,
+    created_at: u64,
+    /// When the audio was running: the time of the first tick after the start (the attach
+    /// command's own time predates a start that may block for tens of milliseconds).
+    started_us: Option<u64>,
+    /// The latest default render device change seen while waiting (the holder is still idle
+    /// and ignores it): replayed right after `begin_attach` (ruling 10).
+    device_changed: Option<Option<String>>,
+}
+
 pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     holder: Holder<S>,
     audio: A,
@@ -245,14 +288,19 @@ pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     pending_load: Option<PendingLoad>,
     phase: Phase,
     pid: Option<u32>,
-    /// `begin_attach` runs on the next tick (after the audio started).
-    pending_attach: Option<(u32, u64)>,
+    /// `begin_attach` runs on a later tick, once reference audio was captured (see the
+    /// module docs).
+    pending_attach: Option<PendingAttach>,
     /// The user's last requested toggle.
     user_devocal: bool,
     /// (stage before the last forwarded toggle, until when the requested mode is reported).
     toggle_settle: Option<(Stage, u64)>,
     bound_endpoint: Option<String>,
+    /// Next output endpoint check.
     next_check_us: Option<u64>,
+    /// Next periodic `Holder::follow` (every 0.5 s; after an attach not before the end of the
+    /// R2 confirm window).
+    next_follow_us: Option<u64>,
     next_metrics_us: Option<u64>,
     overridden_total: u64,
     last_state: StateKey,
@@ -264,6 +312,10 @@ pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     /// A notification asked for a follow pass that has not run yet (it arrived while
     /// attaching).
     event_follow: bool,
+    /// The R2 window being published, and the tick it was first published at.
+    r2_window: Option<(AttachRamp, u64)>,
+    /// Why the last R2 window ended (also logged): `Holder::attach_ramp_end`, or a new epoch.
+    r2_window_end: Option<&'static str>,
 }
 
 impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
@@ -287,6 +339,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             toggle_settle: None,
             bound_endpoint: None,
             next_check_us: None,
+            next_follow_us: None,
             next_metrics_us: None,
             overridden_total: 0,
             last_state: (Phase::Idle, None, None, None),
@@ -295,6 +348,8 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             exit_requested: false,
             signals: Arc::new(SessionSignals::default()),
             event_follow: false,
+            r2_window: None,
+            r2_window_end: None,
         }
     }
 
@@ -404,6 +459,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         self.periodic(now_us, &mut ev);
         self.gains
             .set(self.holder.capture_gain(now_us), self.holder.output_gain());
+        self.publish_attach_ramp(now_us);
         if self.audio_stop_at.is_some_and(|t| now_us >= t) {
             self.stop_audio();
         }
@@ -411,6 +467,9 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             if !self.audio_live() || self.audio.stage() != before || now_us >= until {
                 self.toggle_settle = None;
             }
+        }
+        while let Some(line) = self.audio.take_fallback_log() {
+            eprintln!("{line}");
         }
         self.metrics(now_us, &mut ev);
         self.sync_state(now_us, &mut ev);
@@ -499,7 +558,12 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
                 self.audio_model = with_model;
                 self.audio_toggle = false;
                 self.bound_endpoint = endpoint;
-                self.pending_attach = Some((pid, created_at));
+                self.pending_attach = Some(PendingAttach {
+                    pid,
+                    created_at,
+                    started_us: None,
+                    device_changed: None,
+                });
                 // A fresh processor: apply the user's current toggle once.
                 self.sync_toggle(now_us);
             }
@@ -673,11 +737,41 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         if self.phase != Phase::Attaching {
             return;
         }
-        let Some((pid, created_at)) = self.pending_attach.take() else {
+        let Some(pending) = self.pending_attach.as_mut() else {
+            return;
+        };
+        // R2: wait for 30 ms of audio captured at the player's own volume (the level check's
+        // reference, ATTACH_REF_FRAMES), at most ATTACH_REF_WAIT_US. Meanwhile the player
+        // plays at its original volume and our output gain is 0, so nothing is heard twice
+        // or louder.
+        let started_us = *pending.started_us.get_or_insert(now_us);
+        if self.audio.input_frames() < ATTACH_REF_FRAMES
+            && now_us < started_us.saturating_add(ATTACH_REF_WAIT_US)
+        {
+            return;
+        }
+        let Some(PendingAttach {
+            pid,
+            created_at,
+            device_changed,
+            ..
+        }) = self.pending_attach.take()
+        else {
             return;
         };
         match self.holder.begin_attach(pid, created_at, now_us) {
             Ok(report) => {
+                if let Some(endpoint) = device_changed {
+                    // Ruling 10: the change the idle holder ignored silences the capture now.
+                    self.holder.default_device_changed(now_us, endpoint);
+                }
+                // Ruling 11: no periodic follow inside the R2 confirm window (it would end the
+                // published ramp); event-driven follows still run at once.
+                let window_end = now_us.saturating_add(CONFIRM_WINDOW_US);
+                self.next_follow_us = Some(
+                    self.next_follow_us
+                        .map_or(window_end, |t| t.max(window_end)),
+                );
                 if report.restore_failed > 0 || report.restore_corrupt {
                     ev.push(error(
                         ErrorCode::AttachFailed,
@@ -742,6 +836,36 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         }
     }
 
+    /// Publishes the attach ramp steps issued so far (R2) and logs why a published window
+    /// ended (a timeout, the holder's reason for `None`, or a new epoch).
+    fn publish_attach_ramp(&mut self, now_us: u64) {
+        let ramp = self.holder.attach_ramp(now_us);
+        if let Some((open, since)) = self.r2_window {
+            let end = match ramp {
+                None => Some(self.holder.attach_ramp_end(now_us)),
+                Some(a) if a.epoch != open.epoch => Some("new epoch"),
+                Some(_) => None,
+            };
+            if let Some(reason) = end {
+                eprintln!(
+                    "devocal engine: R2 window {} ended after {} ms ({} steps): {reason}",
+                    open.epoch,
+                    now_us.saturating_sub(since) / 1_000,
+                    open.steps
+                );
+                self.r2_window_end = Some(reason);
+                self.r2_window = None;
+            }
+        }
+        if let Some(a) = ramp {
+            match &mut self.r2_window {
+                Some((open, _)) => *open = a,
+                None => self.r2_window = Some((a, now_us)),
+            }
+        }
+        self.gains.set_attach(ramp);
+    }
+
     fn schedule_audio_stop(&mut self, now_us: u64) {
         if self.audio_running && self.audio_stop_at.is_none() {
             self.audio_stop_at = Some(now_us + AUDIO_STOP_DELAY_US);
@@ -754,6 +878,10 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         if due {
             self.next_check_us = Some(now_us + CHECK_INTERVAL_US);
         }
+        let follow_due = self.next_follow_us.is_none_or(|t| now_us >= t);
+        if follow_due {
+            self.next_follow_us = Some(now_us + CHECK_INTERVAL_US);
+        }
         // Notifications are taken every pass; they matter only while holding.
         // A new session, or a watched (parked) session turned active.
         let created = self.signals.take_session_created() | self.signals.take_state_changed();
@@ -764,6 +892,11 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
                 self.event_follow = true;
             }
             if let Some(endpoint) = default_changed {
+                if let Some(p) = self.pending_attach.as_mut() {
+                    // The holder is still idle (reference wait) and would drop it: replayed
+                    // after `begin_attach` (ruling 10).
+                    p.device_changed = Some(endpoint.clone());
+                }
                 // Silent (never amplified) until the player is held on the new endpoint.
                 self.holder.default_device_changed(now_us, endpoint);
             }
@@ -772,7 +905,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         }
         let requested = self.audio_live() && self.audio.take_follow_request();
         let event = self.event_follow && self.phase == Phase::Active;
-        if (due || requested || event) && self.phase == Phase::Active {
+        if (follow_due || requested || event) && self.phase == Phase::Active {
             self.event_follow = false;
             self.follow(now_us, ev);
         }
@@ -979,6 +1112,10 @@ impl AudioPort for RealAudio {
             .is_some_and(|h| h.take_follow_request())
     }
 
+    fn take_fallback_log(&self) -> Option<String> {
+        self.handle.as_ref().and_then(|h| h.take_fallback_log())
+    }
+
     fn stats(&self) -> AudioSnapshot {
         let Some(h) = &self.handle else {
             return AudioSnapshot::default();
@@ -992,6 +1129,12 @@ impl AudioPort for RealAudio {
             unattenuated_blocks: s.unattenuated_blocks.load(Ordering::Relaxed),
             headroom_frames: s.headroom_frames.load(Ordering::Relaxed),
         }
+    }
+
+    fn input_frames(&self) -> u64 {
+        self.handle
+            .as_ref()
+            .map_or(0, |h| h.stats.diag.capture_frames.load(Ordering::Relaxed))
     }
 
     fn stop(&mut self) -> Option<Box<dyn Separator>> {
@@ -1357,6 +1500,9 @@ mod tests {
         /// `start` advances this clock by `start_delay_us` (a slow audio start).
         clock: Option<Rc<Cell<u64>>>,
         start_delay_us: u64,
+        /// Captured frames reported by `input_frames`; `None` = `u64::MAX` (plenty of
+        /// reference audio, so `begin_attach` runs on the first tick as before).
+        input_frames: Option<u64>,
     }
 
     /// Audio double: records every call; the test sets stage, failures and stats.
@@ -1394,6 +1540,9 @@ mod tests {
         }
         fn set_stats(&self, stats: AudioSnapshot) {
             self.0.borrow_mut().stats = stats;
+        }
+        fn set_input_frames(&self, frames: u64) {
+            self.0.borrow_mut().input_frames = Some(frames);
         }
     }
 
@@ -1468,6 +1617,9 @@ mod tests {
         }
         fn stats(&self) -> AudioSnapshot {
             self.st().stats
+        }
+        fn input_frames(&self) -> u64 {
+            self.st().input_frames.unwrap_or(u64::MAX)
         }
         fn stop(&mut self) -> Option<Box<dyn Separator>> {
             let mut s = self.0.borrow_mut();
@@ -2548,6 +2700,287 @@ mod tests {
         assert_eq!(r.volume(SESSION), HELD_VOLUME);
         assert_eq!(r.core.phase(), Phase::Active);
         assert!(errors(&out).is_empty(), "{out:?}");
+    }
+
+    /// Review Focus 1: the player keeps its volume until three packets (30 ms) of reference
+    /// audio are captured.
+    #[test]
+    fn attach_waits_for_pre_attach_audio() {
+        let mut r = Rig::new("attach-ref-audio");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.audio().set_input_frames(0);
+        r.send(attach());
+        r.run(5);
+        assert_eq!(r.core.phase(), Phase::Attaching);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert_eq!(r.volume(SESSION), 0.8);
+        let gains = r.audio().st().gains.clone().unwrap();
+        assert_eq!(
+            gains.output_gain(),
+            0.0,
+            "our output is silent while waiting"
+        );
+        assert_eq!(gains.attach(), None);
+        assert_eq!(ATTACH_REF_FRAMES, 1_323, "three 441-frame packets");
+        r.audio().set_input_frames(1_322);
+        r.run(1);
+        assert_eq!(
+            r.core.sessions().set_volume_calls(),
+            0,
+            "1322 frames: not yet"
+        );
+        r.audio().set_input_frames(1_323);
+        r.run(1);
+        assert_eq!(r.core.sessions().set_volume_calls(), 1);
+        assert!(r.volume(SESSION) < 0.8, "{}", r.volume(SESSION));
+        assert_eq!(gains.attach().map(|a| a.steps), Some(1));
+        r.run(40);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert_eq!(r.volume(SESSION), HELD_VOLUME);
+    }
+
+    #[test]
+    fn attach_proceeds_after_100ms_without_audio() {
+        let mut r = Rig::new("attach-no-audio");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.audio().set_input_frames(0);
+        r.send(attach());
+        // Ticks at T0 .. T0 + 98 ms.
+        r.run(99);
+        assert_eq!(r.now, T0 + 99 * MS);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert_eq!(r.volume(SESSION), 0.8);
+        // The tick at T0 + 99 ms still waits; the one at T0 + 100 ms starts the ramp.
+        r.run(1);
+        assert_eq!(
+            r.core.sessions().set_volume_calls(),
+            0,
+            "99 ms: still waiting"
+        );
+        assert_eq!(r.now, T0 + ATTACH_REF_WAIT_US);
+        r.run(1);
+        assert_eq!(r.core.sessions().set_volume_calls(), 1, "100 ms: lowering");
+        assert!(r.volume(SESSION) < 0.8);
+        r.run(40);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert_eq!(r.volume(SESSION), HELD_VOLUME);
+    }
+
+    /// Ruling 10: a default device change during the reference wait (holder still idle) is
+    /// replayed once `begin_attach` ran, so the capture stays silent.
+    #[test]
+    fn default_device_change_during_the_reference_wait_mutes_after_attach() {
+        let mut r = Rig::new("ref-wait-device");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.audio().set_input_frames(0);
+        r.send(attach());
+        r.run(5);
+        r.core.signals().notify_default_changed(Some("ep2".into()));
+        r.run(5);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0, "still waiting");
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        r.run(1);
+        assert_eq!(r.core.sessions().set_volume_calls(), 1, "attached");
+        let gains = r.audio().st().gains.clone().unwrap();
+        assert_eq!(gains.capture_gain(), 0.0, "device mute replayed");
+        assert_eq!(gains.attach(), None);
+        // The player has not moved to ep2: still silent once held.
+        r.run(40);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert_eq!(gains.capture_gain(), 0.0);
+        assert_eq!(gains.attach(), None);
+    }
+
+    /// Ruling 11: the periodic follow waits for the end of the R2 confirm window.
+    #[test]
+    fn periodic_follow_waits_for_the_confirm_window() {
+        let mut r = Rig::new("confirm-window-follow");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        // Idle ticks: the first one makes the periodic check due at T0 + 500 ms.
+        r.run(400);
+        let t1 = r.now;
+        r.send(attach());
+        let gains = r.audio().st().gains.clone().unwrap();
+        r.run(10);
+        // A session appears without a notification: only a periodic follow lowers it.
+        const LATE: &str = "ep1|player|2%b100";
+        r.core
+            .sessions()
+            .add_session(session(LATE, "ep1"), 0.9, false);
+        while r.now < t1 + CONFIRM_WINDOW_US {
+            r.core.tick(r.now);
+            let ms = (r.now - t1) / MS;
+            assert!(gains.attach().is_some(), "+{ms} ms: published");
+            assert_eq!(r.volume(LATE), 0.9, "+{ms} ms: no periodic follow yet");
+            r.now += MS;
+        }
+        r.core.tick(r.now);
+        assert_eq!(
+            r.volume(LATE),
+            HELD_VOLUME,
+            "the periodic follow at +150 ms"
+        );
+        assert_eq!(gains.attach(), None);
+    }
+
+    /// Attaches with the reference wait pending (no captured audio yet); returns the gains.
+    fn waiting_attach(tag: &str) -> (Rig, Arc<SharedGains>) {
+        let mut r = Rig::new(tag);
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.audio().set_input_frames(0);
+        r.send(attach());
+        r.run(5);
+        assert_eq!(r.core.phase(), Phase::Attaching);
+        let gains = r.audio().st().gains.clone().unwrap();
+        (r, gains)
+    }
+
+    /// Ruling 17 (3): a new-session notification latched during the reference wait (our own
+    /// render stream opening, say) runs a follow pass once active that finds nothing to do;
+    /// the R2 window stays published for its whole 150 ms and ends by timeout.
+    #[test]
+    fn a_notification_during_the_reference_wait_keeps_the_r2_window() {
+        let (mut r, gains) = waiting_attach("ref-wait-notify");
+        r.core.signals().notify_session_created();
+        r.run(5);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        let t1 = r.now;
+        while r.now < t1 + CONFIRM_WINDOW_US {
+            r.core.tick(r.now);
+            let ms = (r.now - t1) / MS;
+            assert!(gains.attach().is_some(), "+{ms} ms: published");
+            r.now += MS;
+        }
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert!(!r.core.event_follow, "the event follow ran");
+        r.core.tick(r.now);
+        assert_eq!(gains.attach(), None);
+        assert_eq!(r.core.r2_window_end, Some("timeout"));
+    }
+
+    /// The same notification with a real new session: the follow lowers it and ends the
+    /// window at once.
+    #[test]
+    fn a_follow_that_lowers_a_new_session_ends_the_r2_window() {
+        let (mut r, gains) = waiting_attach("ref-wait-notify-new");
+        const NEW: &str = "ep1|player|2%b100";
+        r.core.signals().notify_session_created();
+        r.run(5);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        let t1 = r.now;
+        let mut ended = None;
+        while r.now < t1 + CONFIRM_WINDOW_US {
+            r.core.tick(r.now);
+            if r.now == t1 {
+                // Appears after `begin_attach`, so the ramp does not cover it.
+                r.core
+                    .sessions()
+                    .add_session(session(NEW, "ep1"), 0.9, false);
+            }
+            if gains.attach().is_none() && ended.is_none() {
+                ended = Some((r.now - t1) / MS);
+            }
+            r.now += MS;
+        }
+        let ended = ended.expect("the window ended early");
+        assert!((30..=31).contains(&ended), "ended at +{ended} ms (active)");
+        assert_eq!(r.volume(NEW), HELD_VOLUME);
+        assert_eq!(r.core.r2_window_end, Some("follow changed sessions"));
+    }
+
+    /// Minor: a release during the reference wait lowers nothing and goes back to idle; the
+    /// audio arriving later starts nothing.
+    #[test]
+    fn release_during_the_reference_wait_lowers_nothing() {
+        let (mut r, gains) = waiting_attach("ref-wait-release");
+        let mut ev = r.send(Command::Release);
+        ev.extend(r.run(50));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        r.run(200);
+        assert_eq!(r.core.phase(), Phase::Idle);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert_eq!(r.volume(SESSION), 0.8);
+        assert!(!r.restore.exists());
+        assert_eq!(r.audio().st().stops, 1);
+        assert_eq!(gains.attach(), None);
+    }
+
+    /// Minor: an audio failure during the reference wait reports it, lowers nothing and goes
+    /// back to idle.
+    #[test]
+    fn audio_failure_during_the_reference_wait_lowers_nothing() {
+        let (mut r, _gains) = waiting_attach("ref-wait-failure");
+        r.audio().set_capture_failed();
+        let mut ev = r.run(1);
+        assert_eq!(errors(&ev), vec![ErrorCode::CaptureFailed]);
+        ev.extend(r.run(50));
+        assert_eq!(states(&ev), vec![RELEASING, IDLE]);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        r.run(200);
+        assert_eq!(r.core.phase(), Phase::Idle);
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert!(!r.restore.exists());
+        assert_eq!(r.audio().st().stops, 1);
+    }
+
+    /// Minor: the player exits during the reference wait (its process and sessions are gone):
+    /// nothing is lowered and the engine goes back to idle.
+    #[test]
+    fn player_exit_during_the_reference_wait_lowers_nothing() {
+        let (mut r, _gains) = waiting_attach("ref-wait-exit");
+        r.core.sessions().remove_session(SESSION);
+        r.core.sessions().set_process_created(PID, None);
+        let mut ev = r.run(5);
+        r.audio().set_input_frames(ATTACH_REF_FRAMES);
+        ev.extend(r.run(300));
+        assert_eq!(r.core.phase(), Phase::Idle, "{ev:?}");
+        assert_eq!(r.core.sessions().set_volume_calls(), 0);
+        assert!(!r.restore.exists());
+        assert_eq!(r.audio().st().stops, 1);
+        assert_eq!(states(&ev).last(), Some(&IDLE));
+    }
+
+    #[test]
+    fn published_attach_ramp_follows_the_holder() {
+        let mut r = Rig::new("published-ramp");
+        r.send(Command::Hello { version: PROTOCOL });
+        r.send(set_model("model.onnx", "cpu"));
+        r.send(attach());
+        let gains = r.audio().st().gains.clone().unwrap();
+        assert_eq!(gains.attach(), None);
+        let mut epoch = None;
+        for ms in 0..200u64 {
+            r.core.tick(r.now);
+            r.now += MS;
+            let published = gains.attach();
+            let expected_steps = match ms {
+                0..=9 => Some(1),
+                10..=19 => Some(2),
+                20..=29 => Some(3),
+                30..=149 => Some(4),
+                _ => None,
+            };
+            assert_eq!(
+                published.map(|a| a.steps),
+                expected_steps,
+                "+{ms} ms: {published:?}"
+            );
+            if let Some(a) = published {
+                assert_eq!(a.original, 0.8);
+                assert_eq!(
+                    *epoch.get_or_insert(a.epoch),
+                    a.epoch,
+                    "one epoch per attach"
+                );
+            }
+        }
+        assert_eq!(r.core.phase(), Phase::Active);
     }
 
     #[test]

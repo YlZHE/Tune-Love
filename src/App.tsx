@@ -23,7 +23,6 @@ import { useAutoTuneTarget } from "./useAutoTuneTarget";
 import { useAutoApplyTarget } from "./useAutoApplyTarget";
 import { useAutoApplyEnabled } from "./autoApplyPreferences";
 import { KeyTitle } from "./components/KeyTitle";
-import { AutoTuneTargetStatus } from "./components/AutoTuneTargetStatus";
 
 function WindowButton({ label, children, active, onClick }: {
   label: string; children: ReactNode; active?: boolean; onClick: () => void;
@@ -78,8 +77,7 @@ export function App() {
   const track = status === "ready" ? snapshot.track : null;
   // Progress, playback state and delayed artwork do not identify a new song.
   const songKey = track ? JSON.stringify([track.sourceId ?? track.source, track.title, track.artist, track.album]) : "empty";
-  // One key-detection poll feeds both the title label and the Key/Scale recommendation.
-  const { keyLabel: detectedKey, target } = useAutoTuneTarget(track?.sourceId ?? null, songKey,
+  const { target, evidenceSeconds } = useAutoTuneTarget(track?.sourceId ?? null, songKey,
     track ? snapshot.targetGeneration : undefined);
   const autoApplyEnabled = useAutoApplyEnabled();
   const written = useAutoApplyTarget(target, track ? songKey : "", autoApplyEnabled, setNotice);
@@ -136,8 +134,7 @@ export function App() {
       <header className="titlebar">
         <div className="brand" data-tauri-drag-region>
           <MusicNotes size={17} weight="bold" aria-hidden="true" />
-          <KeyTitle label={detectedKey} />
-          <AutoTuneTargetStatus target={target} written={written} enabled={autoApplyEnabled} />
+          <KeyTitle target={target} evidenceSeconds={evidenceSeconds} written={written} enabled={autoApplyEnabled} />
         </div>
         <div className="window-actions">
           <WindowButton label={pinned ? "取消置顶" : "窗口置顶"} active={pinned} onClick={() => void togglePin()}>

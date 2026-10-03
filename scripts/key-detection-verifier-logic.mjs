@@ -1,4 +1,15 @@
-const PITCH_NAMES = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
+// Same spelling as titleLabel in src/keyDetection.ts (profile option labels).
+const PROFILE_KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const PROFILE_SCALES = { major: "Major", minor: "Minor", chromatic: "Chromatic" };
+
+// The title the app must show for the observed Key/Scale target; null without a valid target.
+function expectedTitle(observation) {
+  const scale = PROFILE_SCALES[observation.targetScale];
+  if (!scale || !Object.hasOwn(PROFILE_SCALES, observation.targetScale)) return null;
+  if (observation.targetKey === null) return observation.targetScale === "chromatic" ? "Chromatic" : null;
+  const key = observation.targetKey;
+  return Number.isInteger(key) && key >= 0 && key < 12 ? `${PROFILE_KEYS[key]} ${scale}` : null;
+}
 
 export function createLiveEvidence(initial) {
   return {
@@ -31,8 +42,9 @@ export function observeLiveEvidence(evidence, observation) {
     && ((evidence.initialStatus !== "detected" && observation.detectionStatus === "detected")
       || (Number.isFinite(evidence.initialUpdatedAtMs) && Number.isFinite(observation.detectionUpdatedAtMs)
         && observation.detectionUpdatedAtMs > evidence.initialUpdatedAtMs));
-  const expectedLabel = validDetectedKey(observation)
-    ? `${PITCH_NAMES[observation.pitchClass]} ${observation.mode === "major" ? "大调" : "小调"}` : null;
+  // libKeyFinder's key (pitchClass/mode) and timestamp are progress evidence only; the title
+  // is the Key/Scale target.
+  const expectedLabel = expectedTitle(observation);
   const accepted = observation.mediaStatus === "ready"
     && observation.playbackStatus === "playing"
     && Number.isFinite(observation.mediaAgeMs) && observation.mediaAgeMs >= -50 && observation.mediaAgeMs <= 8_000
@@ -40,6 +52,7 @@ export function observeLiveEvidence(evidence, observation) {
     && liveAudio(observation)
     && observation.presentKeyCount === 1
     && validDetectedKey(observation)
+    && expectedLabel !== null
     && observation.displayedLabel === expectedLabel
     && progressed;
   return { accepted, progressed, expectedLabel };

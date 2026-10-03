@@ -29,7 +29,10 @@ async function installNativeBoundary(page: Page, initialStatus: "idle" | "detect
       media: { status: "ready", track, capturedAtMs: Date.now(), targetGeneration: 4 },
       key: { sourceId: track.sourceId, trackKey: trackKey(track), targetGeneration: 4,
         status: initialStatus, key: initialStatus === "detected" ? { pitchClass: 9, mode: "minor" } : null,
-        updatedAtMs: 100 },
+        updatedAtMs: 100,
+        // The title shows the Key/Scale recommendation, not the libKeyFinder key above.
+        autotuneTarget: initialStatus === "detected"
+          ? { key: 9, scale: "minor", candidate: null, uncoveredNotes: [], evidenceSeconds: 20, source: "analysis" } : null },
       calls: {}, deferreds: [], deferNext: deferInitial, keyInFlight: 0, maxKeyInFlight: 0, hidden: false,
       song,
       trackKey,
@@ -85,7 +88,8 @@ async function setKey(page: Page, pitchClass: number, mode: "major" | "minor", g
   await page.evaluate(({ pitchClass, mode, generation }) => {
     const state = (window as any).__keyFixture;
     state.key = { sourceId: state.media.track.sourceId, trackKey: state.trackKey(state.media.track),
-      targetGeneration: generation, status: "detected", key: { pitchClass, mode }, updatedAtMs: 100 };
+      targetGeneration: generation, status: "detected", key: { pitchClass, mode }, updatedAtMs: 100,
+      autotuneTarget: { key: pitchClass, scale: mode, candidate: null, uncoveredNotes: [], evidenceSeconds: 20, source: "analysis" } };
   }, { pitchClass, mode, generation });
 }
 
@@ -132,7 +136,7 @@ function expectSafeTitleTimeline(frames: Awaited<ReturnType<typeof sampleTitleTr
   expect(final.nodes.filter(node => node.hidden !== "true" && !node.inert)).toHaveLength(1);
 }
 
-test("shows the brand first, then a validated A minor label without disturbing native titlebar layout", async ({ page }) => {
+test("shows the brand first, then the A Minor title without disturbing native titlebar layout", async ({ page }) => {
   await installNativeBoundary(page);
   const brand = page.locator(".brand");
   await expect(brand).toContainText("Tune Love");
@@ -140,7 +144,7 @@ test("shows the brand first, then a validated A minor label without disturbing n
   await expect(page.getByRole("status")).toHaveCount(0);
 
   await setKey(page, 9, "minor", 4);
-  await expect(brand).toContainText("A 小调", { timeout: 2500 });
+  await expect(brand).toContainText("A Minor", { timeout: 2500 });
   await expect(page.locator(".key-title-text.is-detected")).toHaveCSS("font-size", "14px");
   await expect(page.locator(".key-title-text.is-detected")).toHaveCSS("font-weight", "650");
   for (const name of ["取消置顶", "设置", "关闭"]) await expect(page.getByRole("button", { name })).toBeVisible();
@@ -158,7 +162,7 @@ test("shows the brand first, then a validated A minor label without disturbing n
 
 test("rejects a late old-song result, accepts the new generation, and retains it while paused", async ({ page }) => {
   await installNativeBoundary(page, "detected");
-  await expect(page.locator(".brand")).toContainText("A 小调");
+  await expect(page.locator(".brand")).toContainText("A Minor");
   await page.evaluate(() => { (window as any).__keyFixture.deferNext = true; });
   await expect.poll(() => page.evaluate(() => (window as any).__keyFixture.deferreds.length)).toBe(1);
 
@@ -170,20 +174,20 @@ test("rejects a late old-song result, accepts the new generation, and retains it
     state.deferreds.shift()();
   });
   await page.waitForTimeout(100);
-  await expect(page.locator(".brand")).not.toContainText("A 小调");
+  await expect(page.locator(".brand")).not.toContainText("A Minor");
 
   await setKey(page, 1, "major", 5);
-  await expect(page.locator(".brand")).toContainText("C♯ 大调", { timeout: 2500 });
+  await expect(page.locator(".brand")).toContainText("C# Major", { timeout: 2500 });
   await changeSong(page, "second", 5, "paused");
   await expect(page.getByText("已暂停", { exact: true })).toBeVisible({ timeout: 1800 });
   await page.waitForTimeout(1200);
-  await expect(page.locator(".brand")).toContainText("C♯ 大调");
+  await expect(page.locator(".brand")).toContainText("C# Major");
 });
 
 test("identical polling results keep the same label node and do not restart title motion", async ({ page }) => {
   await installNativeBoundary(page, "detected");
   const label = page.locator(".key-title-text.is-detected");
-  await expect(label).toHaveText("A 小调");
+  await expect(label).toHaveText("A Minor");
   await page.evaluate(() => { (window as any).__steadyKeyNode = document.querySelector(".key-title-text.is-detected"); });
   const beforeCalls = await page.evaluate(() => (window as any).__keyFixture.calls.get_key_detection);
   await expect.poll(() => page.evaluate(() => (window as any).__keyFixture.calls.get_key_detection),
@@ -207,7 +211,7 @@ test("identical polling results keep the same label node and do not restart titl
 test("reduced motion changes the key with a fade fallback and no vertical travel", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   await installNativeBoundary(page, "detected");
-  await expect(page.locator(".brand")).toContainText("A 小调");
+  await expect(page.locator(".brand")).toContainText("A Minor");
   await page.evaluate(() => { (window as any).__keyFixture.deferNext = true; });
   await setKey(page, 11, "major", 4);
   await expect.poll(() => page.evaluate(() => (window as any).__keyFixture.deferreds.length)).toBe(1);
@@ -218,7 +222,7 @@ test("reduced motion changes the key with a fade fallback and no vertical travel
     state.deferreds.shift()();
     await new Promise<void>(resolve => {
       const frame = () => {
-        const label = [...document.querySelectorAll(".key-title-text")].find(node => node.textContent === "B 大调");
+        const label = [...document.querySelectorAll(".key-title-text")].find(node => node.textContent === "B Major");
         if (label) values.push(label.getBoundingClientRect().y);
         if (performance.now() - start < 300) requestAnimationFrame(frame); else resolve();
       };
@@ -228,12 +232,12 @@ test("reduced motion changes the key with a fade fallback and no vertical travel
   });
   expect(samples.length).toBeGreaterThan(1);
   expect(Math.max(...samples) - Math.min(...samples)).toBeLessThan(1);
-  await expect(page.locator(".brand")).toContainText("B 大调");
+  await expect(page.locator(".brand")).toContainText("B Major");
 });
 
 test("a media identity commit synchronously hides the previous song key before effects run", async ({ page }) => {
   await installNativeBoundary(page, "detected");
-  await expect(page.locator(".brand")).toContainText("A 小调");
+  await expect(page.locator(".brand")).toContainText("A Minor");
   const observed = page.evaluate(() => new Promise<string>(resolve => {
     const observer = new MutationObserver(() => {
       if ([...document.querySelectorAll("h1")].some(node => node.textContent === "夜航")) {
@@ -257,7 +261,7 @@ test("rapid identity changes keep one native key read in flight across hook life
     max: (window as any).__keyFixture.maxKeyInFlight }))).toEqual({ calls: 1, max: 1 });
   await setKey(page, 11, "major", 5);
   await page.evaluate(() => { (window as any).__keyFixture.deferreds.shift()(); });
-  await expect(page.locator(".brand")).toContainText("B 大调", { timeout: 2500 });
+  await expect(page.locator(".brand")).toContainText("B Major", { timeout: 2500 });
 });
 
 test("a read started before hide cannot become a fresh result after visibility returns", async ({ page }) => {
@@ -282,14 +286,35 @@ test("a read started before hide cannot become a fresh result after visibility r
     observer.disconnect();
     return values;
   });
-  expect(seen).not.toContain("A 小调");
-  await expect(page.locator(".brand")).toContainText("B 大调", { timeout: 2500 });
+  expect(seen).not.toContain("A Minor");
+  await expect(page.locator(".brand")).toContainText("B Major", { timeout: 2500 });
 });
 
 test("brand-to-key and key-to-key motion stays stage-clipped without horizontal action overlap", async ({ page }) => {
   await installNativeBoundary(page);
   expectSafeTitleTimeline(await sampleTitleTransition(page, 9, "minor", 4));
-  await expect(page.locator(".key-title-text.is-detected:not([aria-hidden='true']):not([inert])")).toHaveText("A 小调");
+  await expect(page.locator(".key-title-text.is-detected:not([aria-hidden='true']):not([inert])")).toHaveText("A Minor");
   expectSafeTitleTimeline(await sampleTitleTransition(page, 1, "major", 4));
-  await expect(page.locator(".key-title-text.is-detected:not([aria-hidden='true']):not([inert])")).toHaveText("C♯ 大调");
+  await expect(page.locator(".key-title-text.is-detected:not([aria-hidden='true']):not([inert])")).toHaveText("C# Major");
+});
+
+test("without evidence the title is Chromatic; an uncertain F Chromatic explains itself in the tooltip", async ({ page }) => {
+  await installNativeBoundary(page);
+  const setTarget = (target: object | null) => page.evaluate(target => {
+    const state = (window as any).__keyFixture;
+    state.key = { ...state.key, status: "analyzing", autotuneTarget: target };
+  }, target);
+  await setTarget({ key: null, scale: "chromatic", candidate: null, uncoveredNotes: [], evidenceSeconds: 0, source: "analysis" });
+  const label = page.locator(".key-title-text.is-detected");
+  await expect(label).toHaveText("Chromatic", { timeout: 2500 });
+  await expect(page.locator(".autotune-target-status")).toHaveCount(0);
+
+  await setTarget({ key: 5, scale: "chromatic", candidate: { key: 5, scale: "minor" }, uncoveredNotes: [8, 11],
+    evidenceSeconds: 14, source: "analysis" });
+  await expect(label).toHaveText("F Chromatic", { timeout: 2500 });
+  await page.locator(".key-title-hit").hover();
+  const tip = page.locator(".warm-tooltip");
+  await expect(tip).toContainText("拿不准：G# 与 B 都常用，暂用 Chromatic。排第一的候选是 F Minor。");
+  expect(await page.evaluate(() => document.querySelector(".music-window")!.scrollWidth
+    <= document.querySelector(".music-window")!.clientWidth)).toBe(true);
 });

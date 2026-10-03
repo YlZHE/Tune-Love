@@ -3,9 +3,9 @@ import { autoTune } from "./useAutoTune";
 import { nextWrite, type WrittenPair } from "./autoApplyTarget";
 import type { AutoTuneTarget } from "./keyDetection";
 
-// Writes the current track's Major/Minor recommendation into the connected
-// plugin once per (connection, track, pair) while the switch is on. Nothing is
-// written before the song has evidence; Chromatic is never recommended. A failure is reported once and never retried on its own.
+// Writes the current track's Key/Scale recommendation into the connected plugin once per
+// (connection, track, pair) while the switch is on. Before the song has evidence that is
+// Chromatic. A failure (e.g. a label the profile lacks) is reported once and never retried on its own.
 export function useAutoApplyTarget(target: AutoTuneTarget | null, trackKey: string, enabled: boolean,
   onNotice: (message: string) => void): WrittenPair | null {
   // Share PlayerControls' status poll instead of starting a second refresh loop.
@@ -25,7 +25,8 @@ export function useAutoApplyTarget(target: AutoTuneTarget | null, trackKey: stri
     rerender();
     // Both labels join one apply batch (see AutoTuneControl.queue).
     Promise.resolve()
-      .then(() => Promise.all([autoTune.setDiscrete("key", pair.key), autoTune.setDiscrete("scale", pair.scale)]))
+      .then(() => Promise.all([pair.key === null ? undefined : autoTune.setDiscrete("key", pair.key),
+        autoTune.setDiscrete("scale", pair.scale)]))
       .then(() => { record.status = "written"; })
       .catch(error => {
         record.status = "failed";

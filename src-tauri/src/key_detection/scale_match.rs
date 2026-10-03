@@ -1,18 +1,38 @@
 //! Choose the Auto-Tune Key/Scale whose allowed note set best covers the song's
-//! accumulated pitch-class evidence. Only Major and Minor are ever chosen: the
-//! user's experience is that Chromatic barely corrects a voice, so there is no
-//! "safe" Chromatic state. Before the first evidence there is no target (nothing
-//! is written); the first evidence commits immediately, later changes need a
-//! clear cost improvement. Parameters are the ones frozen by the offline pilot
-//! (docs/2026-10-02_scale-match-pilot-report.md); the note sets are the textbook
-//! assumption pending stage C verification against the plugin.
-use super::ChromaEvidence;
+//! accumulated pitch-class evidence, and say when that choice is too uncertain
+//! to act on.
+//!
+//! Two layers (docs/2026-10-04_chromatic-gate-report.md):
+//! * The set (Major or Minor, 24 combos covering 12 distinct note sets) comes from
+//!   the pilot-frozen cost matcher: the first evidence commits immediately, later
+//!   changes need a clear cost improvement.
+//! * A gate decides whether to *write* that set or Chromatic ("when uncertain, do
+//!   not pull"). Statistic: max out-of-set weight / min in-set weight, with ENTER and
+//!   EXIT lines and an exit hold, counted in evidence seconds. It mirrors
+//!   `experiments/scale-match/chromatic_gate.py` (`gate_statistic("ratio")`,
+//!   `Gate.update`) step for step; the tests pin both against the same sequences.
+//!   Chromatic is therefore the starting state and the uncertain state; the chosen
+//!   set stays visible as `candidate`.
+//!
+//! The note sets are the textbook assumption verified against the plugin in stage C.
+use super::{ChromaEvidence, Mode, MusicalKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scale {
     Major,
     Minor,
+    Chromatic,
+}
+
+/// A Major/Minor name for the note set the matcher currently favours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Candidate {
+    /// Pitch class 0..12 (C = 0).
+    pub key: u8,
+    /// Major or Minor only.
+    pub scale: Scale,
 }
 
 /// Where the current choice came from: this play's analysis, or the result
@@ -26,12 +46,17 @@ pub enum TargetSource {
 }
 
 /// The current recommendation, keyed exactly like the profile's option tables.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoTuneTarget {
-    /// Pitch class 0..12 (C = 0).
-    pub key: u8,
+    /// Pitch class 0..12 (C = 0) of the current name; None while there is no evidence at all.
+    pub key: Option<u8>,
     pub scale: Scale,
+    /// The favoured set under its name; also given while `scale` is Chromatic.
+    pub candidate: Option<Candidate>,
+    /// Pitch classes outside the set whose weight is at least GATE.exit times the
+    /// weakest in-set weight; at most 2, strongest first.
+    pub uncovered_notes: Vec<u8>,
     /// Seconds of non-silent evidence analysed during this play.
     pub evidence_seconds: f64,
     pub source: TargetSource,
@@ -61,10 +86,27 @@ pub const FROZEN: Params = Params {
     silence_rms: 1.0e-3,
 };
 
+/// Lines of the Chromatic gate, in units of the ratio statistic and evidence seconds.
+#[derive(Clone, Copy, Debug)]
+pub struct GateParams {
+    pub enter: f64,
+    pub exit: f64,
+    pub exit_hold_seconds: f64,
+    pub min_seconds: f64,
+}
+
+/// Frozen by the user's choice of the second-round default (chromatic-gate-02, ratio 3.0/1.5/3/3).
+pub const GATE: GateParams = GateParams {
+    enter: 3.0,
+    exit: 1.5,
+    exit_hold_seconds: 3.0,
+    min_seconds: 3.0,
+};
+
 const MAJOR: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
 const MINOR: [u8; 7] = [0, 2, 3, 5, 7, 8, 10];
 /// Combo order: Major C..B, then Minor C..B. Ties resolve to the earliest
-/// entry, so a relative-minor tie reports the Major name (same notes).
+/// entry, so a relative-minor tie picks the Major combo (same notes).
 const COMBOS: usize = 24;
 
 fn combo(index: usize) -> (u8, Scale) {
@@ -75,11 +117,20 @@ fn combo(index: usize) -> (u8, Scale) {
     }
 }
 
+/// The note set is identified by its major tonic; a minor key's set is that of its
+/// relative major, three semitones up.
+fn set_of(key: u8, scale: Scale) -> usize {
+    match scale {
+        Scale::Minor => (key as usize + 3) % 12,
+        _ => key as usize,
+    }
+}
+
 fn mask(index: usize) -> [bool; 12] {
     let (key, scale) = combo(index);
     let intervals = match scale {
-        Scale::Major => &MAJOR,
         Scale::Minor => &MINOR,
+        _ => &MAJOR,
     };
     let mut allowed = [false; 12];
     intervals
@@ -88,43 +139,125 @@ fn mask(index: usize) -> [bool; 12] {
     allowed
 }
 
+/// max out-of-set weight / min in-set weight (the prior keeps the in-set minimum above 0).
+fn gate_statistic(weights: &[f64; 12], allowed: &[bool; 12]) -> f64 {
+    let top = (0..12)
+        .filter(|i| !allowed[*i])
+        .map(|i| weights[i])
+        .fold(0.0, f64::max);
+    let floor = (0..12)
+        .filter(|i| allowed[*i])
+        .map(|i| weights[i])
+        .fold(f64::INFINITY, f64::min);
+    top / floor
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GateState {
+    chromatic: bool,
+    hold: f64,
+}
+
+impl GateState {
+    fn new() -> Self {
+        Self {
+            chromatic: true,
+            hold: 0.0,
+        }
+    }
+
+    /// `seconds`: accumulated evidence time; `step`: evidence time added by this step.
+    fn update(&mut self, gate: &GateParams, statistic: f64, seconds: f64, step: f64) {
+        if self.chromatic {
+            if seconds >= gate.min_seconds && statistic < gate.exit {
+                self.hold += step;
+                if self.hold >= gate.exit_hold_seconds {
+                    self.chromatic = false;
+                }
+            } else {
+                self.hold = 0.0;
+            }
+        } else if statistic > gate.enter {
+            self.chromatic = true;
+            self.hold = 0.0;
+        }
+    }
+}
+
 pub struct ScaleMatcher {
     params: Params,
+    gate: GateParams,
+    state: GateState,
     evidence: [f64; 12],
     seconds: f64,
     current: Option<usize>,
     seeded: bool,
+    /// Last name used for each note set (indexed by major tonic).
+    names: [Option<(u8, Scale)>; 12],
 }
 
 impl ScaleMatcher {
-    pub fn new(params: Params) -> Self {
+    pub fn new(params: Params, gate: GateParams) -> Self {
         Self {
             params,
+            gate,
+            state: GateState::new(),
             evidence: [0.0; 12],
             seconds: 0.0,
             current: None,
             seeded: false,
+            names: [None; 12],
         }
     }
 
-    /// Forget the song: a new track starts undecided with no evidence.
+    /// Forget the song: a new track starts Chromatic with no evidence and no names.
     pub fn reset(&mut self) {
         self.evidence = [0.0; 12];
         self.seconds = 0.0;
         self.current = None;
         self.seeded = false;
+        self.state = GateState::new();
+        self.names = [None; 12];
     }
 
     /// Start a song from a remembered choice (before any evidence of this play).
-    pub fn seed(&mut self, key: u8, scale: Scale) {
+    /// Major/Minor: that set, gate open. Chromatic: the remembered `candidate` set, gate
+    /// Chromatic. Either way analysis cannot overrule it before SEED_HOLD_SECONDS.
+    /// A Chromatic seed without a valid Major/Minor candidate is ignored.
+    pub fn seed(&mut self, key: u8, scale: Scale, candidate: Option<Candidate>) {
         if key >= 12 {
             return;
         }
-        self.current = Some(match scale {
-            Scale::Major => key as usize,
-            Scale::Minor => 12 + key as usize,
+        let (name_key, name_scale) = if scale == Scale::Chromatic {
+            match candidate {
+                Some(c) if c.key < 12 && c.scale != Scale::Chromatic => (c.key, c.scale),
+                _ => return,
+            }
+        } else {
+            (key, scale)
+        };
+        self.current = Some(match name_scale {
+            Scale::Minor => 12 + name_key as usize,
+            _ => name_key as usize,
         });
+        self.names[set_of(name_key, name_scale)] = Some((name_key, name_scale));
+        self.state.chromatic = scale == Scale::Chromatic;
+        self.state.hold = 0.0;
         self.seeded = true;
+    }
+
+    /// The stable libKeyFinder result decides how a relative major/minor pair is named:
+    /// if it belongs to a set, that set uses its name from now on (until the song resets).
+    pub fn set_name_hint(&mut self, hint: Option<MusicalKey>) {
+        if let Some(MusicalKey { pitch_class, mode }) = hint {
+            if pitch_class < 12 {
+                let scale = match mode {
+                    Mode::Major => Scale::Major,
+                    Mode::Minor => Scale::Minor,
+                };
+                self.names[set_of(pitch_class, scale)] = Some((pitch_class, scale));
+            }
+        }
     }
 
     /// Accumulate one step of evidence; silent or empty steps are ignored.
@@ -154,6 +287,13 @@ impl ScaleMatcher {
             self.seeded = false;
         }
         self.current = Some(chosen);
+        let statistic = gate_statistic(&self.weights(), &mask(chosen));
+        let before = self.state.chromatic;
+        self.state
+            .update(&self.gate, statistic, self.seconds, step.seconds);
+        if self.state.chromatic != before {
+            self.seeded = false;
+        }
     }
 
     fn weights(&self) -> [f64; 12] {
@@ -183,7 +323,7 @@ impl ScaleMatcher {
             .min_by(|a, b| costs[*a].total_cmp(&costs[*b]))
             .unwrap_or(0);
         match self.current {
-            // First evidence commits immediately: there is no neutral fallback.
+            // First evidence commits immediately to a candidate set.
             None => best,
             Some(current)
                 if best != current && costs[best] < costs[current] - self.params.margin =>
@@ -194,28 +334,67 @@ impl ScaleMatcher {
         }
     }
 
-    /// None until the first non-silent evidence of the current song.
+    /// Always Some: before any evidence it is Chromatic with no key or candidate, so the
+    /// song can start unpulled.
     pub fn target(&self) -> Option<AutoTuneTarget> {
-        self.current.map(|index| {
-            let (key, scale) = combo(index);
-            AutoTuneTarget {
-                key,
-                scale,
+        let source = if self.seeded {
+            TargetSource::Cache
+        } else {
+            TargetSource::Analysis
+        };
+        let Some(index) = self.current else {
+            return Some(AutoTuneTarget {
+                key: None,
+                scale: Scale::Chromatic,
+                candidate: None,
+                uncovered_notes: Vec::new(),
                 evidence_seconds: self.seconds,
-                source: if self.seeded {
-                    TargetSource::Cache
-                } else {
-                    TargetSource::Analysis
-                },
-            }
+                source,
+            });
+        };
+        let (tonic, scale) = combo(index);
+        let set = set_of(tonic, scale);
+        let (key, named) = self.names[set].unwrap_or((set as u8, Scale::Major));
+
+        let weights = self.weights();
+        let allowed = mask(index);
+        let floor = (0..12)
+            .filter(|i| allowed[*i])
+            .map(|i| weights[i])
+            .fold(f64::INFINITY, f64::min);
+        let mut outside: Vec<(u8, f64)> = (0..12)
+            .filter(|i| !allowed[*i] && weights[*i] >= self.gate.exit * floor)
+            .map(|i| (i as u8, weights[i]))
+            .collect();
+        outside.sort_by(|a, b| b.1.total_cmp(&a.1)); // stable: equal weights keep pitch-class order
+        outside.truncate(2);
+
+        Some(AutoTuneTarget {
+            key: Some(key),
+            scale: if self.state.chromatic {
+                Scale::Chromatic
+            } else {
+                named
+            },
+            candidate: Some(Candidate { key, scale: named }),
+            uncovered_notes: outside.into_iter().map(|(pc, _)| pc).collect(),
+            evidence_seconds: self.seconds,
+            source,
         })
     }
 }
 
-/// Player transposition shifts the Key only; the Scale is unchanged.
+/// Player transposition shifts the Key (and the candidate and uncovered notes with
+/// it); the Scale is unchanged.
 pub fn transpose(target: AutoTuneTarget, semitones: i32) -> AutoTuneTarget {
+    let shift = |pc: u8| ((pc as i32 + semitones).rem_euclid(12)) as u8;
     AutoTuneTarget {
-        key: ((target.key as i32 + semitones).rem_euclid(12)) as u8,
+        key: target.key.map(shift),
+        candidate: target.candidate.map(|c| Candidate {
+            key: shift(c.key),
+            ..c
+        }),
+        uncovered_notes: target.uncovered_notes.into_iter().map(shift).collect(),
         ..target
     }
 }
@@ -223,6 +402,11 @@ pub fn transpose(target: AutoTuneTarget, semitones: i32) -> AutoTuneTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const C_MAJOR: [usize; 7] = [0, 2, 4, 5, 7, 9, 11];
+    const G_MAJOR: [usize; 7] = [7, 9, 11, 0, 2, 4, 6];
+    /// G# major / F minor notes: G# A# C C# D# F G.
+    const AB_MAJOR: [usize; 7] = [8, 10, 0, 1, 3, 5, 7];
 
     fn evidence(pitch_classes: &[usize], seconds: f64) -> ChromaEvidence {
         let mut chroma = [0.0; 12];
@@ -236,60 +420,360 @@ mod tests {
         }
     }
 
+    fn weighted(levels: &[(usize, f64)]) -> ChromaEvidence {
+        let mut chroma = [0.0; 12];
+        for (pc, level) in levels {
+            chroma[*pc] = *level;
+        }
+        ChromaEvidence {
+            chroma,
+            seconds: 1.0,
+            rms: 0.1,
+        }
+    }
+
+    fn silent() -> ChromaEvidence {
+        ChromaEvidence {
+            chroma: [1.0; 12],
+            seconds: 1.0,
+            rms: 0.0,
+        }
+    }
+
     fn feed(matcher: &mut ScaleMatcher, pitch_classes: &[usize], steps: usize) {
         for _ in 0..steps {
             matcher.add(&evidence(pitch_classes, 1.0));
         }
     }
 
-    fn pair(matcher: &ScaleMatcher) -> (u8, Scale) {
-        let target = matcher.target().expect("decided");
+    fn new_matcher() -> ScaleMatcher {
+        ScaleMatcher::new(FROZEN, GATE)
+    }
+
+    fn pair(matcher: &ScaleMatcher) -> (Option<u8>, Scale) {
+        let target = matcher.target().expect("target");
         (target.key, target.scale)
     }
 
+    fn musical(pitch_class: u8, mode: Mode) -> MusicalKey {
+        MusicalKey { pitch_class, mode }
+    }
+
+    fn candidate(key: u8, scale: Scale) -> Option<Candidate> {
+        Some(Candidate { key, scale })
+    }
+
+    // ---- frozen values and gate state machine (mirror chromatic_gate.py) ----
+
     #[test]
-    fn undecided_until_evidence_then_c_major() {
-        let mut matcher = ScaleMatcher::new(FROZEN);
-        assert!(matcher.target().is_none());
-        feed(&mut matcher, &[0, 2, 4, 5, 7, 9, 11], 30);
-        assert_eq!(pair(&matcher), (0, Scale::Major));
-        assert_eq!(matcher.target().unwrap().evidence_seconds, 30.0);
+    fn gate_values_are_the_frozen_ones() {
+        assert_eq!(
+            (
+                GATE.enter,
+                GATE.exit,
+                GATE.exit_hold_seconds,
+                GATE.min_seconds
+            ),
+            (3.0, 1.5, 3.0, 3.0)
+        );
+    }
+
+    /// In-set notes at 0.125 (exact in binary, so ratio 3.0 is exactly 3.0), out-of-set notes at
+    /// 0.001 except D-flat, which is `ratio` x 0.125 (the C major set). The Python script used
+    /// 0.1, where 0.1 * 3.0 / 0.1 is 3.0000000000000004; flags elsewhere are unaffected.
+    fn ratio_weights(ratio: f64) -> ([f64; 12], [bool; 12]) {
+        let allowed = mask(0);
+        let mut weights = [0.001; 12];
+        for pc in 0..12 {
+            if allowed[pc] {
+                weights[pc] = 0.125;
+            }
+        }
+        weights[1] = 0.125 * ratio;
+        (weights, allowed)
+    }
+
+    /// One second per value; returns the Chromatic flag after every step like the Python `run`.
+    fn run_gate(state: &mut GateState, seconds: &mut f64, ratios: &[f64]) -> String {
+        ratios
+            .iter()
+            .map(|r| {
+                let (weights, allowed) = ratio_weights(*r);
+                let statistic = gate_statistic(&weights, &allowed);
+                *seconds += 1.0;
+                state.update(&GATE, statistic, *seconds, 1.0);
+                if state.chromatic {
+                    'C'
+                } else {
+                    '.'
+                }
+            })
+            .collect()
+    }
+
+    fn settled_gate() -> (GateState, f64) {
+        let mut state = GateState::new();
+        let mut seconds = 0.0;
+        run_gate(&mut state, &mut seconds, &[0.0; 8]);
+        assert!(!state.chromatic);
+        (state, seconds)
     }
 
     #[test]
-    fn first_evidence_commits_to_a_covering_major_or_minor() {
-        let mut matcher = ScaleMatcher::new(FROZEN);
+    fn statistic_is_top_out_of_set_over_weakest_in_set() {
+        let allowed = mask(0);
+        let mut weights = [0.0; 12];
+        for pc in 0..12 {
+            weights[pc] = if allowed[pc] { 0.12 } else { 0.0 };
+        }
+        weights[1] = 0.06; // strongest out-of-set note
+        weights[0] = 0.03; // weakest in-set note
+        assert!((gate_statistic(&weights, &allowed) - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gate_starts_chromatic_until_min_seconds_then_needs_the_hold() {
+        // Python: "CCCC...." (qualifying from second 3, hold of 3 s met at second 5)
+        let mut state = GateState::new();
+        assert_eq!(run_gate(&mut state, &mut 0.0, &[0.0; 8]), "CCCC....");
+    }
+
+    #[test]
+    fn enter_is_strict_greater_than() {
+        let (mut state, mut seconds) = settled_gate();
+        assert_eq!(run_gate(&mut state, &mut seconds, &[3.0]), "."); // 3.0 is not > ENTER
+        assert_eq!(run_gate(&mut state, &mut seconds, &[3.000001]), "C");
+    }
+
+    #[test]
+    fn oscillation_between_lines_holds() {
+        let (mut state, mut seconds) = settled_gate();
+        let between: Vec<f64> = [2.0, 1.6, 2.9, 1.8].repeat(5);
+        assert_eq!(run_gate(&mut state, &mut seconds, &between), ".".repeat(20));
+        assert_eq!(run_gate(&mut state, &mut seconds, &[4.0]), "C");
+        assert_eq!(run_gate(&mut state, &mut seconds, &between), "C".repeat(20));
+    }
+
+    #[test]
+    fn exit_requires_hold() {
+        let (mut state, mut seconds) = settled_gate();
+        assert_eq!(run_gate(&mut state, &mut seconds, &[4.0]), "C");
+        // a blip above EXIT resets the hold
+        assert_eq!(
+            run_gate(&mut state, &mut seconds, &[0.1, 0.1, 4.0, 0.1, 0.1]),
+            "CCCCC"
+        );
+        assert_eq!(run_gate(&mut state, &mut seconds, &[4.0]), "C");
+        assert_eq!(run_gate(&mut state, &mut seconds, &[0.1, 0.1, 0.1]), "CC.");
+    }
+
+    // ---- end-to-end parity with chromatic_gate.production_chromatic (majmin + ratio gate) ----
+
+    enum Step {
+        Chroma(ChromaEvidence),
+        Silence,
+    }
+
+    /// Feeds the steps; returns the matcher, the Chromatic flag after every step and the
+    /// gate statistic of the current set after every step (NaN before the first evidence).
+    fn replay(steps: Vec<Step>) -> (ScaleMatcher, String, Vec<f64>) {
+        let mut matcher = new_matcher();
+        let mut flags = String::new();
+        let mut ratios = Vec::new();
+        for step in steps {
+            match step {
+                Step::Chroma(e) => matcher.add(&e),
+                Step::Silence => matcher.add(&silent()),
+            }
+            let target = matcher.target().expect("target");
+            flags.push(if target.scale == Scale::Chromatic {
+                'C'
+            } else {
+                '.'
+            });
+            ratios.push(
+                matcher
+                    .current
+                    .map(|c| gate_statistic(&matcher.weights(), &mask(c)))
+                    .unwrap_or(f64::NAN),
+            );
+        }
+        (matcher, flags, ratios)
+    }
+
+    fn rep(e: ChromaEvidence, n: usize) -> Vec<Step> {
+        (0..n).map(|_| Step::Chroma(e.clone())).collect()
+    }
+
+    fn near(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "ratio {actual} != python {expected}"
+        );
+    }
+
+    #[test]
+    fn parity_clean_c_major() {
+        let (m, flags, ratios) = replay(rep(evidence(&C_MAJOR, 1.0), 30));
+        assert_eq!(flags, "CCCC..........................");
+        for (i, r) in [
+            (0, 0.538462),
+            (3, 0.225806),
+            (4, 0.189189),
+            (9, 0.104478),
+            (29, 0.037433),
+        ] {
+            near(ratios[i], r);
+        }
+        assert_eq!(pair(&m), (Some(0), Scale::Major));
+    }
+
+    const D_AND_DFLAT: [(usize, f64); 8] = [
+        (5, 1.0),
+        (7, 1.0),
+        (8, 1.0),
+        (10, 1.0),
+        (0, 1.0),
+        (1, 1.0),
+        (3, 0.8),
+        (2, 1.0),
+    ];
+
+    #[test]
+    fn parity_d_and_dflat_strong_stays_chromatic_with_the_set_as_candidate() {
+        // F minor notes + D natural; E-flat weaker (0.8). Python: Eb major set, Chromatic all 20 s.
+        let (m, flags, ratios) = replay(rep(weighted(&D_AND_DFLAT), 20));
+        assert_eq!(flags, "C".repeat(20));
+        for (i, r) in [(0, 1.359008), (1, 1.574841), (9, 2.107498), (19, 2.252581)] {
+            near(ratios[i], r);
+        }
+        let target = m.target().unwrap();
+        assert_eq!(target.scale, Scale::Chromatic);
+        assert_eq!(target.candidate, candidate(3, Scale::Major));
+        assert_eq!(target.key, Some(3));
+        assert_eq!(target.uncovered_notes, vec![1]); // D-flat: the one note outside Eb major
+    }
+
+    #[test]
+    fn parity_equal_weight_extra_note_leaves_chromatic() {
+        // E-flat also at 1.0: the statistic is exactly 1.0 < EXIT (Python: "CCCC" then clear).
+        let mut levels = D_AND_DFLAT;
+        levels[6].1 = 1.0;
+        let (_, flags, ratios) = replay(rep(weighted(&levels), 20));
+        assert_eq!(flags, "CCCC................");
+        near(ratios[19], 1.0);
+    }
+
+    #[test]
+    fn parity_set_change_does_not_reenter_chromatic() {
+        let mut steps = rep(evidence(&C_MAJOR, 1.0), 12);
+        steps.extend(rep(evidence(&G_MAJOR, 1.0), 25));
+        let (m, flags, ratios) = replay(steps);
+        assert_eq!(flags, "CCCC.................................");
+        for (i, r) in [
+            (11, 0.088608),
+            (12, 0.164557),
+            (29, 1.455696),
+            (30, 0.652893),
+            (36, 0.503185),
+        ] {
+            near(ratios[i], r);
+        }
+        assert_eq!(pair(&m), (Some(7), Scale::Major));
+    }
+
+    #[test]
+    fn parity_silent_steps_change_nothing_then_a_borrowed_set_enters() {
+        let mut steps = rep(evidence(&C_MAJOR, 1.0), 12);
+        steps.extend((0..3).map(|_| Step::Silence));
+        let f_minor_plus_d = [
+            (2, 1.0),
+            (1, 1.0),
+            (5, 0.5),
+            (7, 0.5),
+            (8, 0.5),
+            (10, 0.5),
+            (0, 0.5),
+            (3, 0.5),
+        ];
+        steps.extend(rep(weighted(&f_minor_plus_d), 15));
+        let (_, flags, ratios) = replay(steps);
+        assert_eq!(flags, "CCCC........................CC");
+        for (i, r) in [
+            (12, 0.088608),
+            (14, 0.088608),
+            (15, 0.312458),
+            (29, 3.446369),
+        ] {
+            near(ratios[i], r);
+        }
+    }
+
+    #[test]
+    fn parity_a_borrowed_note_below_the_lines_stays_out_of_chromatic() {
+        let mut steps = rep(evidence(&C_MAJOR, 1.0), 10);
+        steps.extend(rep(evidence(&[0, 2, 4, 5, 7, 9, 11, 1], 1.0), 12));
+        let (_, flags, ratios) = replay(steps);
+        assert_eq!(flags, "CCCC..................");
+        near(ratios[21], 0.538462);
+    }
+
+    // ---- target semantics ----
+
+    #[test]
+    fn no_evidence_is_chromatic_without_key() {
+        let mut matcher = new_matcher();
+        let target = matcher.target().expect("a target exists from the start");
+        assert_eq!(target.scale, Scale::Chromatic);
+        assert_eq!(target.key, None);
+        assert_eq!(target.candidate, None);
+        assert!(target.uncovered_notes.is_empty());
+        assert_eq!(target.evidence_seconds, 0.0);
+        feed(&mut matcher, &C_MAJOR, 10);
+        matcher.reset();
+        let target = matcher.target().unwrap();
+        assert_eq!(
+            (target.key, target.scale, target.candidate),
+            (None, Scale::Chromatic, None)
+        );
+    }
+
+    #[test]
+    fn chromatic_until_min_seconds_then_commits() {
+        let mut matcher = new_matcher();
+        feed(&mut matcher, &C_MAJOR, 3);
+        let early = matcher.target().unwrap();
+        assert_eq!(early.scale, Scale::Chromatic);
+        assert_eq!(early.key, Some(0), "key follows the current naming");
+        assert_eq!(early.candidate, candidate(0, Scale::Major));
+        feed(&mut matcher, &C_MAJOR, 27);
+        assert_eq!(pair(&matcher), (Some(0), Scale::Major));
+        let done = matcher.target().unwrap();
+        assert_eq!(done.evidence_seconds, 30.0);
+        assert_eq!(done.candidate, candidate(0, Scale::Major));
+    }
+
+    #[test]
+    fn first_evidence_picks_a_covering_major_or_minor_candidate() {
+        let mut matcher = new_matcher();
         feed(&mut matcher, &[0, 4, 7], 1); // one second of a C major triad
-        let target = matcher.target().expect("commits on first evidence");
+        let target = matcher.target().expect("candidate on first evidence");
         let allowed = mask(matcher.current.unwrap());
         assert!([0, 4, 7].iter().all(|pc| allowed[*pc]), "{target:?}");
-    }
-
-    #[test]
-    fn relative_minor_tie_reports_major_name() {
-        let mut matcher = ScaleMatcher::new(FROZEN);
-        feed(&mut matcher, &[9, 11, 0, 2, 4, 5, 7], 30); // A natural minor == C major notes
-        assert_eq!(pair(&matcher), (0, Scale::Major));
+        assert!(target.candidate.is_some());
     }
 
     #[test]
     fn pentatonic_evidence_narrows_to_a_covering_diatonic_set() {
-        let mut matcher = ScaleMatcher::new(FROZEN);
+        let mut matcher = new_matcher();
         feed(&mut matcher, &[5, 8, 10, 0, 3], 30);
         let allowed = mask(matcher.current.unwrap());
         assert!([5, 8, 10, 0, 3].iter().all(|pc| allowed[*pc]));
     }
 
     #[test]
-    fn ambiguous_evidence_still_chooses_major_or_minor() {
-        let mut matcher = ScaleMatcher::new(FROZEN);
-        feed(&mut matcher, &(0..12).collect::<Vec<_>>(), 60);
-        assert!(matcher.target().is_some());
-    }
-
-    #[test]
     fn silence_and_invalid_steps_are_ignored() {
-        let mut matcher = ScaleMatcher::new(FROZEN);
+        let mut matcher = new_matcher();
         let mut quiet = evidence(&[0, 4, 7], 1.0);
         quiet.rms = 1.0e-4;
         matcher.add(&quiet);
@@ -304,82 +788,269 @@ mod tests {
             rms: 0.1,
         });
         matcher.add(&evidence(&[0, 4, 7], 0.0));
-        assert!(matcher.target().is_none());
+        let target = matcher.target().unwrap();
+        assert_eq!(
+            (target.key, target.scale, target.evidence_seconds),
+            (None, Scale::Chromatic, 0.0)
+        );
     }
 
     #[test]
     fn hysteresis_requires_a_clear_improvement_to_switch() {
-        let mut matcher = ScaleMatcher::new(FROZEN);
-        feed(&mut matcher, &[0, 2, 4, 5, 7, 9, 11], 30);
-        assert_eq!(pair(&matcher).0, 0);
-        feed(&mut matcher, &[7, 9, 11, 0, 2, 4, 6], 1);
-        assert_eq!(pair(&matcher).0, 0);
-        feed(&mut matcher, &[7, 9, 11, 0, 2, 4, 6], 120);
-        assert_eq!(pair(&matcher), (7, Scale::Major));
+        let mut matcher = new_matcher();
+        feed(&mut matcher, &C_MAJOR, 30);
+        assert_eq!(pair(&matcher).0, Some(0));
+        feed(&mut matcher, &G_MAJOR, 1);
+        assert_eq!(pair(&matcher).0, Some(0));
+        feed(&mut matcher, &G_MAJOR, 120);
+        assert_eq!(pair(&matcher), (Some(7), Scale::Major));
     }
 
     #[test]
-    fn reset_forgets_the_song() {
-        let mut matcher = ScaleMatcher::new(FROZEN);
-        feed(&mut matcher, &[0, 2, 4, 5, 7, 9, 11], 30);
+    fn reset_forgets_the_song_and_the_gate_starts_chromatic_again() {
+        let mut matcher = new_matcher();
+        feed(&mut matcher, &C_MAJOR, 30);
         matcher.reset();
-        assert!(matcher.target().is_none());
+        let target = matcher.target().unwrap();
+        assert_eq!((target.key, target.scale), (None, Scale::Chromatic));
+        feed(&mut matcher, &C_MAJOR, 2);
+        assert_eq!(matcher.target().unwrap().scale, Scale::Chromatic);
+    }
+
+    // ---- naming of relative major / minor ----
+
+    #[test]
+    fn relative_pair_follows_stable_hint() {
+        let mut matcher = new_matcher();
+        feed(&mut matcher, &AB_MAJOR, 30);
+        let first = matcher.target().unwrap();
+        assert_eq!(
+            (first.key, first.scale),
+            (Some(8), Scale::Major),
+            "G# Major"
+        );
+        matcher.set_name_hint(Some(musical(5, Mode::Minor)));
+        let second = matcher.target().unwrap();
+        assert_eq!(
+            (second.key, second.scale, second.candidate),
+            (Some(5), Scale::Minor, candidate(5, Scale::Minor)),
+            "F Minor"
+        );
+        matcher.set_name_hint(Some(musical(0, Mode::Major))); // unrelated: keeps the last name
+        assert_eq!(pair(&matcher), (Some(5), Scale::Minor));
+        matcher.set_name_hint(None);
+        assert_eq!(pair(&matcher), (Some(5), Scale::Minor));
     }
 
     #[test]
-    fn transpose_shifts_key_only() {
-        let c_major = AutoTuneTarget {
-            key: 0,
-            scale: Scale::Major,
+    fn hint_names_the_set_even_before_the_gate_commits() {
+        let mut matcher = new_matcher();
+        matcher.set_name_hint(Some(musical(5, Mode::Minor)));
+        feed(&mut matcher, &AB_MAJOR, 2); // still Chromatic, candidate named by the hint
+        let target = matcher.target().unwrap();
+        assert_eq!(target.scale, Scale::Chromatic);
+        assert_eq!(target.candidate, candidate(5, Scale::Minor));
+    }
+
+    #[test]
+    fn reset_clears_the_hint() {
+        let mut matcher = new_matcher();
+        matcher.set_name_hint(Some(musical(5, Mode::Minor)));
+        matcher.reset();
+        feed(&mut matcher, &AB_MAJOR, 30);
+        assert_eq!(pair(&matcher), (Some(8), Scale::Major));
+    }
+
+    #[test]
+    fn same_hint_twice_does_not_change_target() {
+        let mut matcher = new_matcher();
+        feed(&mut matcher, &AB_MAJOR, 30);
+        matcher.set_name_hint(Some(musical(5, Mode::Minor)));
+        let once = matcher.target().unwrap();
+        matcher.set_name_hint(Some(musical(5, Mode::Minor)));
+        assert_eq!(matcher.target().unwrap(), once);
+    }
+
+    // ---- transpose / serialization ----
+
+    #[test]
+    fn transpose_shifts_key_and_candidate() {
+        let target = AutoTuneTarget {
+            key: Some(0),
+            scale: Scale::Chromatic,
+            candidate: candidate(11, Scale::Minor),
+            uncovered_notes: vec![1, 10],
             evidence_seconds: 1.0,
             source: TargetSource::Analysis,
         };
-        assert_eq!(transpose(c_major, 2).key, 2);
-        assert_eq!(transpose(c_major, -1).key, 11);
-        assert_eq!(transpose(c_major, 2).scale, Scale::Major);
+        let up = transpose(target.clone(), 2);
+        assert_eq!(up.key, Some(2));
+        assert_eq!(up.scale, Scale::Chromatic);
+        assert_eq!(up.candidate, candidate(1, Scale::Minor));
+        assert_eq!(up.uncovered_notes, vec![3, 0]);
+        assert_eq!(transpose(target, -1).key, Some(11));
+        let none = transpose(new_matcher().target().unwrap(), 5);
+        assert_eq!((none.key, none.candidate), (None, None));
     }
 
     #[test]
     fn target_serializes_with_profile_compatible_names() {
         let json = serde_json::to_value(AutoTuneTarget {
-            key: 6,
-            scale: Scale::Minor,
+            key: Some(6),
+            scale: Scale::Chromatic,
+            candidate: candidate(6, Scale::Minor),
+            uncovered_notes: vec![2, 1],
             evidence_seconds: 12.5,
             source: TargetSource::Cache,
         })
         .unwrap();
         assert_eq!(json["key"], 6);
-        assert_eq!(json["scale"], "minor");
+        assert_eq!(json["scale"], "chromatic");
+        assert_eq!(json["candidate"]["key"], 6);
+        assert_eq!(json["candidate"]["scale"], "minor");
+        assert_eq!(json["uncoveredNotes"], serde_json::json!([2, 1]));
         assert_eq!(json["evidenceSeconds"], 12.5);
         assert_eq!(json["source"], "cache");
-        assert_eq!(json.as_object().unwrap().len(), 4);
+        assert_eq!(json.as_object().unwrap().len(), 6);
+        let bare = serde_json::to_value(new_matcher().target().unwrap()).unwrap();
+        assert!(bare["key"].is_null() && bare["candidate"].is_null());
     }
+
+    // ---- seeding (Major/Minor only until Task 3) ----
 
     #[test]
     fn a_seed_is_reported_immediately_and_held_against_early_contrary_evidence() {
-        let mut matcher = ScaleMatcher::new(FROZEN);
-        matcher.seed(6, Scale::Minor);
+        let mut matcher = new_matcher();
+        matcher.seed(6, Scale::Minor, None);
         let seeded = matcher.target().unwrap();
         assert_eq!(
             (seeded.key, seeded.scale, seeded.source),
-            (6, Scale::Minor, TargetSource::Cache)
+            (Some(6), Scale::Minor, TargetSource::Cache)
         );
-        feed(&mut matcher, &[0, 2, 4, 5, 7, 9, 11], 19); // contrary, but under the hold
-        assert_eq!(pair(&matcher), (6, Scale::Minor));
+        feed(&mut matcher, &C_MAJOR, 19); // contrary, but under the hold
+        assert_eq!(pair(&matcher), (Some(6), Scale::Minor));
         assert_eq!(matcher.target().unwrap().source, TargetSource::Cache);
-        feed(&mut matcher, &[0, 2, 4, 5, 7, 9, 11], 40); // overwhelming: analysis takes over
-        assert_eq!(pair(&matcher), (0, Scale::Major));
+        feed(&mut matcher, &C_MAJOR, 40); // overwhelming: analysis takes over
+        assert_eq!(pair(&matcher), (Some(0), Scale::Major));
         assert_eq!(matcher.target().unwrap().source, TargetSource::Analysis);
     }
 
     #[test]
+    fn seeded_chromatic_holds_until_seed_hold() {
+        let mut matcher = new_matcher();
+        matcher.seed(3, Scale::Chromatic, candidate(3, Scale::Major));
+        let seeded = matcher.target().unwrap();
+        assert_eq!(
+            (seeded.key, seeded.scale, seeded.candidate, seeded.source),
+            (
+                Some(3),
+                Scale::Chromatic,
+                candidate(3, Scale::Major),
+                TargetSource::Cache
+            )
+        );
+        feed(&mut matcher, &C_MAJOR, 19); // clean evidence, but under the hold
+        let held = matcher.target().unwrap();
+        assert_eq!(
+            (held.scale, held.candidate, held.source),
+            (
+                Scale::Chromatic,
+                candidate(3, Scale::Major),
+                TargetSource::Cache
+            )
+        );
+        feed(&mut matcher, &C_MAJOR, 40); // analysis takes over and the gate opens
+        let after = matcher.target().unwrap();
+        assert_eq!(
+            (after.key, after.scale, after.source),
+            (Some(0), Scale::Major, TargetSource::Analysis)
+        );
+    }
+
+    #[test]
+    fn seeded_chromatic_that_analysis_confirms_leaves_chromatic_only_after_the_hold() {
+        let mut matcher = new_matcher();
+        matcher.seed(0, Scale::Chromatic, candidate(0, Scale::Major));
+        feed(&mut matcher, &C_MAJOR, 19);
+        assert_eq!(matcher.target().unwrap().scale, Scale::Chromatic);
+        feed(&mut matcher, &C_MAJOR, 2); // seed hold over, gate hold not yet met
+        let waiting = matcher.target().unwrap();
+        assert_eq!(
+            (waiting.scale, waiting.source),
+            (Scale::Chromatic, TargetSource::Cache),
+            "same set and still Chromatic: still the cached result"
+        );
+        feed(&mut matcher, &C_MAJOR, 2); // 3 s of hold after the seed hold: the gate opens
+        let after = matcher.target().unwrap();
+        assert_eq!((after.key, after.scale), (Some(0), Scale::Major));
+        assert_eq!(
+            after.source,
+            TargetSource::Analysis,
+            "the gate change is the analysis overruling the cache"
+        );
+    }
+
+    #[test]
+    fn a_cached_major_that_analysis_turns_chromatic_reports_analysis() {
+        // C major notes with F weak and D-flat strong: the set stays C major (hysteresis),
+        // but the out-of-set D-flat outweighs the weakest in-set note more than ENTER.
+        let levels = [
+            (0, 1.0),
+            (2, 1.0),
+            (4, 1.0),
+            (5, 0.5),
+            (7, 1.0),
+            (9, 1.0),
+            (11, 1.0),
+            (1, 1.0),
+        ];
+        let mut matcher = new_matcher();
+        matcher.seed(0, Scale::Major, None);
+        for _ in 0..19 {
+            matcher.add(&weighted(&levels));
+        }
+        let held = matcher.target().unwrap();
+        assert_eq!(
+            (held.scale, held.source),
+            (Scale::Major, TargetSource::Cache),
+            "under the seed hold nothing changes"
+        );
+        for _ in 0..30 {
+            matcher.add(&weighted(&levels));
+        }
+        let after = matcher.target().unwrap();
+        assert_eq!(after.scale, Scale::Chromatic);
+        assert_eq!(
+            after.candidate,
+            candidate(0, Scale::Major),
+            "same set, now uncertain"
+        );
+        assert_eq!(after.source, TargetSource::Analysis);
+    }
+
+    #[test]
+    fn a_seed_of_chromatic_without_candidate_or_with_bad_input_is_ignored() {
+        let mut matcher = new_matcher();
+        matcher.seed(3, Scale::Chromatic, None);
+        matcher.seed(12, Scale::Major, None);
+        matcher.seed(3, Scale::Chromatic, candidate(13, Scale::Major));
+        matcher.seed(3, Scale::Chromatic, candidate(3, Scale::Chromatic));
+        let target = matcher.target().unwrap();
+        assert_eq!(
+            (target.key, target.scale, target.candidate),
+            (None, Scale::Chromatic, None)
+        );
+    }
+
+    #[test]
     fn a_confirmed_seed_keeps_its_cache_source() {
-        let mut matcher = ScaleMatcher::new(FROZEN);
-        matcher.seed(0, Scale::Major);
-        feed(&mut matcher, &[0, 2, 4, 5, 7, 9, 11], 40);
-        assert_eq!(pair(&matcher), (0, Scale::Major));
+        let mut matcher = new_matcher();
+        matcher.seed(0, Scale::Major, None);
+        feed(&mut matcher, &C_MAJOR, 40);
+        assert_eq!(pair(&matcher), (Some(0), Scale::Major));
         assert_eq!(matcher.target().unwrap().source, TargetSource::Cache);
         matcher.reset();
-        assert!(matcher.target().is_none());
+        let target = matcher.target().unwrap();
+        assert_eq!((target.key, target.scale), (None, Scale::Chromatic));
     }
 }

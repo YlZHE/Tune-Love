@@ -71,6 +71,7 @@ const applies = (page: Page) => page.evaluate(() => (window as any).bridgeReques
   .filter((r: any) => r.op === "apply").map((r: any) => r.values));
 
 test("the switch defaults off, persists across windows and reloads, and writes each pair once", async ({ page, context }) => {
+  test.slow(); // many reloads and fixed waits; runs close to the default 30 s under load
   await prepare(context); await page.goto("/");
   await expect(page.getByRole("heading", { name: "Song", exact: true })).toBeVisible();
   await expect(page.locator(".autotune-target-status")).toHaveCount(0);

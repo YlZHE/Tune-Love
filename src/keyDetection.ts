@@ -22,8 +22,6 @@ export type DetectionSnapshot = {
   autotuneTarget: AutoTuneTarget | null;
 };
 
-const pitchNames = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"] as const;
-
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown> : null;
@@ -31,21 +29,6 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function validGeneration(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) >= 0;
-}
-
-export function keyLabel(value: unknown, sourceId: string | null,
-  trackKey: string, targetGeneration: number | undefined): string | null {
-  if (!sourceId || !trackKey || !validGeneration(targetGeneration)) return null;
-  const snapshot = record(value);
-  if (!snapshot || snapshot.status !== "detected" || snapshot.sourceId !== sourceId
-    || snapshot.trackKey !== trackKey || snapshot.targetGeneration !== targetGeneration
-    || !Number.isSafeInteger(snapshot.updatedAtMs) || Number(snapshot.updatedAtMs) <= 0) return null;
-  const key = record(snapshot.key);
-  const pitchClass = key?.pitchClass;
-  const mode = key?.mode;
-  if (!Number.isInteger(pitchClass) || Number(pitchClass) < 0 || Number(pitchClass) >= pitchNames.length
-    || (mode !== "major" && mode !== "minor")) return null;
-  return `${pitchNames[Number(pitchClass)]} ${mode === "major" ? "大调" : "小调"}`;
 }
 
 // Profile option labels (reference/profiles/*.json use "C#"-style sharps).
@@ -87,11 +70,6 @@ export function targetOptionLabels(target: AutoTuneTarget): OptionPair {
 export function titleLabel(target: AutoTuneTarget): string {
   const { key, scale } = targetOptionLabels(target);
   return key === null ? scale : `${key} ${scale}`;
-}
-
-export function targetLabel(target: AutoTuneTarget): string {
-  return target.scale === "chromatic" || target.key === null ? titleLabel(target)
-    : `${pitchNames[target.key]} ${target.scale === "major" ? "大调" : "小调"}`;
 }
 
 /** Same target for effect purposes: everything shown or written, but not evidenceSeconds growth. */

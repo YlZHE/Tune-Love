@@ -34,9 +34,18 @@ button { cursor: pointer; }
 .brand > * { pointer-events: none; }
 .brand > svg { width: 14px; color: var(--accent); }
 .brand-light { font-weight: 450; }
-.key-title-stage { position: relative; display: block; flex: 1; min-width: 0; height: 20px; overflow: hidden; }
+.key-title-stage { position: relative; display: block; flex: 0 1 auto; min-width: 0; height: 20px; overflow: hidden; }
+.key-title-sizer { display: block; visibility: hidden; height: 20px; line-height: 20px; white-space: nowrap; }
+.key-title-sizer::after { content: attr(data-text); }
+.key-title-sizer.is-detected { font-size: 14px; font-weight: 650; letter-spacing: -.1px; }
 .key-title-text { position: absolute; inset: 0 auto auto 0; display: block; max-width: 100%; line-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .key-title-text.is-detected { font-size: 14px; font-weight: 650; letter-spacing: -.1px; }
+/* The brand is a drag region whose children ignore pointer events; only the title text
+   opts back in so its tooltip can open. */
+.brand > .key-title-trigger { pointer-events: auto; display: inline-flex; min-width: 0; height: 20px; }
+.key-title-hit { display: inline-flex; align-items: center; gap: 6px; min-width: 0; outline: none; cursor: default; }
+.key-title-hit:focus-visible { color: var(--accent); }
+.key-title-failed { flex: none; width: 6px; height: 6px; border-radius: 50%; background: #ff6b6b; }
 .window-actions { display: flex; align-items: center; gap: 10px; padding-left: 12px; }
 .window-button { color: var(--muted); width: 24px; height: 24px; margin: 0; }
 .window-button.is-active { color: var(--accent); }

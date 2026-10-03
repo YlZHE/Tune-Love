@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { initialControlState, type ControlState } from "./autotuneControl";
 import type { AutoTuneTarget } from "./keyDetection";
-import { nextWrite, targetStatusLabel, type WrittenPair } from "./autoApplyTarget";
+import { nextWrite, targetTooltip, writeState, type WrittenPair } from "./autoApplyTarget";
 import { AUTO_APPLY_STORAGE_KEY, parseAutoApplyPreference } from "./autoApplyPreferences";
 
 const ready = (connectionId = "session-a", capabilities = ["retune", "key", "scale"]): ControlState => ({
@@ -74,17 +74,41 @@ describe("nextWrite", () => {
   });
 });
 
-describe("targetStatusLabel", () => {
-  test("describes the recommendation and whether it was written", () => {
-    expect(targetStatusLabel(minor, null, true)).toBe("建议 F♯ 小调 · 未写入");
-    expect(targetStatusLabel(minor, written(), true)).toBe("建议 F♯ 小调 · 已写入");
-    expect(targetStatusLabel(minor, written({ status: "pending" }), true)).toBe("建议 F♯ 小调 · 写入中");
-    expect(targetStatusLabel(minor, written({ status: "failed" }), true)).toBe("建议 F♯ 小调 · 写入失败");
+describe("targetTooltip", () => {
+  const fChromatic: AutoTuneTarget = { ...base, key: 5, scale: "chromatic", evidenceSeconds: 14,
+    candidate: { key: 5, scale: "minor" }, uncoveredNotes: [8, 11] };
+  const fWritten = written({ key: "F", scale: "Chromatic" });
+
+  test("evidence and write status for a Major/Minor target", () => {
+    expect(targetTooltip(minor, null, true)).toBe("已分析 12 秒。连接 Auto-Tune 后自动写入。");
+    expect(targetTooltip(minor, written(), true)).toBe("已分析 12 秒。已写入当前连接的插件。");
+    expect(targetTooltip(minor, written({ status: "pending" }), true)).toBe("已分析 12 秒。连接 Auto-Tune 后自动写入。");
+    expect(targetTooltip(minor, written({ status: "failed" }), true)).toBe("已分析 12 秒。写入失败，不会自动重试。");
+    expect(targetTooltip(minor, written(), false)).toBe("已分析 12 秒。自动写入已关闭，可在设置中开启。");
+    expect(targetTooltip({ ...minor, source: "cache", evidenceSeconds: 2.4 }, null, true))
+      .toBe("来自上次播放的分析结果（本次已分析 2 秒，足够后会重新确认）。连接 Auto-Tune 后自动写入。");
   });
 
-  test("a remembered pair for another target or a disabled switch reads as not written", () => {
-    expect(targetStatusLabel(major, written(), true)).toBe("建议 B 大调 · 未写入");
-    expect(targetStatusLabel(minor, written(), false)).toBe("建议 F♯ 小调 · 未写入");
+  test("a remembered pair for another target is not this target's status", () => {
+    expect(targetTooltip(major, written(), true)).toBe("已分析 20 秒。连接 Auto-Tune 后自动写入。");
+    expect(writeState(minor, written({ status: "failed" }), true)).toBe("failed");
+    expect(writeState(major, written({ status: "failed" }), true)).toBe("idle");
+    expect(writeState(minor, written({ status: "failed" }), false)).toBe("off");
+  });
+
+  test("the Chromatic uncertainty sentences use profile spellings", () => {
+    expect(targetTooltip(fChromatic, fWritten, true))
+      .toBe("已分析 14 秒。拿不准：G# 与 B 都常用，暂用 Chromatic。排第一的候选是 F Minor。已写入当前连接的插件。");
+    expect(targetTooltip({ ...fChromatic, uncoveredNotes: [1] }, null, true))
+      .toBe("已分析 14 秒。拿不准：C# 常用但不在候选调内，暂用 Chromatic。排第一的候选是 F Minor。连接 Auto-Tune 后自动写入。");
+    expect(targetTooltip({ ...fChromatic, uncoveredNotes: [] }, null, true))
+      .toBe("已分析 14 秒。暂用 Chromatic。排第一的候选是 F Minor。连接 Auto-Tune 后自动写入。");
+  });
+
+  test("no candidate means the analysis just started; Major/Minor never gets the sentence", () => {
+    expect(targetTooltip({ ...chromatic, candidate: null, evidenceSeconds: 0 }, null, true))
+      .toBe("已分析 0 秒。刚开始分析，暂用 Chromatic。连接 Auto-Tune 后自动写入。");
+    expect(targetTooltip({ ...minor, uncoveredNotes: [1] }, null, true)).not.toContain("Chromatic");
   });
 });
 

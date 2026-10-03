@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { autotuneTarget, keyLabel, sameTarget, type AutoTuneTarget } from "./keyDetection";
+import { autotuneTarget, sameTarget, type AutoTuneTarget } from "./keyDetection";
 
 const POLL_INTERVAL_MS = 1_000;
 
@@ -68,9 +68,9 @@ export function useKeyDetectionSnapshot(sourceId: string | null, trackKey: strin
   return snapshot;
 }
 
-/** The validated key label and Key/Scale recommendation for the current track. */
+/** The Key/Scale recommendation for the current track. */
 export function useAutoTuneTarget(sourceId: string | null, trackKey: string,
-  targetGeneration: number | undefined): { keyLabel: string | null; target: AutoTuneTarget | null } {
+  targetGeneration: number | undefined): { target: AutoTuneTarget | null } {
   const snapshot = useKeyDetectionSnapshot(sourceId, trackKey, targetGeneration);
   const target = autotuneTarget(snapshot, sourceId, trackKey, targetGeneration);
   // Keep one object per distinct target (see sameTarget) so effects keyed on it do not
@@ -78,5 +78,5 @@ export function useAutoTuneTarget(sourceId: string | null, trackKey: string,
   const stable = useRef<AutoTuneTarget | null>(null);
   if (!target) stable.current = null;
   else if (!stable.current || !sameTarget(stable.current, target)) stable.current = target;
-  return { keyLabel: keyLabel(snapshot, sourceId, trackKey, targetGeneration), target: stable.current };
+  return { target: stable.current };
 }

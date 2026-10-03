@@ -614,7 +614,7 @@ const Trigger: React.FC<TriggerProps> = ({
   }, [open, disabled]);
 
   useLayoutEffect(() => {
-    if (open && !disabled) group.update(payload());
+    if (!disabled) group.update(payload()); // no-op unless this tooltip is the open one
     // Context updates alone must not recursively publish another payload.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, disabled, content, shortcut, side, gap, arrow, surfaceColor, inkColor,

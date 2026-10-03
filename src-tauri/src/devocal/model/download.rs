@@ -41,6 +41,8 @@ pub enum ModelError {
     DeleteDenied,
     ImportMismatch,
     ImportUnsupported,
+    /// A command's blocking task panicked (details are only logged).
+    Internal,
 }
 
 impl ModelError {
@@ -64,6 +66,7 @@ impl ModelError {
             ModelError::DeleteDenied => "delete_denied",
             ModelError::ImportMismatch => "import_mismatch",
             ModelError::ImportUnsupported => "import_unsupported",
+            ModelError::Internal => "internal_error",
         };
         code.to_string()
     }
@@ -1333,6 +1336,7 @@ mod tests {
             (DeleteDenied, "delete_denied"),
             (ImportMismatch, "import_mismatch"),
             (ImportUnsupported, "import_unsupported"),
+            (Internal, "internal_error"),
         ] {
             assert_eq!(e.code(), code);
         }

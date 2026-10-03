@@ -13,10 +13,11 @@ pub mod state;
 pub mod verify;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 use download::{ModelError, RetryPolicy};
 use fetch::ReqwestFetcher;
@@ -58,10 +59,47 @@ pub fn wants_auto_enable(req: &ModelRequest) -> bool {
     req.auto_enable && req.id == STEMGENRT_ID
 }
 
-/// Whether to enable de-vocal right away rather than on install: the model is already installed,
-/// so `begin_*` would finish at once without calling `on_installed`.
-fn enable_now(req: &ModelRequest, already_installed: bool) -> bool {
-    already_installed && wants_auto_enable(req) && matches!(req.action.as_str(), "download" | "import")
+/// What a download or import request does, given whether the model is already installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// Not installed: start the job (for import, open the file dialog first).
+    Start,
+    /// Installed and auto-enable asked: enable de-vocal now. `begin_*` would finish at once
+    /// without calling `on_installed`, so the install callback would never do it.
+    EnableNow,
+    /// Installed: nothing to do, and no file dialog.
+    Nothing,
+}
+
+fn next_step(req: &ModelRequest, already_installed: bool) -> Next {
+    if !already_installed {
+        Next::Start
+    } else if wants_auto_enable(req) && matches!(req.action.as_str(), "download" | "import") {
+        Next::EnableNow
+    } else {
+        Next::Nothing
+    }
+}
+
+/// The one import dialog that may be open.
+static IMPORT_DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// The slot of the open import dialog; dropping it frees the slot.
+struct DialogSlot(&'static AtomicBool);
+
+impl DialogSlot {
+    /// `None` if a dialog already holds the slot.
+    fn take(flag: &'static AtomicBool) -> Option<DialogSlot> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| DialogSlot(flag))
+    }
+}
+
+impl Drop for DialogSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// The user's prefix, an empty one counting as not filled in.
@@ -120,19 +158,35 @@ fn is_installed(state: &ModelState, id: &str) -> bool {
     state.statuses().iter().any(|s| s.id == id && s.phase == ModelPhase::Installed)
 }
 
-/// Runs `f` (which may hash files) on a blocking thread; errors become machine codes.
+/// Blocking. `Some(statuses)` if the model is already installed, after enabling de-vocal when
+/// the request asks for it; `None` if the job is still to be started.
+fn settle_installed(app: &AppHandle, state: &ModelState, req: &ModelRequest) -> Option<Vec<ModelStatus>> {
+    match next_step(req, is_installed(state, &req.id)) {
+        Next::Start => None,
+        Next::EnableNow => {
+            enable_devocal(app);
+            Some(state.statuses())
+        }
+        Next::Nothing => Some(state.statuses()),
+    }
+}
+
+/// Runs `f` (which may hash files) on a blocking thread; errors become machine codes. A panic in
+/// `f` is logged and reported as `internal_error`.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, ModelError> + Send + 'static) -> Result<T, String> {
-    tauri::async_runtime::spawn_blocking(f)
-        .await
-        .map_err(|e| format!("model command failed: {e}"))?
-        .map_err(|e| e.code())
+    match tauri::async_runtime::spawn_blocking(f).await {
+        Ok(result) => result.map_err(|e| e.code()),
+        Err(e) => {
+            eprintln!("models: command task failed: {e}");
+            Err(ModelError::Internal.code())
+        }
+    }
 }
 
 /// Blocking.
 fn start_download(app: &AppHandle, state: &ModelState, req: &ModelRequest) -> Result<Vec<ModelStatus>, ModelError> {
-    if enable_now(req, is_installed(state, &req.id)) {
-        enable_devocal(app);
-        return Ok(state.statuses());
+    if let Some(statuses) = settle_installed(app, state, req) {
+        return Ok(statuses);
     }
     let job = state.begin_download(
         fetcher()?,
@@ -153,9 +207,9 @@ fn start_import(
     req: &ModelRequest,
     file: PathBuf,
 ) -> Result<Vec<ModelStatus>, ModelError> {
-    if enable_now(req, is_installed(state, &req.id)) {
-        enable_devocal(app);
-        return Ok(state.statuses());
+    // Installed meanwhile (another import or a download finished while the dialog was open)?
+    if let Some(statuses) = settle_installed(app, state, req) {
+        return Ok(statuses);
     }
     // Still the final guard: a job may have started while the dialog was open.
     let job = state.begin_import(&req.id, file, on_installed(app, req))?;
@@ -163,29 +217,51 @@ fn start_import(
     Ok(state.statuses())
 }
 
-async fn import(app: AppHandle, state: ModelState, req: ModelRequest) -> Result<Vec<ModelStatus>, String> {
-    // Refused before the dialog opens, not after the user has picked a file.
-    let busy = blocking({
-        let state = state.clone();
+async fn import(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: ModelState,
+    req: ModelRequest,
+) -> Result<Vec<ModelStatus>, String> {
+    // One dialog at a time: a second click on Import while one is open is refused.
+    let slot = DialogSlot::take(&IMPORT_DIALOG_OPEN).ok_or_else(|| ModelError::AlreadyRunning.code())?;
+    // Settled before the dialog opens, not after the user has picked a file: an installed model
+    // needs no file, and a running job would refuse the import anyway.
+    let settled = blocking({
+        let (app, state, req) = (app.clone(), state.clone(), req.clone());
         move || {
-            Ok(state
+            if let Some(statuses) = settle_installed(&app, &state, &req) {
+                return Ok(Some(statuses));
+            }
+            let busy = state
                 .statuses()
                 .iter()
-                .any(|s| matches!(s.phase, ModelPhase::Downloading | ModelPhase::Verifying)))
+                .any(|s| matches!(s.phase, ModelPhase::Downloading | ModelPhase::Verifying));
+            if busy {
+                return Err(ModelError::AlreadyRunning);
+            }
+            Ok(None)
         }
     })
     .await?;
-    if busy {
-        return Err(ModelError::AlreadyRunning.code());
+    if let Some(statuses) = settled {
+        return Ok(statuses);
     }
-    let picked = blocking({
-        let app = app.clone();
-        move || {
-            use tauri_plugin_dialog::DialogExt;
-            Ok(app.dialog().file().add_filter("ONNX 模型", &["onnx"]).blocking_pick_file())
-        }
+    // The slot travels with the dialog, so it stays taken until the dialog has closed even if
+    // this future were dropped meanwhile.
+    let (slot, picked) = blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        // Parented to the calling window, so the picker is not hidden behind an always-on-top one.
+        let picked = window
+            .dialog()
+            .file()
+            .set_parent(&window)
+            .add_filter("ONNX 模型", &["onnx"])
+            .blocking_pick_file();
+        Ok((slot, picked))
     })
     .await?;
+    drop(slot);
     let Some(picked) = picked else {
         // Dialog closed without a choice.
         return blocking(move || Ok(state.statuses())).await;
@@ -204,6 +280,7 @@ pub async fn get_model_status(state: State<'_, ModelState>) -> Result<Vec<ModelS
 #[tauri::command]
 pub async fn model_command(
     app: AppHandle,
+    window: WebviewWindow,
     request: ModelRequest,
     state: State<'_, ModelState>,
 ) -> Result<Vec<ModelStatus>, String> {
@@ -211,7 +288,7 @@ pub async fn model_command(
     let state = state.inner().clone();
     match request.action.as_str() {
         "download" => blocking(move || start_download(&app, &state, &request)).await,
-        "import" => import(app, state, request).await,
+        "import" => import(app, window, state, request).await,
         "cancel" => {
             blocking(move || {
                 state.cancel(&request.id);
@@ -281,18 +358,36 @@ mod tests {
     }
 
     #[test]
-    fn enable_now_only_when_auto_enable_meets_an_installed_model() {
-        // Already installed: `begin_*` would finish at once without `on_installed`.
-        assert!(enable_now(&req(STEMGENRT_ID, "download", true, None), true));
-        assert!(enable_now(&req(STEMGENRT_ID, "import", true, None), true));
-        // Not installed yet: the install callback does it.
-        assert!(!enable_now(&req(STEMGENRT_ID, "download", true, None), false));
-        // No auto-enable asked, or not the StemgenRT model.
-        assert!(!enable_now(&req(STEMGENRT_ID, "download", false, None), true));
-        assert!(!enable_now(&req("other", "download", true, None), true));
+    fn installed_model_needs_no_job_and_enables_only_on_request() {
+        // Not installed: start the job (import: open the dialog), whatever was asked.
+        assert_eq!(next_step(&req(STEMGENRT_ID, "download", true, None), false), Next::Start);
+        assert_eq!(next_step(&req(STEMGENRT_ID, "import", false, None), false), Next::Start);
+        // Installed + auto-enable: `begin_*` would finish at once without `on_installed`.
+        assert_eq!(next_step(&req(STEMGENRT_ID, "download", true, None), true), Next::EnableNow);
+        assert_eq!(next_step(&req(STEMGENRT_ID, "import", true, None), true), Next::EnableNow);
+        // Installed, no auto-enable (or not StemgenRT): nothing to do, no dialog.
+        assert_eq!(next_step(&req(STEMGENRT_ID, "download", false, None), true), Next::Nothing);
+        assert_eq!(next_step(&req(STEMGENRT_ID, "import", false, None), true), Next::Nothing);
+        assert_eq!(next_step(&req("other", "import", true, None), true), Next::Nothing);
         // Cancel and delete never enable.
-        assert!(!enable_now(&req(STEMGENRT_ID, "cancel", true, None), true));
-        assert!(!enable_now(&req(STEMGENRT_ID, "delete", true, None), true));
+        assert_eq!(next_step(&req(STEMGENRT_ID, "cancel", true, None), true), Next::Nothing);
+        assert_eq!(next_step(&req(STEMGENRT_ID, "delete", true, None), true), Next::Nothing);
+    }
+
+    #[test]
+    fn dialog_slot_admits_one_and_frees_on_drop() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let first = DialogSlot::take(&FLAG).expect("free slot");
+        assert!(DialogSlot::take(&FLAG).is_none(), "second dialog refused while one is open");
+        drop(first);
+        let again = DialogSlot::take(&FLAG).expect("freed on drop");
+        // Freed on unwind too.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = again;
+            panic!("dialog task panicked");
+        }));
+        assert!(r.is_err());
+        assert!(DialogSlot::take(&FLAG).is_some());
     }
 
     #[test]

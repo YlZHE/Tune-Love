@@ -2975,6 +2975,9 @@ mod tests {
         /// One deadline in every `n` never fires (index `k % n == n / 2`): the device wake
         /// after it finds it still armed.
         skip_every: Option<u64>,
+        /// Processing time of one 128-frame hop, us (300: passthrough; a model takes longer,
+        /// so a packet's hops reach ring B as a slower burst).
+        hop_us: u64,
     }
 
     impl EvCfg {
@@ -2985,6 +2988,7 @@ mod tests {
                 stall: None,
                 preroll_at: None,
                 skip_every: None,
+                hop_us: 300,
             }
         }
     }
@@ -3046,7 +3050,7 @@ mod tests {
         const PERIOD: usize = 441;
         const PERIOD_US: u64 = 10_000;
         const HOP: usize = 128;
-        const HOP_US: u64 = 300;
+        let hop_us = cfg.hop_us;
         const SAMPLE_US: u64 = 100;
         const T0: u64 = 10 * SEC;
         let sink = FakeSink::new(0);
@@ -3083,6 +3087,11 @@ mod tests {
         let mut deadlines = 0u64;
         let mut next_sample = 0u64;
         let mut preroll_at = cfg.preroll_at;
+        if preroll_at == Some(0) {
+            // An "on" accepted before the stream's first fill (attach with devocal on).
+            preroll_at = None;
+            shared.preroll_request.store(true, Ordering::Release);
+        }
         while next_sample < cfg.len_us {
             let candidates = [
                 Some(next_read),
@@ -3118,7 +3127,7 @@ mod tests {
                     shared.last_input_us.store(T0 + t, Ordering::Release);
                     if busy_until.is_none() && ring_a >= HOP {
                         ring_a -= HOP;
-                        busy_until = Some(t + HOP_US);
+                        busy_until = Some(t + hop_us);
                     }
                     k += 1;
                     next_capture = capture_at(k);
@@ -3130,7 +3139,7 @@ mod tests {
                     wake(&mut r, Wake::Data, t, &mut sim);
                     busy_until = if ring_a >= HOP {
                         ring_a -= HOP;
-                        Some(t + HOP_US)
+                        Some(t + hop_us)
                     } else {
                         None
                     };
@@ -3272,6 +3281,53 @@ mod tests {
                 s.decay
             );
             assert!(after <= before + 128.0 + 16.0, "phase {phase}");
+        }
+    }
+
+    /// Ruling 21 (a): with the pre-roll released the target is period + hop again, which is
+    /// the floor the decay skips down to, so a pre-roll leaves the queue within one hop of the
+    /// never-toggled queue in every capture phase (the rest is O2's own spread: its steady low
+    /// sits between a period and the target). This holds with the "on" at the stream start
+    /// (attach with devocal on) and in steady state, and with a packet's hops taking 300 us
+    /// each (passthrough) or 1 or 2 ms each (a model: hop-sized bursts spread over the
+    /// period). No read starves, nothing is padded after the stream start, no underrun.
+    #[test]
+    fn o2_preroll_returns_within_a_hop_of_the_never_toggled_queue() {
+        for hop_us in [300, 1_000, 2_000] {
+            for phase in (0..10_000).step_by(500) {
+                let cfg = EvCfg {
+                    hop_us,
+                    ..EvCfg::new(phase, 3 * SEC)
+                };
+                let base = simulate_events(cfg);
+                let base_low = base.low(5 * SEC / 2, 3 * SEC);
+                assert!(base.starved.is_empty(), "hop {hop_us} phase {phase}");
+                assert_eq!(base.pads_after(50 * MS), 0, "hop {hop_us} phase {phase}");
+                for at in [0, SEC] {
+                    let s = simulate_events(EvCfg {
+                        preroll_at: Some(at),
+                        ..cfg
+                    });
+                    let low = s.low(5 * SEC / 2, 3 * SEC);
+                    let what = format!("hop {hop_us} phase {phase} on at {at}");
+                    eprintln!(
+                        "{what}: decay {} low {low} never toggled {base_low} (+{}) pads {:?} \
+                         starved {}",
+                        s.decay,
+                        low as i64 - base_low as i64,
+                        s.pads,
+                        s.starved.len()
+                    );
+                    assert_eq!(s.preroll, 441, "{what}");
+                    assert!(s.starved.is_empty(), "{what}");
+                    assert_eq!(s.pads_after(50 * MS), 0, "{what}: {:?}", s.pads);
+                    assert_eq!(s.underruns, 0, "{what}");
+                    assert!(
+                        (base_low..=base_low + 128).contains(&low),
+                        "{what}: low {low}, never toggled {base_low}"
+                    );
+                }
+            }
         }
     }
 

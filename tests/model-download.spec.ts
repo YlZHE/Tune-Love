@@ -14,6 +14,7 @@ async function prepare(page: Page, view = "/?view=settings", opts: { models?: Re
     state.models = models;
     state.modelRequests = [];
     state.modelFailure = null;
+    state.modelDelayMs = 0;
     state.devocal = { ...OFF, ...devocal };
     state.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "settings" } },
@@ -21,6 +22,7 @@ async function prepare(page: Page, view = "/?view=settings", opts: { models?: Re
         if (command === "get_model_status") return structuredClone(state.models);
         if (command === "model_command") {
           state.modelRequests.push(args.request);
+          await new Promise(resolve => setTimeout(resolve, state.modelDelayMs));
           if (state.modelFailure) throw state.modelFailure;
           const { id, action } = args.request;
           state.models = state.models.map((m: any) => {
@@ -148,4 +150,43 @@ test("settings: a failure shows the Chinese error with retry and import", async 
   await row.getByRole("button", { name: "从本地文件导入…", exact: true }).click();
   await expect(row.getByRole("alert")).toHaveCount(0);
   expect(await requests(page)).toEqual([request("download"), request("import")]);
+});
+
+test("settings: a rejection disappears when the row changes phase", async ({ page }) => {
+  const row = await prepare(page);
+  await page.evaluate(() => { (window as any).modelFailure = "already_running"; });
+  await row.getByRole("button", { name: "下载模型（约 36 MB）", exact: true }).click();
+  await expect(row.getByRole("alert")).toHaveText("正在下载中。");
+  await setModels(page, [{ ...MISSING, phase: "downloading", receivedBytes: 1_000_000, source: "origin" }]);
+  await expect(row.getByRole("progressbar")).toBeVisible();
+  await expect(row.getByRole("alert")).toHaveCount(0);
+});
+
+test("settings: a stale rejection does not hide a newer failure", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings", { models: [{ ...MISSING, phase: "failed", error: "timeout" }] });
+  await page.evaluate(() => { (window as any).modelFailure = "already_running"; });
+  await row.getByRole("button", { name: "重试", exact: true }).click();
+  await expect(row.getByRole("alert")).toHaveText("正在下载中。");
+  await setModels(page, [{ ...MISSING, phase: "downloading", receivedBytes: 1_000_000 }]);
+  await expect(row.getByRole("progressbar")).toBeVisible();
+  await setModels(page, [{ ...MISSING, phase: "failed", error: "sha256_mismatch" }]);
+  await expect(row.getByRole("alert")).toHaveText("下载的文件校验不通过，已删除。请重试。");
+});
+
+test("settings: a failed status without an error code still reads sensibly", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings", { models: [{ ...MISSING, phase: "failed", error: null }] });
+  await expect(row.getByRole("alert")).toHaveText("下载失败，请重试。");
+});
+
+test("settings: the row's buttons are disabled while a command is pending", async ({ page }) => {
+  const row = await prepare(page);
+  await page.evaluate(() => { (window as any).modelDelayMs = 600; });
+  const download = row.getByRole("button", { name: "下载模型（约 36 MB）", exact: true });
+  await download.click();
+  await expect(download).toBeDisabled();
+  await expect(row.getByRole("button", { name: "从本地文件导入…", exact: true })).toBeDisabled();
+  await download.click({ force: true });
+  await expect(row.getByRole("progressbar")).toBeVisible();
+  expect(await requests(page)).toEqual([request("download")]);
+  await expect(row.getByRole("button", { name: "取消", exact: true })).toBeEnabled();
 });

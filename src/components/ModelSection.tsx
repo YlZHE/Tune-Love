@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, Progress } from "@radix-ui/themes";
 import { useModelDownload, type ModelAction } from "../useModelDownload";
 import {
@@ -20,11 +20,23 @@ export function ModelSection(_props: { autoEnablePending: boolean; onAutoEnableC
 }
 
 function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStatus | null; send: Send }) {
-  const [actionError, setActionError] = useState("");
+  // A rejected command is shown only while the row is still in the phase it was raised in:
+  // a phase change brings fresher information than the rejection.
+  const [rejection, setRejection] = useState<{ text: string; phase: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const phase = status?.phase ?? "unknown";
+  // Dropped for good on a phase change, so it cannot come back if the row returns to that phase.
+  useEffect(() => setRejection(null), [phase]);
+  const actionError = rejection && rejection.phase === phase ? rejection.text : "";
 
+  // One command at a time per row, so a fast double-click cannot come back as already_running.
   const run = (action: ModelAction) => {
-    setActionError("");
-    send(model.id, action).catch((e: unknown) => setActionError(e instanceof Error ? e.message : modelErrorText(String(e))));
+    if (busy) return;
+    setRejection(null);
+    setBusy(true);
+    send(model.id, action)
+      .catch((e: unknown) => setRejection({ text: e instanceof Error ? e.message : modelErrorText(String(e)), phase }))
+      .finally(() => setBusy(false));
   };
   // Download, resume and retry all go through here; the confirmation box and the
   // acceleration prefix are added in front of it later.
@@ -35,9 +47,9 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
   const hint = status?.sourceError && (status.phase === "downloading" || status.phase === "failed")
     ? <p className="model-row-note">{modelErrorText(status.sourceError)}</p> : null;
   // A rejected command replaces the status error until the next action.
-  const failure = status?.phase === "failed" ? (actionError || modelErrorText(status.error ?? "")) : actionError;
+  const failure = status?.phase === "failed" ? (actionError || (status.error ? modelErrorText(status.error) : "下载失败，请重试。")) : actionError;
 
-  const importButton = <Button variant="ghost" color="gray" size="1" onClick={() => run("import")}>从本地文件导入…</Button>;
+  const importButton = <Button variant="ghost" color="gray" size="1" disabled={busy} onClick={() => run("import")}>从本地文件导入…</Button>;
 
   let body;
   if (!status) {
@@ -46,7 +58,7 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
     const weights = model.license.weights;
     body = <>
       <div className="model-row-actions">
-        <Button variant="soft" color="gray" onClick={startDownload}>下载模型（{approxSize(modelTotalBytes(model))}）</Button>
+        <Button variant="soft" color="gray" disabled={busy} onClick={startDownload}>下载模型（{approxSize(modelTotalBytes(model))}）</Button>
         {importButton}
       </div>
       <p className="model-row-note">
@@ -57,8 +69,8 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
   } else if (status.phase === "missing") {
     body = <>
       <div className="model-row-actions">
-        <Button variant="soft" color="gray" onClick={startDownload}>继续下载</Button>
-        <Button variant="ghost" color="gray" size="1" onClick={() => run("delete")}>删除已下载部分</Button>
+        <Button variant="soft" color="gray" disabled={busy} onClick={startDownload}>继续下载</Button>
+        <Button variant="ghost" color="gray" size="1" disabled={busy} onClick={() => run("delete")}>删除已下载部分</Button>
         {importButton}
       </div>
       <p className="model-row-note">{partial}</p>
@@ -69,7 +81,7 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
       <p className="model-row-note">{progressText(status)}</p>
       {hint}
       <div className="model-row-actions">
-        <Button variant="soft" color="gray" onClick={() => run("cancel")}>取消</Button>
+        <Button variant="soft" color="gray" disabled={busy} onClick={() => run("cancel")}>取消</Button>
       </div>
     </>;
   } else if (status.phase === "verifying") {
@@ -87,7 +99,7 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
         </dl>
       </details>
       {!env && <div className="model-row-actions">
-        <Button variant="soft" color="gray" onClick={() => run("delete")}>删除模型</Button>
+        <Button variant="soft" color="gray" disabled={busy} onClick={() => run("delete")}>删除模型</Button>
       </div>}
     </>;
   } else {
@@ -95,7 +107,7 @@ function ModelRow({ model, status, send }: { model: ModelInfo; status: ModelStat
       <p role="alert" className="color-error">{failure}</p>
       {hint}
       <div className="model-row-actions">
-        <Button variant="soft" color="gray" onClick={startDownload}>重试</Button>
+        <Button variant="soft" color="gray" disabled={busy} onClick={startDownload}>重试</Button>
         {importButton}
       </div>
     </>;

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button, TextField } from "@radix-ui/themes";
 import { UserSound } from "@phosphor-icons/react";
 import { isValidMirrorPrefix, readMirrorPrefix, saveMirrorPrefix } from "../modelDownload";
@@ -29,15 +29,17 @@ function MirrorPrefixField() {
 }
 
 // `request` says how settings were last opened. From the main window's missing-model hint
-// ("devocal-model") it scrolls here, focuses the model row and makes the row's next started
-// download or import turn de-vocal on once the model is installed. A plain open of the already
-// open window (section null) drops that, without scrolling or focusing.
+// ("devocal-model") it scrolls here, focuses the model row and makes the row's downloads and
+// imports (retries and resumes included) turn de-vocal on once the model is installed; that holds
+// until the model is installed or the user cancels a download. A plain open of the already open
+// window (section null) drops it, without scrolling or focusing.
 export function DevocalSettings({ request = null }: { request?: SettingsSectionRequest | null }) {
   const { status, release } = useDevocal();
   const [error, setError] = useState("");
   const section = useRef<HTMLElement>(null);
   const [autoEnablePending, setAutoEnablePending] = useState(false);
   const [focusSeq, setFocusSeq] = useState(0);
+  const consumeAutoEnable = useCallback(() => setAutoEnablePending(false), []);
   const seq = request?.seq ?? 0;
   const fromHint = request?.section === "devocal-model";
   useEffect(() => {
@@ -53,7 +55,7 @@ export function DevocalSettings({ request = null }: { request?: SettingsSectionR
       <div><h2 id="devocal-settings-title">去人声</h2>
         <p>开启去人声后，本应用会接管当前播放器的声音输出。音量合成器里播放器那一栏接近 0 是正常的，声音由本应用发出；要调音量请调本应用。点‘释放播放器’可立即交还。</p></div>
     </div>
-    <ModelSection autoEnablePending={autoEnablePending} onAutoEnableConsumed={() => setAutoEnablePending(false)} focusSeq={focusSeq} />
+    <ModelSection autoEnablePending={autoEnablePending} onAutoEnableConsumed={consumeAutoEnable} focusSeq={focusSeq} />
     <div className="devocal-settings-actions">
       <Button variant="soft" color="gray" disabled={!status.held}
         onClick={() => { setError(""); release().catch(() => setError("未能释放播放器，请重试")); }}>释放播放器</Button>

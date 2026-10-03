@@ -12,8 +12,8 @@ type Send = ReturnType<typeof useModelDownload>["send"];
 
 // The StemgenRT row is the one the main window's missing-model hint points at. While
 // `autoEnablePending` holds, its downloads and imports ask the backend to turn de-vocal on after
-// installing; the request is used up only once one of them has actually started (or found the
-// model installed). A non-zero `focusSeq` change focuses the row's first usable button.
+// installing; the request is used up once the row reaches installed, or dropped when the user
+// cancels a download. A non-zero `focusSeq` change focuses the row's first usable button.
 export function ModelSection({ autoEnablePending, onAutoEnableConsumed, focusSeq }: {
   autoEnablePending: boolean; onAutoEnableConsumed(): void; focusSeq: number;
 }) {
@@ -40,19 +40,18 @@ function ModelRow({ model, status, send, autoEnable, onAutoEnableConsumed, focus
   useEffect(() => setRejection(null), [phase]);
   const actionError = rejection && rejection.phase === phase ? rejection.text : "";
 
+  // A pending auto-enable is used up once the model is installed. Until then it rides on every
+  // download, resume, retry or import; only the user's own cancel of a download drops it early.
+  useEffect(() => { if (autoEnable && phase === "installed") onAutoEnableConsumed(); }, [autoEnable, phase, onAutoEnableConsumed]);
+
   // One command at a time per row, so a fast double-click cannot come back as already_running.
-  // A pending auto-enable rides on every download or import until one has started: a rejected
-  // command, or a reply still showing the row missing or failed (a closed file picker), keeps it.
   const run = (action: ModelAction, options?: { mirrorPrefix?: string }) => {
     if (busy) return;
     setRejection(null);
     setBusy(true);
+    if (autoEnable && action === "cancel") onAutoEnableConsumed();
     const withAutoEnable = autoEnable && (action === "download" || action === "import");
     send(model.id, action, { ...options, autoEnable: withAutoEnable })
-      .then(next => {
-        const after = next?.find(s => s.id === model.id)?.phase;
-        if (withAutoEnable && (after === "downloading" || after === "verifying" || after === "installed")) onAutoEnableConsumed();
-      })
       .catch((e: unknown) => setRejection({ text: e instanceof Error ? e.message : modelErrorText(String(e)), phase }))
       .finally(() => setBusy(false));
   };
@@ -154,8 +153,8 @@ function ModelRow({ model, status, send, autoEnable, onAutoEnableConsumed, focus
     </>;
   }
 
-  // Only where a download or import can still be started.
-  const autoEnableNote = autoEnable && (status?.phase === "missing" || status?.phase === "failed")
+  // Shown for as long as the request is pending, i.e. until the model is installed.
+  const autoEnableNote = autoEnable && status && status.phase !== "installed"
     ? <p className="model-row-note">下载完成后将自动开启去人声</p> : null;
 
   return <div ref={row} role="group" aria-label={model.name} className="model-row">

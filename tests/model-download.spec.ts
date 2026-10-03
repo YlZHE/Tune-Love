@@ -369,6 +369,8 @@ test("settings opened from the missing-model hint downloads with autoEnable", as
   await page.getByRole("alertdialog").getByRole("button", { name: "同意并下载", exact: true }).click();
   await expect.poll(async () => (await requests(page)).length).toBe(1);
   expect(await requests(page)).toEqual([{ ...request("download"), autoEnable: true }]);
+  // Still pending while the download runs; the user's cancel drops it.
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
   await row.getByRole("button", { name: "取消", exact: true }).click();
   await row.getByRole("button", { name: "继续下载", exact: true }).click();
   await expect.poll(async () => (await requests(page)).length).toBe(3);
@@ -439,6 +441,31 @@ test("a rejected download keeps the pending auto-enable for the retry", async ({
   await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
   await expect(row.getByRole("progressbar")).toBeVisible();
   expect(await requests(page)).toEqual([{ ...request("download"), autoEnable: true }, { ...request("download"), autoEnable: true }]);
+  // Kept until the model is installed.
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+});
+
+test("a download from the hint that fails retries with autoEnable until the model is installed", async ({ page }) => {
+  const row = await prepare(page, "/?view=settings&section=devocal-model");
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect(row.getByRole("progressbar")).toBeVisible();
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  // Every source failed.
+  await setModels(page, [{ ...MISSING, phase: "failed", receivedBytes: 1_000_000, error: "all_sources_failed", sourceError: "timeout" }]);
+  await expect(row.getByRole("button", { name: "重试", exact: true })).toBeVisible();
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  await row.getByRole("button", { name: "重试", exact: true }).click();
+  await expect(row.getByRole("progressbar")).toBeVisible();
+  expect(await requests(page)).toEqual([{ ...request("download"), autoEnable: true }, { ...request("download"), autoEnable: true }]);
+  await expect(row.getByText(AUTO_ENABLE_NOTE, { exact: true })).toBeVisible();
+  // Installed: the request is used up, so a later download (after a delete) does not carry it.
+  await setModels(page, [{ ...MISSING, phase: "installed", receivedBytes: 37_529_132, source: "origin", path: "C:\\m\\model.onnx" }]);
+  await expect(row.getByText("模型已就绪", { exact: true })).toBeVisible();
+  await expect(row.getByText(AUTO_ENABLE_NOTE)).toHaveCount(0);
+  await row.getByRole("button", { name: "删除模型", exact: true }).click();
+  await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
+  await expect.poll(async () => (await requests(page)).length).toBe(4);
+  expect((await requests(page))[3]).toEqual(request("download"));
   await expect(row.getByText(AUTO_ENABLE_NOTE)).toHaveCount(0);
 });
 

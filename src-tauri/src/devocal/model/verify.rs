@@ -46,27 +46,29 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// therefore either rename a file into place (which gives a fresh entry) or call
 /// [`note_verified`] right after; the downloader does both.
 pub fn file_verified(path: &Path, spec: &FileSpec) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
+    verified_sha256(path, spec).is_some()
+}
+
+/// [`file_verified`], returning the hash that was computed over the file (now or, for an
+/// unchanged file, earlier) when it matches the spec.
+pub fn verified_sha256(path: &Path, spec: &FileSpec) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() != spec.bytes {
-        return false;
+        return None;
     }
     let Ok(mtime) = meta.modified() else {
-        return sha256_file(path).is_ok_and(|h| h == spec.sha256);
+        return sha256_file(path).ok().filter(|h| *h == spec.sha256);
     };
     if let Some((m, len, sha)) = lock_cache().get(path) {
         if *m == mtime && *len == meta.len() {
-            return *sha == spec.sha256;
+            return (*sha == spec.sha256).then(|| sha.clone());
         }
     }
     // Not holding the cache lock while hashing.
-    let Ok(sha) = sha256_file(path) else {
-        return false;
-    };
+    let sha = sha256_file(path).ok()?;
     let ok = sha == spec.sha256;
-    lock_cache().insert(path.to_path_buf(), (mtime, meta.len(), sha));
-    ok
+    lock_cache().insert(path.to_path_buf(), (mtime, meta.len(), sha.clone()));
+    ok.then_some(sha)
 }
 
 /// Remembers a hash that was just computed while installing, so the next check does not redo it.
@@ -112,13 +114,17 @@ pub fn migrate_legacy(manifest: &Manifest, models_dir: &Path) -> Vec<String> {
         let flat = models_dir.join(flat_name);
         let dir = model_dir(models_dir, id);
         let target = dir.join(&file.file);
-        if !flat.is_file() || target.exists() || !file_verified(&flat, file) {
+        if !flat.is_file() || target.exists() {
             continue;
         }
+        let Some(sha256) = verified_sha256(&flat, file) else {
+            continue;
+        };
         if std::fs::create_dir_all(&dir).is_err() || std::fs::rename(&flat, &target).is_err() {
             continue;
         }
-        note_verified(&target, &file.sha256);
+        // The hash computed over the file, as `note_verified` requires (not the manifest value).
+        note_verified(&target, &sha256);
         migrated.push((*id).to_string());
     }
     migrated
@@ -227,5 +233,23 @@ pub(crate) mod tests {
         assert!(migrate_legacy(&m, &models).is_empty());
         assert_eq!(std::fs::read(&flat).unwrap(), GOOD);
         assert_eq!(std::fs::read(&target).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn verified_sha256_returns_the_hash_it_computed() {
+        let m = fake_manifest(GOOD);
+        let spec = &m.model(ID).unwrap().files[0];
+        let dir = temp_dir("verify-sha");
+        let file = dir.join("model.onnx");
+        std::fs::write(&file, GOOD).unwrap();
+        let computed = format!("{:x}", Sha256::digest(GOOD));
+        assert_eq!(verified_sha256(&file, spec), Some(computed.clone()));
+        // Cached the second time; still the computed value.
+        assert_eq!(verified_sha256(&file, spec), Some(computed));
+        let mut bad = GOOD.to_vec();
+        bad[1] ^= 1;
+        rewrite(&file, &bad, 2);
+        assert_eq!(verified_sha256(&file, spec), None);
+        assert_eq!(verified_sha256(&dir.join("missing.onnx"), spec), None);
     }
 }

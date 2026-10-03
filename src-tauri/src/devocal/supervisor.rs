@@ -1585,7 +1585,11 @@ mod tests {
     #[test]
     fn missing_model_reports_unavailable() {
         let dir = crate::devocal::tests::temp_dir("missing-model");
-        let model = crate::devocal::model_path_from(None, &dir);
+        let model = crate::devocal::model_path_from(
+            None,
+            &dir,
+            crate::devocal::model::manifest::bundled(),
+        );
         assert_eq!(model, None);
         let mut r = rig();
         r.sup.enable(model);

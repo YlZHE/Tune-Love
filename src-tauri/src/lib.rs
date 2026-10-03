@@ -39,6 +39,14 @@ pub fn run() {
             let data_dir = app.path().app_local_data_dir().ok();
             if let Some(dir) = &data_dir {
                 devocal::restore_at_startup(&devocal::restore_file(dir));
+                // Older builds kept the model as one flat file; move a verified one into place.
+                let migrated = devocal::model::verify::migrate_legacy(
+                    devocal::model::manifest::bundled(),
+                    &dir.join("models"),
+                );
+                if !migrated.is_empty() {
+                    eprintln!("models: migrated legacy file(s): {}", migrated.join(", "));
+                }
             }
             app.state::<audio::AudioState>().start();
             // Installed builds ship the bridge and Python under the resource dir.

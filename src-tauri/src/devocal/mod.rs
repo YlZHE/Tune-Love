@@ -30,8 +30,6 @@ use supervisor::{DevocalStatus, PlayerProcess, Supervisor};
 
 /// Env override for the StemgenRT ONNX file.
 pub const MODEL_ENV: &str = "TUNE_LOVE_STEMGENRT_ONNX";
-/// Default model location under the app data dir (where `npm run fetch:stemgenrt` puts it).
-pub const MODEL_FILE: &str = "stemgenrt-hop128.onnx";
 pub const RESTORE_FILE: &str = "devocal-restore.json";
 pub const ENGINE_EXE: &str = "devocal-engine.exe";
 const TICK: Duration = Duration::from_millis(100);
@@ -40,17 +38,33 @@ const RESOLVE_RETRY_MS: u64 = 2_000;
 /// How long app exit waits for the supervisor thread to shut the engine down.
 const SHUTDOWN_JOIN: Duration = Duration::from_secs(3);
 
-/// The model file: env `TUNE_LOVE_STEMGENRT_ONNX`, then `<data>/models/stemgenrt-hop128.onnx`;
-/// the first that exists.
+/// The model file: env `TUNE_LOVE_STEMGENRT_ONNX` (an existing file, used as is), then the
+/// verified `<data>/models/stemgenrt-hop128/<file>`. May hash the file (cached), so keep it off
+/// hot paths.
 pub fn model_path(data_dir: &Path) -> Option<PathBuf> {
-    model_path_from(std::env::var_os(MODEL_ENV), data_dir)
+    model_path_from(
+        std::env::var_os(MODEL_ENV),
+        data_dir,
+        model::manifest::bundled(),
+    )
 }
 
-/// [`model_path`] with the env value passed in (testable without touching the process env).
-pub fn model_path_from(env: Option<OsString>, data_dir: &Path) -> Option<PathBuf> {
+/// [`model_path`] with the env value and manifest passed in (testable without the process env).
+pub fn model_path_from(
+    env: Option<OsString>,
+    data_dir: &Path,
+    manifest: &model::manifest::Manifest,
+) -> Option<PathBuf> {
     let from_env = env.filter(|v| !v.is_empty()).map(PathBuf::from);
-    let default = data_dir.join("models").join(MODEL_FILE);
-    from_env.into_iter().chain([default]).find(|p| p.is_file())
+    if let Some(path) = from_env.filter(|p| p.is_file()) {
+        return Some(path);
+    }
+    model::verify::installed_files(
+        manifest,
+        &data_dir.join("models"),
+        model::manifest::STEMGENRT_ID,
+    )
+    .and_then(|files| files.into_iter().next())
 }
 
 pub fn restore_file(data_dir: &Path) -> PathBuf {
@@ -178,11 +192,17 @@ impl DevocalState {
 
     pub fn command(&self, action: &str) -> Result<DevocalStatus, String> {
         let data_dir = lock(&self.shared.data_dir).clone();
+        // Worked out before taking the supervisor lock: the first check hashes the model file.
+        let model = if action == "enable" {
+            data_dir.as_deref().and_then(model_path)
+        } else {
+            None
+        };
         let mut slot = lock(&self.shared.supervisor);
         let Some(sup) = slot.as_mut() else {
             return Err("devocal is not started yet".into());
         };
-        apply(sup, action, data_dir.as_deref())?;
+        apply(sup, action, model)?;
         let status = sup.status();
         *lock(&self.shared.status) = status.clone();
         Ok(status)
@@ -206,10 +226,10 @@ impl DevocalState {
 fn apply<L: link::EngineLink>(
     sup: &mut Supervisor<L>,
     action: &str,
-    data_dir: Option<&Path>,
+    model: Option<PathBuf>,
 ) -> Result<(), String> {
     match action {
-        "enable" => sup.enable(data_dir.and_then(model_path)),
+        "enable" => sup.enable(model),
         "disable" => sup.disable(),
         "release" => sup.release(),
         other => return Err(format!("unknown devocal action {other:?}")),
@@ -369,29 +389,44 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn model_path_prefers_an_existing_env_file_then_the_data_dir() {
+    fn model_path_prefers_an_existing_env_file_then_the_verified_data_dir_file() {
+        use crate::devocal::model::verify::tests::fake_manifest;
+        let manifest = fake_manifest(b"good model bytes");
         let dir = temp_dir("model-path");
-        assert_eq!(model_path_from(None, &dir), None);
+        assert_eq!(model_path_from(None, &dir, &manifest), None);
         let env_file = dir.join("custom.onnx");
         // A set but missing env path falls through to the data dir.
-        assert_eq!(model_path_from(Some(env_file.clone().into()), &dir), None);
-        std::fs::create_dir_all(dir.join("models")).unwrap();
-        let data_file = dir.join("models").join("stemgenrt-hop128.onnx");
-        std::fs::write(&data_file, b"x").unwrap();
-        assert_eq!(model_path_from(None, &dir), Some(data_file.clone()));
         assert_eq!(
-            model_path_from(Some(env_file.clone().into()), &dir),
-            Some(data_file)
+            model_path_from(Some(env_file.clone().into()), &dir, &manifest),
+            None
         );
+        let data_file = dir
+            .join("models")
+            .join("stemgenrt-hop128")
+            .join("model.onnx");
+        std::fs::create_dir_all(data_file.parent().unwrap()).unwrap();
+        // Wrong content does not verify.
+        std::fs::write(&data_file, b"x").unwrap();
+        assert_eq!(model_path_from(None, &dir, &manifest), None);
+        std::fs::write(&data_file, b"good model bytes").unwrap();
+        assert_eq!(
+            model_path_from(None, &dir, &manifest),
+            Some(data_file.clone())
+        );
+        assert_eq!(
+            model_path_from(Some(env_file.clone().into()), &dir, &manifest),
+            Some(data_file.clone())
+        );
+        // An existing env file wins and is not verified.
         std::fs::write(&env_file, b"x").unwrap();
         assert_eq!(
-            model_path_from(Some(env_file.clone().into()), &dir),
+            model_path_from(Some(env_file.clone().into()), &dir, &manifest),
             Some(env_file)
         );
         // An empty env value is ignored.
         assert_eq!(
-            model_path_from(Some(OsString::new()), &dir),
-            Some(dir.join("models").join("stemgenrt-hop128.onnx"))
+            model_path_from(Some(OsString::new()), &dir, &manifest),
+            Some(data_file)
         );
     }
 
@@ -467,17 +502,12 @@ pub(crate) mod tests {
     fn actions_map_to_supervisor_calls() {
         let dir = temp_dir("actions");
         let (mut sup, engines) = fake_supervisor();
-        apply(&mut sup, "enable", Some(&dir)).unwrap();
-        assert_eq!(
-            sup.status().phase,
-            "unavailable",
-            "no model in the data dir"
-        );
-        assert!(apply(&mut sup, "explode", Some(&dir)).is_err());
+        apply(&mut sup, "enable", None).unwrap();
+        assert_eq!(sup.status().phase, "unavailable", "no verified model");
+        assert!(apply(&mut sup, "explode", None).is_err());
 
-        std::fs::create_dir_all(dir.join("models")).unwrap();
-        std::fs::write(dir.join("models").join(MODEL_FILE), b"x").unwrap();
-        apply(&mut sup, "enable", Some(&dir)).unwrap();
+        let model = dir.join("model.onnx");
+        apply(&mut sup, "enable", Some(model)).unwrap();
         let player = PlayerProcess {
             source_id: "folia".into(),
             pid: 7,
@@ -487,8 +517,8 @@ pub(crate) mod tests {
         let engine = engines.lock().unwrap()[0].clone();
         assert_eq!(engine.sent().len(), 4);
         engine.clear_sent();
-        apply(&mut sup, "disable", Some(&dir)).unwrap();
-        apply(&mut sup, "release", Some(&dir)).unwrap();
+        apply(&mut sup, "disable", None).unwrap();
+        apply(&mut sup, "release", None).unwrap();
         assert_eq!(
             engine.sent(),
             vec![Command::SetMode { devocal: false }, Command::Release]

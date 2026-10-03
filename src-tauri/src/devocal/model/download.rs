@@ -136,7 +136,8 @@ fn local<T>(r: std::io::Result<T>) -> Result<T, ModelError> {
     r.map_err(|e| io_error(&e))
 }
 
-fn remove_if_present(path: &Path) -> Result<(), ModelError> {
+/// Removes a file; one that is already gone is fine.
+pub(crate) fn remove_if_present(path: &Path) -> Result<(), ModelError> {
     match fs::remove_file(path) {
         Err(e) if e.kind() != ErrorKind::NotFound => Err(io_error(&e)),
         _ => Ok(()),

@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::download::{download_file, install, io_error, meta_path, part_path, ModelError, PartMeta, RetryPolicy, Update};
+use super::download::{
+    download_file, install, io_error, meta_path, part_path, remove_if_present, ModelError, PartMeta, RetryPolicy, Update,
+};
 use super::fetch::Fetcher;
 use super::manifest::{candidates, FileSpec, Manifest, ModelSpec, SourceKind, STEMGENRT_ID};
 use super::verify::{file_verified, installed_files, model_dir};
@@ -104,6 +106,15 @@ impl Drop for RunGuard {
     }
 }
 
+/// Sets the flag when dropped.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 impl RunGuard {
     /// Records how the job ended, ends the registration, then reports a successful install.
     fn finish(self, result: Result<Option<String>, ModelError>, on_installed: Box<dyn FnOnce() + Send>) {
@@ -147,9 +158,10 @@ impl Inner {
                 return Err(ModelError::AlreadyRunning);
             }
             *running = Some(Running { id: id.into(), cancel: cancel.clone(), phase, received: 0, source: None });
+            // Still under `running`, so no status shows the new run with the old run's detail.
+            lock(&self.errors).remove(id);
+            lock(&self.source_errors).remove(id);
         }
-        lock(&self.errors).remove(id);
-        lock(&self.source_errors).remove(id);
         Ok(RunGuard { inner: self.clone(), id: id.into(), cancel })
     }
 
@@ -262,13 +274,6 @@ fn resumable_bytes(file: &FileSpec, final_path: &Path) -> u64 {
     }
 }
 
-fn remove_if_present(path: &Path) -> Result<(), ModelError> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() != ErrorKind::NotFound => Err(io_error(&e)),
-        _ => Ok(()),
-    }
-}
-
 /// Like `remove_if_present`, but a protected file or one open elsewhere is `DeleteDenied`.
 fn remove_for_delete(path: &Path) -> Result<(), ModelError> {
     match fs::remove_file(path) {
@@ -329,11 +334,13 @@ fn import_file(guard: &RunGuard, file: &FileSpec, source: &Path, final_path: &Pa
     if let Some(dir) = final_path.parent() {
         fs::create_dir_all(dir).map_err(|e| io_error(&e))?;
     }
+    // Opened before anything is removed: a source that cannot be read leaves a partial download alone.
+    let input = File::open(source).map_err(|_| ModelError::ImportMismatch)?;
     let part = part_path(final_path);
     // An import replaces whatever download of this file was in progress.
     remove_if_present(&part)?;
     remove_if_present(&meta_path(final_path))?;
-    let copied = copy_hashing(source, &part, file.bytes, &guard.cancel, |n| {
+    let copied = copy_hashing(input, &part, file.bytes, &guard.cancel, |n| {
         guard.inner.with_running(&guard.id, |r| r.received = n);
     });
     let result = match copied {
@@ -351,10 +358,9 @@ fn import_file(guard: &RunGuard, file: &FileSpec, source: &Path, final_path: &Pa
     result
 }
 
-/// Returns the SHA-256 of what was copied. A source that cannot be read, or whose length turns
-/// out not to be `expected` after all, is not the model (`ImportMismatch`).
-fn copy_hashing(source: &Path, part: &Path, expected: u64, cancel: &AtomicBool, progress: impl Fn(u64)) -> Result<String, ModelError> {
-    let mut input = File::open(source).map_err(|_| ModelError::ImportMismatch)?;
+/// Returns the SHA-256 of what was copied. A source that fails to read, or whose length turns out
+/// not to be `expected` after all, is not the model (`ImportMismatch`).
+fn copy_hashing(mut input: File, part: &Path, expected: u64, cancel: &AtomicBool, progress: impl Fn(u64)) -> Result<String, ModelError> {
     let mut output = File::create(part).map_err(|e| io_error(&e))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; IMPORT_CHUNK];
@@ -463,8 +469,10 @@ impl ModelState {
         let final_path = model_dir(&models_dir, id).join(&file.file);
         Ok(async move {
             let Some(guard) = guard else { return };
-            // Copying and hashing a large file is blocking work. If this future is dropped, the
-            // guard (moved into the closure) still ends the registration when the copy stops.
+            // If this future is dropped mid-copy, the copy is told to stop; the guard (moved into
+            // the closure) ends the registration once it has.
+            let _stop_on_drop = CancelOnDrop(guard.cancel.clone());
+            // Copying and hashing a large file is blocking work.
             let joined = tokio::task::spawn_blocking(move || {
                 let result = import_file(&guard, file, &source_file, &final_path);
                 (guard, result)
@@ -1024,6 +1032,121 @@ mod tests {
         t.state.begin_import("a", t.dir.join("gone.onnx"), noop()).unwrap().await;
         assert_eq!(t.status("a").error.as_deref(), Some("import_mismatch"));
         assert_eq!(n.load(Ordering::SeqCst) + n2.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn import_of_an_unopenable_source_keeps_the_partial_download() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let t = fx("st-import-locked");
+        let src = t.dir.join("picked.onnx");
+        std::fs::write(&src, &t.a).unwrap();
+        std::fs::create_dir_all(t.dir.join("a")).unwrap();
+        std::fs::write(part_path(&t.a_file()), b"partial").unwrap();
+        std::fs::write(meta_path(&t.a_file()), b"{\"meta\":1}").unwrap();
+        // Right size, but another program holds it open exclusively.
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&src).unwrap();
+        t.state.begin_import("a", src.clone(), noop()).unwrap().await;
+        drop(lock);
+        assert_eq!(t.status("a").error.as_deref(), Some("import_mismatch"));
+        assert_eq!(std::fs::read(part_path(&t.a_file())).unwrap(), b"partial");
+        assert_eq!(std::fs::read(meta_path(&t.a_file())).unwrap(), b"{\"meta\":1}");
+    }
+
+    /// A one-model manifest (`big`, file `big.bin`) whose import takes many 1 MiB chunks, plus a
+    /// matching source file to import.
+    struct Big {
+        dir: PathBuf,
+        state: ModelState,
+        src: PathBuf,
+        file: PathBuf,
+    }
+
+    fn big(tag: &str) -> Big {
+        let content = vec![0x5A_u8; 64 << 20];
+        let manifest = leak(vec![model_json("big", vec![file_json("big.bin", &content, A_ORIGIN, true)])]);
+        let dir = temp_dir(tag);
+        let src = dir.join("picked.onnx");
+        std::fs::write(&src, &content).unwrap();
+        let state = ModelState::new(manifest, None);
+        state.set_models_dir(dir.join("models"));
+        let file = dir.join("models").join("big").join("big.bin");
+        Big { dir, state, src, file }
+    }
+
+    impl Big {
+        fn status(&self) -> ModelStatus {
+            self.state.statuses().remove(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_import_returns_to_missing_and_removes_the_part() {
+        let t = big("st-import-cancel");
+        let (n, cb) = counter();
+        let job = tokio::spawn(t.state.begin_import("big", t.src.clone(), cb).unwrap());
+        until("the copy to start", || t.status().received_bytes > 0).await;
+        assert_eq!(t.status().phase, ModelPhase::Verifying);
+        t.state.cancel("big");
+        tokio::time::timeout(Duration::from_secs(10), job).await.expect("cancel ignored").unwrap();
+        let s = t.status();
+        assert_eq!((s.phase, s.error, s.received_bytes), (ModelPhase::Missing, None, 0));
+        assert!(!part_path(&t.file).exists() && !t.file.exists());
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+        assert!(t.src.exists());
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_import_mid_copy_stops_it() {
+        let t = big("st-import-drop");
+        let (n, cb) = counter();
+        let job = tokio::spawn(t.state.begin_import("big", t.src.clone(), cb).unwrap());
+        until("the copy to start", || t.status().received_bytes > 0).await;
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        // The slot stays taken until the copy has actually stopped.
+        until("the copy to stop", || t.status().phase != ModelPhase::Verifying).await;
+        let s = t.status();
+        assert_eq!((s.phase, s.error), (ModelPhase::Missing, None), "nothing recorded");
+        assert!(!t.file.exists(), "not installed");
+        assert!(!part_path(&t.file).exists());
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+        assert!(t.state.begin_import("big", t.src.clone(), noop()).is_ok(), "slot free again");
+        let _ = std::fs::remove_dir_all(&t.dir);
+    }
+
+    #[tokio::test]
+    async fn import_of_an_installed_model_completes_at_once() {
+        let t = fx("st-import-installed");
+        std::fs::create_dir_all(t.dir.join("a")).unwrap();
+        std::fs::write(t.a_file(), &t.a).unwrap();
+        let (n, cb) = counter();
+        // The picked file is not even looked at.
+        t.state.begin_import("a", t.dir.join("does-not-exist.onnx"), cb).unwrap().await;
+        let s = t.status("a");
+        assert_eq!((s.phase, s.error), (ModelPhase::Installed, None));
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(t.a_file()).unwrap(), t.a);
+    }
+
+    #[tokio::test]
+    async fn download_of_stemgenrt_with_env_override_completes_at_once() {
+        let content = bytes(1024, 5);
+        let manifest = leak(vec![model_json(STEMGENRT_ID, vec![file_json("model.onnx", &content, A_ORIGIN, true)])]);
+        let dir = temp_dir("st-env-download");
+        let env_file = dir.join("elsewhere.onnx");
+        std::fs::write(&env_file, b"anything").unwrap();
+        let state = ModelState::new(manifest, Some(env_file));
+        state.set_models_dir(dir.join("models"));
+        let f = Arc::new(FakeFetcher::new());
+        let (n, cb) = counter();
+        state.begin_download(f.clone(), STEMGENRT_ID, None, POLICY, false, cb).unwrap().await;
+        assert!(f.calls().is_empty());
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+        assert!(!dir.join("models").exists(), "nothing written");
+        let s = state.statuses().remove(0);
+        assert_eq!((s.phase, s.source.as_deref()), (ModelPhase::Installed, Some("env")));
     }
 
     #[test]

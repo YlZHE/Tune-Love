@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   MODEL_MANIFEST, STEMGENRT_ID, approxSize, consentKey, formatMiB, hasModelConsent, isValidMirrorPrefix,
   modelErrorText, modelTotalBytes, parseModelStatuses, pinnedCommit, progressPercent, progressText,
-  readMirrorPrefix, rememberModelConsent, saveMirrorPrefix, sourceLabel, type ModelStatus,
+  readMirrorPrefix, rememberModelConsent, saveMirrorPrefix, sourceErrorHint, sourceLabel, type ModelStatus,
 } from "./modelDownload";
 
 function memoryStorage() {
@@ -200,5 +200,26 @@ describe("throwing localStorage", () => {
     expect(readMirrorPrefix()).toBe("");
     expect(() => rememberModelConsent(m)).not.toThrow();
     expect(() => saveMirrorPrefix("https://a.b/")).not.toThrow();
+  });
+});
+
+describe("sourceErrorHint", () => {
+  it("while downloading, says a source failed and the next one is in use", () => {
+    expect(sourceErrorHint("downloading", "timeout")).toBe("某个来源失败（下载超时，请重试），已自动换用下一个");
+    expect(sourceErrorHint("downloading", "http_status:503")).toBe("某个来源失败（下载服务繁忙（HTTP 503），请稍后再试），已自动换用下一个");
+    expect(sourceErrorHint("downloading", "network_unreachable")).toBe("某个来源失败（无法连接下载地址。请检查网络，或设置系统代理后重试），已自动换用下一个");
+    // Its own text already says the next source was taken.
+    expect(sourceErrorHint("downloading", "source_html")).toBe("某个来源失败（加速服务返回了网页），已自动换用下一个");
+  });
+  it("after the download failed, names the last source's failure", () => {
+    expect(sourceErrorHint("failed", "timeout")).toBe("最后一个来源失败：下载超时，请重试。");
+    expect(sourceErrorHint("failed", "size_mismatch")).toBe("最后一个来源失败：下载的文件校验不通过，已删除。请重试。");
+    // No "switched to the next one" when there was none.
+    expect(sourceErrorHint("failed", "source_html")).toBe("最后一个来源失败：加速服务返回了网页。");
+  });
+  it("shows nothing without a code or in other phases", () => {
+    expect(sourceErrorHint("downloading", null)).toBeNull();
+    expect(sourceErrorHint("failed", null)).toBeNull();
+    for (const phase of ["missing", "verifying", "installed"] as const) expect(sourceErrorHint(phase, "timeout")).toBeNull();
   });
 });

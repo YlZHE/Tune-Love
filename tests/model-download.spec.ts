@@ -104,12 +104,12 @@ test("settings: clicking download sends the request and follows the new status",
 test("settings: a downloading row shows the last per-source failure as a hint", async ({ page }) => {
   const row = await prepare(page, "/?view=settings", { models: [
     { ...MISSING, phase: "downloading", receivedBytes: 1_000_000, source: "mirror:ghproxy.net", sourceError: "source_html" }] });
-  await expect(row.getByText("加速服务返回了网页，已换下一个来源", { exact: true })).toBeVisible();
+  await expect(row.getByText("某个来源失败（加速服务返回了网页），已自动换用下一个", { exact: true })).toBeVisible();
   await expect(row.getByText(/已下载 1\.0 \/ 35\.8 MB/)).toBeVisible();
   // Other phases do not show it.
   await setModels(page, [{ ...MISSING, sourceError: "source_html" }]);
   await expect(row.getByRole("button", { name: "下载模型（约 36 MB）" })).toBeVisible();
-  await expect(row.getByText("加速服务返回了网页，已换下一个来源")).toHaveCount(0);
+  await expect(row.getByText("加速服务返回了网页")).toHaveCount(0);
 });
 
 test("settings: a partial download offers resume and delete-partial", async ({ page }) => {
@@ -156,7 +156,7 @@ test("settings: a failure shows the Chinese error with retry and import", async 
     { ...MISSING, phase: "failed", error: "all_sources_failed", sourceError: "timeout" }] });
   const alert = row.getByRole("alert");
   await expect(alert).toHaveText("所有下载来源都失败了。可设置系统代理、填写加速前缀，或从本地文件导入。");
-  await expect(row.getByText("下载超时，请重试。", { exact: true })).toBeVisible();
+  await expect(row.getByText("最后一个来源失败：下载超时，请重试。", { exact: true })).toBeVisible();
   await page.evaluate(() => { (window as any).modelFailure = "already_running"; });
   await row.getByRole("button", { name: "重试", exact: true }).click();
   await expect(alert).toHaveText("正在下载中。");

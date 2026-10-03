@@ -119,6 +119,21 @@ export function modelErrorText(code: string): string {
   }
 }
 
+// The hint line for the most recent per-source failure (`sourceError`): while downloading the
+// download has moved on to the next source; once failed it was the last source. Null when
+// there is nothing to show.
+export function sourceErrorHint(phase: ModelPhase, code: string | null): string | null {
+  if (!code) return null;
+  const html = code === "source_html";
+  if (phase === "downloading") {
+    const reason = html ? "加速服务返回了网页" : modelErrorText(code).replace(/。$/, "");
+    return `某个来源失败（${reason}），已自动换用下一个`;
+  }
+  // source_html's own text says the next source was taken, which is not so for the last one.
+  if (phase === "failed") return `最后一个来源失败：${html ? "加速服务返回了网页。" : modelErrorText(code)}`;
+  return null;
+}
+
 // Mirrors `valid_prefix` in src-tauri/src/devocal/model/manifest.rs: https:// + host
 // ([A-Za-z0-9.-]+, optional :port 1-65535), ends with "/", no whitespace or control
 // characters, at most 200 bytes. The host rule keeps userinfo, queries and fragments out.

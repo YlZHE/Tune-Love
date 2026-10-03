@@ -3,7 +3,7 @@ import { Button, Progress } from "@radix-ui/themes";
 import { useModelDownload, type ModelAction } from "../useModelDownload";
 import {
   MODEL_MANIFEST, STEMGENRT_ID, approxSize, formatMiB, hasModelConsent, isValidMirrorPrefix, modelErrorText, modelTotalBytes,
-  progressPercent, progressText, readMirrorPrefix, rememberModelConsent, type ModelInfo, type ModelStatus,
+  progressPercent, progressText, readMirrorPrefix, rememberModelConsent, sourceErrorHint, type ModelInfo, type ModelStatus,
 } from "../modelDownload";
 import { ModelConsentDialog } from "./ModelConsentDialog";
 import "./ModelSection.css";
@@ -84,8 +84,8 @@ function ModelRow({ model, status, send, autoEnable, onAutoEnableConsumed, focus
 
   const total = status && status.totalBytes > 0 ? status.totalBytes : modelTotalBytes(model);
   const partial = status ? `已下载 ${formatMiB(status.receivedBytes)} / ${formatMiB(total)} MB` : "";
-  const hint = status?.sourceError && (status.phase === "downloading" || status.phase === "failed")
-    ? <p className="model-row-note">{modelErrorText(status.sourceError)}</p> : null;
+  const hintText = status ? sourceErrorHint(status.phase, status.sourceError) : null;
+  const hint = hintText ? <p className="model-row-note">{hintText}</p> : null;
   // A rejected command replaces the status error until the next action.
   const failure = status?.phase === "failed" ? (actionError || (status.error ? modelErrorText(status.error) : "下载失败，请重试。")) : actionError;
 

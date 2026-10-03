@@ -1053,8 +1053,8 @@ mod tests {
         assert_eq!(std::fs::read(meta_path(&t.a_file())).unwrap(), b"{\"meta\":1}");
     }
 
-    /// A one-model manifest (`big`, file `big.bin`) whose import takes many 1 MiB chunks, plus a
-    /// matching source file to import.
+    /// A one-model manifest (`big`, file `big.bin`) of `len` bytes, plus a matching source file
+    /// to import (one import chunk is 1 MiB).
     struct Big {
         dir: PathBuf,
         state: ModelState,
@@ -1062,8 +1062,8 @@ mod tests {
         file: PathBuf,
     }
 
-    fn big(tag: &str) -> Big {
-        let content = vec![0x5A_u8; 64 << 20];
+    fn big(tag: &str, len: usize) -> Big {
+        let content = vec![0x5A_u8; len];
         let manifest = leak(vec![model_json("big", vec![file_json("big.bin", &content, A_ORIGIN, true)])]);
         let dir = temp_dir(tag);
         let src = dir.join("picked.onnx");
@@ -1082,12 +1082,13 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_an_import_returns_to_missing_and_removes_the_part() {
-        let t = big("st-import-cancel");
+        let t = big("st-import-cancel", 1 << 20);
         let (n, cb) = counter();
-        let job = tokio::spawn(t.state.begin_import("big", t.src.clone(), cb).unwrap());
-        until("the copy to start", || t.status().received_bytes > 0).await;
+        let job = t.state.begin_import("big", t.src.clone(), cb).unwrap();
+        // Registered synchronously, so the cancel lands before the copy's first check.
         assert_eq!(t.status().phase, ModelPhase::Verifying);
         t.state.cancel("big");
+        let job = tokio::spawn(job);
         tokio::time::timeout(Duration::from_secs(10), job).await.expect("cancel ignored").unwrap();
         let s = t.status();
         assert_eq!((s.phase, s.error, s.received_bytes), (ModelPhase::Missing, None, 0));
@@ -1099,10 +1100,12 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_an_import_mid_copy_stops_it() {
-        let t = big("st-import-drop");
+        // 64 MiB: the copy takes far longer than the abort below.
+        let t = big("st-import-drop", 64 << 20);
         let (n, cb) = counter();
         let job = tokio::spawn(t.state.begin_import("big", t.src.clone(), cb).unwrap());
-        until("the copy to start", || t.status().received_bytes > 0).await;
+        // On the current-thread test runtime this polls the job once, which starts the copy.
+        tokio::task::yield_now().await;
         job.abort();
         assert!(job.await.unwrap_err().is_cancelled());
         // The slot stays taken until the copy has actually stopped.

@@ -1037,7 +1037,9 @@ mod tests {
                 let _ = tx.send(l);
             })
         });
-        thread::sleep(Duration::from_millis(250));
+        // Mid-way between the polls at 200 and 250 ms, so the stop is seen at 250 ms and the
+        // partial line spans ~50 ms (< 100) with 25 ms of slack either way.
+        thread::sleep(Duration::from_millis(225));
         shared.stop.store(true, Ordering::Release);
         let stopped_at = Instant::now();
         while !t.is_finished() && stopped_at.elapsed() < Duration::from_millis(200) {

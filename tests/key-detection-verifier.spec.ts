@@ -15,9 +15,13 @@ const liveDetected = {
   detectionGeneration: 4,
   detectionStatus: "detected",
   matchedIdentity: true,
+  // libKeyFinder key and timestamp: progress evidence only.
   pitchClass: 9,
   mode: "minor",
   detectionUpdatedAtMs: 9_000,
+  // The Key/Scale target the title is built from.
+  targetKey: 9,
+  targetScale: "minor",
   audioStatus: "capturing",
   audioSourceMatches: true,
   audioTrackMatches: true,
@@ -26,7 +30,7 @@ const liveDetected = {
   audioPeak: 0.4,
   audioLevel: 0.3,
   presentKeyCount: 1,
-  displayedLabel: "A 小调",
+  displayedLabel: "A Minor",
 };
 
 test("cached same-key detection cannot pass without progress observed in this verifier run", () => {
@@ -38,11 +42,11 @@ test("cached same-key detection cannot pass without progress observed in this ve
 
 test("matching non-detected to detected progress with fresh live audio is accepted", () => {
   const evidence = createLiveEvidence({ ...liveDetected, detectionStatus: "idle", pitchClass: null,
-    mode: null, displayedLabel: null, presentKeyCount: 0 });
+    mode: null, targetKey: null, targetScale: null, displayedLabel: null, presentKeyCount: 0 });
   expect(observeLiveEvidence(evidence, { ...liveDetected, detectionStatus: "analyzing", pitchClass: null,
-    mode: null, displayedLabel: null, presentKeyCount: 0 }).accepted).toBe(false);
+    mode: null, targetKey: null, targetScale: null, displayedLabel: null, presentKeyCount: 0 }).accepted).toBe(false);
   const result = observeLiveEvidence(evidence, liveDetected);
-  expect(result).toMatchObject({ accepted: true, progressed: true, expectedLabel: "A 小调" });
+  expect(result).toMatchObject({ accepted: true, progressed: true, expectedLabel: "A Minor" });
 });
 
 test("cached detected output on a new target generation still requires a later publication", () => {
@@ -51,7 +55,7 @@ test("cached detected output on a new target generation still requires a later p
   const reset = createLiveEvidence(newTarget);
   expect(observeLiveEvidence(reset, newTarget).accepted).toBe(false);
   expect(observeLiveEvidence(reset, { ...newTarget, detectionStatus: "analyzing",
-    pitchClass: null, mode: null, displayedLabel: null, presentKeyCount: 0 }).accepted).toBe(false);
+    pitchClass: null, mode: null, targetKey: null, targetScale: null, displayedLabel: null, presentKeyCount: 0 }).accepted).toBe(false);
   expect(observeLiveEvidence(reset, { ...newTarget, detectionUpdatedAtMs: 9_500 }).accepted).toBe(true);
   expect(observeLiveEvidence(evidence, newTarget).accepted).toBe(false);
 });
@@ -59,8 +63,22 @@ test("cached detected output on a new target generation still requires a later p
 test("a newly advanced detection timestamp can prove replacement progress", () => {
   const evidence = createLiveEvidence(liveDetected);
   const result = observeLiveEvidence(evidence, { ...liveDetected, detectionUpdatedAtMs: 9_500,
-    pitchClass: 1, mode: "major", displayedLabel: "C♯ 大调" });
-  expect(result).toMatchObject({ accepted: true, progressed: true, expectedLabel: "C♯ 大调" });
+    pitchClass: 1, mode: "major", targetKey: 1, targetScale: "major", displayedLabel: "C# Major" });
+  expect(result).toMatchObject({ accepted: true, progressed: true, expectedLabel: "C# Major" });
+});
+
+test("the title is the Key/Scale target, not the libKeyFinder key", () => {
+  const evidence = createLiveEvidence({ ...liveDetected, detectionStatus: "idle" });
+  const changes = { detectionUpdatedAtMs: 9_500 };
+  // libKeyFinder says A minor, the target says Chromatic: the title must read as the target.
+  expect(observeLiveEvidence(evidence, { ...liveDetected, ...changes, targetKey: null, targetScale: "chromatic",
+    displayedLabel: "Chromatic" })).toMatchObject({ accepted: true, expectedLabel: "Chromatic" });
+  expect(observeLiveEvidence(evidence, { ...liveDetected, ...changes, targetKey: 5, targetScale: "chromatic",
+    displayedLabel: "F Chromatic" })).toMatchObject({ accepted: true, expectedLabel: "F Chromatic" });
+  // The old libKeyFinder-derived label is no longer accepted.
+  expect(observeLiveEvidence(evidence, { ...liveDetected, ...changes, displayedLabel: "A 小调" }).accepted).toBe(false);
+  expect(observeLiveEvidence(evidence, { ...liveDetected, ...changes, targetKey: 5, targetScale: "chromatic",
+    displayedLabel: "A Minor" }).accepted).toBe(false);
 });
 
 for (const [name, changes] of [
@@ -77,7 +95,11 @@ for (const [name, changes] of [
   ["malformed mode", { mode: "dorian" }],
   ["outgoing-only label", { presentKeyCount: 0 }],
   ["ambiguous present labels", { presentKeyCount: 2 }],
-  ["wrong displayed label", { displayedLabel: "A 大调" }],
+  ["wrong displayed label", { displayedLabel: "A Major" }],
+  ["no Key/Scale target", { targetKey: null, targetScale: null }],
+  ["null key on a Major/Minor target", { targetKey: null }],
+  ["out-of-range target key", { targetKey: 12 }],
+  ["unknown target scale", { targetScale: "dorian" }],
 ]) test(`rejects ${name} even after timestamp progress`, () => {
   const evidence = createLiveEvidence(liveDetected);
   const result = observeLiveEvidence(evidence, { ...liveDetected, detectionUpdatedAtMs: 9_500, ...changes });

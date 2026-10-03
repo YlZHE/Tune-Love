@@ -20,7 +20,7 @@ export function AutoApplySettings() {
           catch { setError("未能保存自动写入设置，请重试"); }
         }} />
     </div>
-    <p className="auto-apply-note">未连接时不写入。拿不准或刚开始时写入 Chromatic，确定后写入 Major/Minor，之后只在明显更合适时更换。写入失败不会自动重试。</p>
+    <p className="auto-apply-note">未连接时不写入。拿不准或刚开始时写入 Chromatic，确定后写入 Major/Minor，之后只在明显更合适时更换，或重新拿不准时回到 Chromatic。写入失败不会自动重试。</p>
     {error && <p role="alert" className="color-error">{error}</p>}
   </section>;
 }

@@ -63,6 +63,7 @@ const setTarget = (page: Page, target: Target) => page.evaluate(value => {
 }, target);
 const title = (page: Page) => page.locator(".key-title-text.is-detected:not([aria-hidden='true']):not([inert])");
 const tooltip = async (page: Page) => {
+  await page.mouse.move(300, 220); // leave first, so every call is a fresh hover
   await page.locator(".key-title-hit").hover();
   return page.locator(".warm-tooltip");
 };

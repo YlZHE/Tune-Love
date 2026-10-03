@@ -6,7 +6,7 @@ const POLL_INTERVAL_MS = 1_000;
 
 // One native read per second, single-flight, paused while hidden; a read that
 // started before the window was hidden can never land as a fresh result.
-// The key label and the Key/Scale recommendation share this one IPC poll.
+// The Key/Scale recommendation (the title and the auto-write) comes from this one IPC poll.
 export function useKeyDetectionSnapshot(sourceId: string | null, trackKey: string,
   targetGeneration: number | undefined): unknown {
   const [snapshot, setSnapshot] = useState<unknown>(null);

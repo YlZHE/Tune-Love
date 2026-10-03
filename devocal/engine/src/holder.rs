@@ -85,6 +85,24 @@ pub const RAMP_STEP_US: u64 = 10_000;
 pub const GAIN_WINDOW_US: u64 = 100_000;
 /// Longest the capture stays silent after a default render device change.
 pub const DEVICE_MUTE_US: u64 = 1_000_000;
+/// R2: how long after the start of the attach ramp its steps are published for the level
+/// check ([`Holder::attach_ramp`]); the design's 150 ms decision timeout.
+pub const CONFIRM_WINDOW_US: u64 = 150_000;
+
+/// The attach ramp as issued so far (R2): the audio side compares the captured level against
+/// the pre-attach reference to confirm the gain. Published only while every owned session is
+/// lowered by this ramp and nothing has disturbed it (see [`Holder::attach_ramp`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttachRamp {
+    /// Incremented by every `begin_attach`.
+    pub epoch: u32,
+    /// Ramp steps issued so far, 1..=[`RAMP_STEPS`]; step `k` set every session to
+    /// `ramp_value(its original, HELD_VOLUME, k)`.
+    pub steps: u32,
+    /// The ramp's reference original: the smallest original among the owned sessions (the
+    /// holder's gain reference), so a level check against it takes the smaller gain.
+    pub original: f32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HolderPhase {
@@ -254,6 +272,11 @@ pub struct Holder<S: SessionVolumes> {
     /// Log lines already written (`park:<id>`, `unpark:<id>`), so a repeating failure is
     /// logged once until it clears.
     logged: HashSet<String>,
+    /// Incremented by every successful `begin_attach` ([`AttachRamp::epoch`]).
+    attach_epoch: u32,
+    /// A `follow` pass since the last `begin_attach` changed something (see
+    /// [`Holder::follow`]): the volumes may no longer be the ramp's.
+    ramp_disturbed: bool,
 }
 
 /// True for a volume the holder lowers: finite, above `HELD_VOLUME` and not already held.
@@ -273,7 +296,7 @@ fn active_endpoints(tree: &[SessionInfo]) -> Vec<String> {
 }
 
 /// Geometric interpolation from `from` to `to`: step 0 is `from`, step `RAMP_STEPS` exactly `to`.
-fn ramp_value(from: f32, to: f32, step: u32) -> f32 {
+pub(crate) fn ramp_value(from: f32, to: f32, step: u32) -> f32 {
     if step >= RAMP_STEPS || !from.is_finite() || from <= 0.0 || !to.is_finite() || to <= 0.0 {
         return to;
     }
@@ -358,6 +381,8 @@ impl<S: SessionVolumes> Holder<S> {
             parked_epoch: 0,
             playing: Vec::new(),
             logged: HashSet::new(),
+            attach_epoch: 0,
+            ramp_disturbed: false,
         }
     }
 
@@ -392,6 +417,11 @@ impl<S: SessionVolumes> Holder<S> {
     /// user's own near-zero and are left alone. A session whose volume cannot be read now is
     /// picked up by `follow`.
     ///
+    /// A player that already exited (or whose pid now names another process) is refused
+    /// after the restore, before anything is recorded: the engine may wait for reference
+    /// audio between the start and this call. A failed process query is not proof of an exit
+    /// and does not refuse (`follow` checks again).
+    ///
     /// The restore outcome and the adoptions are returned in [`AttachReport`]; on `Err` the
     /// restore outcome is appended to the message when it was not clean.
     pub fn begin_attach(
@@ -419,6 +449,13 @@ impl<S: SessionVolumes> Holder<S> {
                 msg
             }
         };
+        if let Ok(c) = self.sessions.process_created(pid) {
+            if c != Some(created_at) {
+                return Err(with_restore(format!(
+                    "the player {pid} exited before the attach"
+                )));
+            }
+        }
         // An unreadable file is already counted in `restore_failed`; adoption then finds
         // nothing, and the write below fails if anything is to be lowered.
         let kept = restore::read(&self.restore_path)
@@ -487,6 +524,8 @@ impl<S: SessionVolumes> Holder<S> {
         self.device_mute = None;
         self.playing = active_endpoints(&tree);
         self.logged.clear();
+        self.attach_epoch = self.attach_epoch.wrapping_add(1);
+        self.ramp_disturbed = false;
         Ok(report)
     }
 
@@ -536,7 +575,29 @@ impl<S: SessionVolumes> Holder<S> {
     /// (restore file first), lowers again sessions that are no longer at the held volume, and
     /// detects that the player exited (then restores through `restore::restore` and goes idle).
     /// Does nothing in other phases.
+    ///
+    /// A pass that changed something ends the R2 window ([`Holder::attach_ramp`]): it
+    /// lowered or re-lowered a session, adopted, parked or unparked one, took over a session
+    /// held by someone else, moved the gain history, hit any failure (a failed park included),
+    /// saw the player exit, or ran while the capture was silenced for a device change (ruling
+    /// 17). A pass that found every session as the ramp left it keeps the window.
     pub fn follow(&mut self, now_us: u64) -> FollowReport {
+        let mut changed = self.device_mute.is_some();
+        let r = self.follow_pass(now_us, &mut changed);
+        if changed
+            || r.failed > 0
+            || r.player_exited
+            || r.newly_lowered > 0
+            || r.overridden > 0
+            || r.error.is_some()
+        {
+            self.ramp_disturbed = true;
+        }
+        r
+    }
+
+    /// The pass of [`Holder::follow`]; sets `changed` for a change the report does not show.
+    fn follow_pass(&mut self, now_us: u64, changed: &mut bool) -> FollowReport {
         let mut r = FollowReport::default();
         if self.stage != Stage::Held {
             return r;
@@ -553,7 +614,7 @@ impl<S: SessionVolumes> Holder<S> {
             Ok(t) => t,
             Err(e) => {
                 r.fail(format!("enumerating the player's sessions failed: {e}"));
-                self.settle_gain(now_us, Some(self.original), false);
+                *changed |= self.settle_gain(now_us, Some(self.original), false);
                 return r;
             }
         };
@@ -641,10 +702,14 @@ impl<S: SessionVolumes> Holder<S> {
                                     parked_any = true;
                                     self.logged.remove(&format!("park:{id}"));
                                 }
-                                Err(e) => self.log_once(
-                                    format!("park:{id}"),
-                                    format!("parking session {id} failed (it stays held): {e}"),
-                                ),
+                                Err(e) => {
+                                    // The write may have landed anyway.
+                                    *changed = true;
+                                    self.log_once(
+                                        format!("park:{id}"),
+                                        format!("parking session {id} failed (it stays held): {e}"),
+                                    );
+                                }
                             }
                         }
                         continue;
@@ -670,6 +735,7 @@ impl<S: SessionVolumes> Holder<S> {
                     // Has an entry but was never lowered by us, yet is held now: treat it as
                     // held so the release restores it to the recorded original.
                     self.owned[i].last_set = Some(HELD_VOLUME);
+                    *changed = true;
                 }
                 owned => {
                     if should_lower(v) && owned.is_none() && parkable(s) {
@@ -703,9 +769,12 @@ impl<S: SessionVolumes> Holder<S> {
         }
         if parked_any {
             self.parked_epoch += 1;
+            *changed = true;
         }
         let mut file_written = false;
         if !candidates.is_empty() {
+            // Lowered, adopted or listed again (or a failure): no longer the ramp's alone.
+            *changed = true;
             match self.record_candidates(&candidates) {
                 Err(e) => {
                     r.fail(format!("writing the restore file failed: {e}"));
@@ -784,7 +853,7 @@ impl<S: SessionVolumes> Holder<S> {
                 ));
             }
         }
-        self.settle_gain(now_us, degraded.then_some(unlowered), spiked);
+        *changed |= self.settle_gain(now_us, degraded.then_some(unlowered), spiked);
         if let Some(m) = &self.device_mute {
             // The player is held on the new endpoint: a held session there that plays, or that
             // this pass lowered before it could start (a stale inactive session does not count).
@@ -880,6 +949,50 @@ impl<S: SessionVolumes> Holder<S> {
     /// attach step `k`, back down to 0 over the release steps.
     pub fn output_gain(&self) -> f32 {
         self.output_gain
+    }
+
+    /// The attach ramp steps issued so far (R2), for the level check on the audio side.
+    /// `Some` only while attaching or held, at least one step issued, before
+    /// `ramp start + CONFIRM_WINDOW_US`, with every owned session lowered by this ramp (none
+    /// adopted at attach, none unreadable), no ramp failure, no default device change and no
+    /// `follow` since the attach that changed anything. Anything else means the captured level
+    /// no longer follows the ramp alone, and the caller keeps the conservative gain
+    /// ([`Holder::attach_ramp_end`] names the reason).
+    pub fn attach_ramp(&self, now_us: u64) -> Option<AttachRamp> {
+        let clean = matches!(self.stage, Stage::Attaching | Stage::Held)
+            && self.ramp_step >= 1
+            && now_us < self.ramp_start_us.saturating_add(CONFIRM_WINDOW_US)
+            && !self.owned.is_empty()
+            && self.owned.iter().all(|o| o.ramp)
+            && self.attach_failure.is_none()
+            && !self.attach_unread
+            && self.device_mute.is_none()
+            && !self.ramp_disturbed;
+        clean.then_some(AttachRamp {
+            epoch: self.attach_epoch,
+            steps: self.ramp_step,
+            original: self.original,
+        })
+    }
+
+    /// Why [`Holder::attach_ramp`] is `None` at `now_us` (the first reason that applies), for
+    /// the log line when an R2 window ends.
+    pub fn attach_ramp_end(&self, now_us: u64) -> &'static str {
+        if !matches!(self.stage, Stage::Attaching | Stage::Held) {
+            "released or idle"
+        } else if self.attach_failure.is_some() {
+            "ramp failure"
+        } else if self.device_mute.is_some() {
+            "default device change"
+        } else if self.ramp_disturbed {
+            "follow changed sessions"
+        } else if now_us >= self.ramp_start_us.saturating_add(CONFIRM_WINDOW_US) {
+            "timeout"
+        } else if self.ramp_step == 0 {
+            "no step issued"
+        } else {
+            "not every session on the ramp"
+        }
     }
 
     fn due_step(&self, now_us: u64) -> u32 {
@@ -1167,15 +1280,18 @@ impl<S: SessionVolumes> Holder<S> {
     /// level, at least `original` (gain 1, no compensation), so a session still playing above
     /// the reference is not amplified either; with nothing lowered yet it is `original`.
     /// Recorded after any spike so the spike only covers its window.
-    fn settle_gain(&mut self, now_us: u64, degraded: Option<f32>, spiked: bool) {
+    /// Returns whether it recorded a gain entry.
+    fn settle_gain(&mut self, now_us: u64, degraded: Option<f32>, spiked: bool) -> bool {
         let target = match degraded {
             Some(level) => level.max(self.original),
             None if !self.lowered_any => self.original,
             None => HELD_VOLUME,
         };
-        if spiked || target != self.effective {
+        let record = spiked || target != self.effective;
+        if record {
             self.record_gain(now_us, target);
         }
+        record
     }
 
     fn record_gain(&mut self, now_us: u64, effective: f32) {
@@ -2560,6 +2676,27 @@ mod tests {
         assert!(!h.logged.contains("park:b"));
     }
 
+    /// The player exited (or its pid was reused) before `begin_attach`: refused, nothing
+    /// recorded or lowered; a failed process query does not refuse.
+    #[test]
+    fn begin_attach_refuses_a_player_that_exited() {
+        for created in [None, Some(CREATED + 1)] {
+            let dir = TempDir::new("attach-exited");
+            let mut h = holder(&dir, &[("a", 0.5)]);
+            h.sessions().set_process_created(PID, created);
+            let e = h.begin_attach(PID, CREATED, T0).unwrap_err();
+            assert!(e.contains("exited before the attach"), "{e}");
+            assert_eq!(h.phase(), HolderPhase::Idle);
+            assert_eq!(h.tick(T0 + 40 * MS), HolderPhase::Idle);
+            assert_eq!(h.sessions().set_volume_calls(), 0);
+            assert!(!dir.file().exists());
+        }
+        let dir = TempDir::new("attach-process-query-fails");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        h.sessions().fail_process_created(PID);
+        assert!(h.begin_attach(PID, CREATED, T0).is_ok());
+    }
+
     #[test]
     fn begin_release_when_idle_is_a_noop() {
         let dir = TempDir::new("release-idle");
@@ -2567,5 +2704,166 @@ mod tests {
         h.begin_release(T0);
         assert_eq!(h.tick(T0), HolderPhase::Idle);
         assert_eq!(h.sessions().set_volume_calls(), 0);
+    }
+
+    #[test]
+    fn attach_ramp_reports_issued_steps_during_the_window() {
+        let dir = TempDir::new("attach-ramp");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        assert_eq!(h.attach_ramp(T0), None, "idle");
+        h.begin_attach(PID, CREATED, T0).unwrap();
+        assert_eq!(h.attach_ramp(T0), None, "no step issued yet");
+        assert_eq!(h.tick(T0), HolderPhase::Attaching);
+        let first = h.attach_ramp(T0).expect("step 1 issued");
+        assert_eq!(first.steps, 1);
+        assert_eq!(first.original, 0.5);
+        let e = first.epoch;
+        let ramp = |steps| {
+            Some(AttachRamp {
+                epoch: e,
+                steps,
+                original: 0.5,
+            })
+        };
+        h.tick(T0 + 10 * MS);
+        assert_eq!(h.attach_ramp(T0 + 10 * MS), ramp(2));
+        h.tick(T0 + 20 * MS);
+        assert_eq!(h.attach_ramp(T0 + 20 * MS), ramp(3));
+        assert_eq!(h.tick(T0 + 30 * MS), HolderPhase::Held);
+        assert_eq!(h.attach_ramp(T0 + 30 * MS), ramp(4));
+        h.tick(T0 + 100 * MS);
+        assert_eq!(h.attach_ramp(T0 + 149_999), ramp(4));
+        assert_eq!(h.attach_ramp(T0 + CONFIRM_WINDOW_US), None);
+        assert_eq!(h.attach_ramp(T0 + 150 * MS), None);
+    }
+
+    #[test]
+    fn attach_ramp_is_none_when_degraded() {
+        // A session whose volume could not be read at attach (it plays unlowered).
+        let dir = TempDir::new("attach-ramp-unread");
+        let mut h = holder(&dir, &[("a", 0.5), ("u", 0.7)]);
+        h.sessions().fail_volume("u");
+        h.begin_attach(PID, CREATED, T0).unwrap();
+        h.tick(T0);
+        assert_eq!(h.attach_ramp(T0), None, "unread session");
+
+        // A session adopted at attach (already held, not part of the ramp).
+        let dir = TempDir::new("attach-ramp-adopted");
+        write_file(&dir, vec![kept_entry(10, "old", "ident:player", 0.7)]);
+        let f = fake(&[("a", 0.5)]);
+        let mut s = info("new", PID);
+        s.session_identifier = "ident:player".into();
+        f.add_session(s, HELD_VOLUME, false);
+        f.fail_set_volume("new");
+        let mut h = Holder::new(f, dir.file());
+        assert_eq!(h.begin_attach(PID, CREATED, T0).unwrap().adopted, 1);
+        h.tick(T0);
+        assert_eq!(h.attach_ramp(T0), None, "adopted session");
+
+        // `set_volume` fails during the ramp.
+        let dir = TempDir::new("attach-ramp-set-fail");
+        let mut h = holder(&dir, &[("a", 0.5), ("b", 0.8)]);
+        h.begin_attach(PID, CREATED, T0).unwrap();
+        h.tick(T0);
+        assert!(h.attach_ramp(T0).is_some());
+        h.sessions().fail_set_volume("b");
+        assert!(matches!(h.tick(T0 + 10 * MS), HolderPhase::Failed(_)));
+        assert_eq!(h.attach_ramp(T0 + 10 * MS), None, "ramp failed");
+
+        // A default render device change in the window.
+        let dir = TempDir::new("attach-ramp-device");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        h.begin_attach(PID, CREATED, T0).unwrap();
+        h.tick(T0);
+        assert!(h.attach_ramp(T0).is_some());
+        h.default_device_changed(T0 + 5 * MS, Some("ep2".into()));
+        assert_eq!(h.attach_ramp(T0 + 5 * MS), None, "device changed");
+        h.tick(T0 + 10 * MS);
+        assert_eq!(h.attach_ramp(T0 + 10 * MS), None);
+
+        // A `follow` pass in the window that lowers a new session.
+        let dir = TempDir::new("attach-ramp-follow");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        assert!(h.attach_ramp(T0 + 30 * MS).is_some());
+        h.sessions().add_session(info("n", PID), 0.9, false);
+        assert_eq!(h.follow(T0 + 40 * MS).newly_lowered, 1);
+        assert_eq!(h.attach_ramp(T0 + 40 * MS), None, "followed");
+    }
+
+    /// Ruling 17 (3): a follow pass that changes nothing (during the attach ramp, or held
+    /// with every session as the ramp left it) keeps the R2 window open.
+    #[test]
+    fn a_follow_that_changes_nothing_keeps_the_attach_ramp() {
+        let dir = TempDir::new("attach-ramp-noop-follow");
+        let mut h = holder(&dir, &[("a", 0.5), ("b", 0.8)]);
+        // A session at the user's own near-zero is left alone and changes nothing.
+        h.sessions().add_session(info("z", PID), 0.000_1, false);
+        h.begin_attach(PID, CREATED, T0).unwrap();
+        h.tick(T0);
+        assert_eq!(h.follow(T0 + 5 * MS), FollowReport::default(), "attaching");
+        assert!(h.attach_ramp(T0 + 5 * MS).is_some());
+        for k in 1..4 {
+            h.tick(T0 + k * 10 * MS);
+        }
+        assert_eq!(h.phase(), HolderPhase::Held);
+        let writes = h.sessions().set_volume_calls();
+        for t in [40, 60, 149] {
+            assert_eq!(h.follow(T0 + t * MS), FollowReport::default());
+            assert!(
+                h.attach_ramp(T0 + t * MS).is_some(),
+                "nothing changed at {t} ms"
+            );
+        }
+        assert_eq!(h.sessions().set_volume_calls(), writes);
+        assert_eq!(h.attach_ramp(T0 + 150 * MS), None, "timed out");
+    }
+
+    /// Ruling 17 (3): every kind of change a follow pass makes ends the R2 window.
+    #[test]
+    fn a_follow_that_changes_something_ends_the_attach_ramp() {
+        let held = |name: &str, extra: &dyn Fn(&FakeSessions)| {
+            let dir = TempDir::new(name);
+            let f = fake(&[("a", 0.5)]);
+            let mut s = info("b", PID);
+            s.endpoint_id = "ep2".into();
+            f.add_session(s, 0.8, false);
+            f.set_default_endpoints(&["ep"]);
+            let mut h = Holder::new(f, dir.file());
+            assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+            assert!(h.attach_ramp(T0 + 30 * MS).is_some());
+            extra(h.sessions());
+            let r = h.follow(T0 + 40 * MS);
+            assert_eq!(h.attach_ramp(T0 + 40 * MS), None, "{name}: {r:?}");
+            r
+        };
+        // The user raised a session: lowered again.
+        let r = held("ramp-end-relower", &|f| f.set_volume("a", 0.9).unwrap());
+        assert_eq!(r.overridden, 1);
+        // A session stopped on a device that neither plays nor is the default: parked.
+        held("ramp-end-park", &|f| f.set_active("b", false));
+        // A failure reading a session, or the player process.
+        let r = held("ramp-end-read-fail", &|f| f.fail_volume("b"));
+        assert_eq!(r.failed, 1);
+        let r = held("ramp-end-process-fail", &|f| f.fail_process_created(PID));
+        assert_eq!(r.failed, 1);
+        // The player exited (restored, idle).
+        let r = held("ramp-end-exit", &|f| f.set_process_created(PID, None));
+        assert!(r.player_exited);
+    }
+
+    #[test]
+    fn attach_ramp_epoch_increments_per_attach() {
+        let dir = TempDir::new("attach-ramp-epoch");
+        let mut h = holder(&dir, &[("a", 0.5)]);
+        assert_eq!(attach(&mut h, T0), HolderPhase::Held);
+        let e1 = h.attach_ramp(T0 + 30 * MS).unwrap().epoch;
+        assert_eq!(release(&mut h, T0 + 500 * MS), HolderPhase::Idle);
+        assert_eq!(h.attach_ramp(T0 + 530 * MS), None);
+        let t2 = T0 + 1_000 * MS;
+        assert_eq!(attach(&mut h, t2), HolderPhase::Held);
+        let r2 = h.attach_ramp(t2 + 30 * MS).unwrap();
+        assert_eq!(r2.epoch, e1 + 1);
+        assert_eq!(r2.steps, 4);
     }
 }

@@ -2074,6 +2074,12 @@ impl Drop for Handle {
 }
 
 impl Handle {
+    /// The raw event handle, still owned (and closed on drop) by this `Handle`; lets a caller
+    /// wait on it together with other handles (`WaitForMultipleObjects`).
+    pub fn as_raw(&self) -> HANDLE {
+        self.handle
+    }
+
     /// Wait for an event on a handle, with a timeout given in ms
     pub fn wait_for_event(&self, timeout_ms: u32) -> WasapiRes<()> {
         let retval = unsafe { WaitForSingleObject(self.handle, timeout_ms) };

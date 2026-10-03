@@ -13,8 +13,10 @@ export function nextWrite(prev: WrittenPair | null, target: AutoTuneTarget | nul
   state: ControlState, trackKey: string): OptionPair | null {
   if (!trackKey || state.phase !== "ready" || !state.connectionId
     || !state.capabilities.includes("scale")) return null;
-  // No evidence yet means Chromatic with no key.
-  const pair: OptionPair = target ? targetOptionLabels(target) : { key: null, scale: "Chromatic" };
+  // A null target only means "no valid snapshot right now" (failed poll, generation
+  // mismatch): never write on it. Rust reports Chromatic itself once a song exists.
+  if (!target) return null;
+  const pair = targetOptionLabels(target);
   if (pair.key !== null && !state.capabilities.includes("key")) return null;
   if (prev && prev.connectionId === state.connectionId && prev.trackKey === trackKey
     && prev.key === pair.key && prev.scale === pair.scale) return null;

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { autotuneTarget, keyLabel, type AutoTuneTarget } from "./keyDetection";
+import { autotuneTarget, keyLabel, sameTarget, type AutoTuneTarget } from "./keyDetection";
 
 const POLL_INTERVAL_MS = 1_000;
 
@@ -73,11 +73,10 @@ export function useAutoTuneTarget(sourceId: string | null, trackKey: string,
   targetGeneration: number | undefined): { keyLabel: string | null; target: AutoTuneTarget | null } {
   const snapshot = useKeyDetectionSnapshot(sourceId, trackKey, targetGeneration);
   const target = autotuneTarget(snapshot, sourceId, trackKey, targetGeneration);
-  // Keep one object per (key, scale, candidate) so effects keyed on the target do not
+  // Keep one object per distinct target (see sameTarget) so effects keyed on it do not
   // re-run just because evidenceSeconds grew by another second.
   const stable = useRef<AutoTuneTarget | null>(null);
-  const pair = (t: AutoTuneTarget) => `${t.key}/${t.scale}/${t.candidate?.key}/${t.candidate?.scale}`;
   if (!target) stable.current = null;
-  else if (!stable.current || pair(stable.current) !== pair(target)) stable.current = target;
+  else if (!stable.current || !sameTarget(stable.current, target)) stable.current = target;
   return { keyLabel: keyLabel(snapshot, sourceId, trackKey, targetGeneration), target: stable.current };
 }

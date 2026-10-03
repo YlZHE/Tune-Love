@@ -93,3 +93,11 @@ export function targetLabel(target: AutoTuneTarget): string {
   return target.scale === "chromatic" || target.key === null ? titleLabel(target)
     : `${pitchNames[target.key]} ${target.scale === "major" ? "大调" : "小调"}`;
 }
+
+/** Same target for effect purposes: everything shown or written, but not evidenceSeconds growth. */
+export function sameTarget(a: AutoTuneTarget, b: AutoTuneTarget): boolean {
+  return a.key === b.key && a.scale === b.scale && a.source === b.source
+    && a.candidate?.key === b.candidate?.key && a.candidate?.scale === b.candidate?.scale
+    && a.uncoveredNotes.length === b.uncoveredNotes.length
+    && a.uncoveredNotes.every((note, i) => note === b.uncoveredNotes[i]);
+}

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { autotuneTarget, keyLabel, targetLabel, targetOptionLabels, titleLabel, type AutoTuneTarget } from "./keyDetection";
+import { autotuneTarget, keyLabel, targetLabel, targetOptionLabels, titleLabel, sameTarget, type AutoTuneTarget } from "./keyDetection";
 
 const identity = { sourceId: "player", trackKey: "song", targetGeneration: 4 } as const;
 
@@ -152,5 +152,21 @@ describe("target labels", () => {
     expect(targetOptionLabels({ ...base, key: 11, scale: "major" })).toEqual({ key: "B", scale: "Major" });
     expect(targetOptionLabels({ ...base, key: 8, scale: "chromatic" })).toEqual({ key: "G#", scale: "Chromatic" });
     expect(targetOptionLabels({ ...base, key: null, scale: "chromatic" })).toEqual({ key: null, scale: "Chromatic" });
+  });
+});
+
+describe("sameTarget", () => {
+  const t: AutoTuneTarget = { key: 5, scale: "chromatic", candidate: { key: 5, scale: "minor" },
+    uncoveredNotes: [1], evidenceSeconds: 10, source: "analysis" };
+
+  test("evidenceSeconds growth is the same target", () => {
+    expect(sameTarget(t, { ...t, evidenceSeconds: 11 })).toBe(true);
+  });
+
+  test.each([
+    { uncoveredNotes: [1, 6] }, { uncoveredNotes: [2] }, { source: "cache" as const },
+    { candidate: { key: 5, scale: "major" as const } }, { candidate: null }, { key: null }, { scale: "minor" as const },
+  ])("a change in %j is a new target", change => {
+    expect(sameTarget(t, { ...t, ...change })).toBe(false);
   });
 });

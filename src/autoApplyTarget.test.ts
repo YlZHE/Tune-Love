@@ -23,9 +23,15 @@ describe("nextWrite", () => {
     expect(nextWrite(null, major, ready(), "song-a")).toEqual({ key: "B", scale: "Major" });
   });
 
-  test("before any evidence the pair is Chromatic with no key", () => {
-    expect(nextWrite(null, null, ready(), "song-a")).toEqual({ key: null, scale: "Chromatic" });
-    expect(nextWrite({ ...written(), key: null, scale: "Chromatic" }, null, ready(), "song-a")).toBeNull();
+  test("a null target (no valid snapshot) writes nothing", () => {
+    expect(nextWrite(null, null, ready(), "song-a")).toBeNull();
+    expect(nextWrite(written(), null, ready(), "song-a")).toBeNull();
+  });
+
+  test("a no-evidence target as Rust reports it is written as Chromatic with no key", () => {
+    const noEvidence: AutoTuneTarget = { ...base, key: null, scale: "chromatic", evidenceSeconds: 0 };
+    expect(nextWrite(null, noEvidence, ready(), "song-a")).toEqual({ key: null, scale: "Chromatic" });
+    expect(nextWrite(written({ key: null, scale: "Chromatic" }), noEvidence, ready(), "song-a")).toBeNull();
   });
 
   test("Chromatic targets write the scale only, or key plus Chromatic when a key is known", () => {

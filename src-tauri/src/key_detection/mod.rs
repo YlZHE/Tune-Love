@@ -13,7 +13,7 @@ mod diagnostics_tests;
 mod stream_tests;
 
 pub use engine::{detect, detect_with_diagnostics};
-pub use scale_match::{AutoTuneTarget, Scale, TargetSource};
+pub use scale_match::{AutoTuneTarget, Candidate, Scale, TargetSource};
 pub use stream::{RollingDetector, StreamAnalysis};
 pub use types::{ChromaEvidence, DiagnosticAnalysis, KeyDiagnostics, KeyScore, Mode, MusicalKey};
 
@@ -385,8 +385,13 @@ mod tests {
             key: Some(key(1, Mode::Minor)),
             updated_at_ms: 99,
             autotune_target: Some(super::AutoTuneTarget {
-                key: 1,
+                key: Some(1),
                 scale: super::Scale::Minor,
+                candidate: Some(super::Candidate {
+                    key: 1,
+                    scale: super::Scale::Minor,
+                }),
+                uncovered_notes: vec![2],
                 evidence_seconds: 20.0,
                 source: super::TargetSource::Analysis,
             }),
@@ -396,6 +401,9 @@ mod tests {
         assert_eq!(fields.len(), 7);
         assert_eq!(json["autotuneTarget"]["key"], 1);
         assert_eq!(json["autotuneTarget"]["scale"], "minor");
+        assert_eq!(json["autotuneTarget"]["candidate"]["key"], 1);
+        assert_eq!(json["autotuneTarget"]["candidate"]["scale"], "minor");
+        assert_eq!(json["autotuneTarget"]["uncoveredNotes"][0], 2);
         assert_eq!(json["autotuneTarget"]["evidenceSeconds"], 20.0);
         assert_eq!(json["autotuneTarget"]["source"], "analysis");
         assert_eq!(json["sourceId"], "player");

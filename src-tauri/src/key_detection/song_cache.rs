@@ -93,6 +93,10 @@ impl SongCache {
     /// Remember `target` for `id` if it is well supported and differs from what
     /// is stored. Returns the serialized file to persist, or None if unchanged.
     pub fn put(&mut self, id: &str, target: &AutoTuneTarget, now_ms: u64) -> Option<Vec<u8>> {
+        // Task 3 adds remembering Chromatic results; until then only a committed Major/Minor is stored.
+        let (Some(key), Scale::Major | Scale::Minor) = (target.key, target.scale) else {
+            return None;
+        };
         if target.evidence_seconds < MIN_CACHE_EVIDENCE_SECONDS
             || !target.evidence_seconds.is_finite()
         {
@@ -101,14 +105,14 @@ impl SongCache {
         if self
             .entries
             .get(id)
-            .is_some_and(|e| e.key == target.key && e.scale == target.scale)
+            .is_some_and(|e| e.key == key && e.scale == target.scale)
         {
             return None;
         }
         self.entries.insert(
             id.to_owned(),
             CachedKey {
-                key: target.key,
+                key,
                 scale: target.scale,
                 evidence_seconds: target.evidence_seconds,
                 updated_ms: now_ms,
@@ -163,8 +167,10 @@ mod tests {
 
     fn target(key: u8, scale: Scale, seconds: f64) -> AutoTuneTarget {
         AutoTuneTarget {
-            key,
+            key: Some(key),
             scale,
+            candidate: None,
+            uncovered_notes: Vec::new(),
             evidence_seconds: seconds,
             source: super::super::scale_match::TargetSource::Analysis,
         }

@@ -2,6 +2,9 @@
 .footer-information, .footer-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 26px; transition: opacity .16s ease, transform .16s ease; }
 /* Warnings sit in the footer's empty top band, outside the hover-revealed row. */
 .devocal-warning { position: absolute; top: 0; left: 0; right: 0; height: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #f0c27b; font-size: 10px; line-height: 13px; pointer-events: none; }
+/* A warning with an action is a link-like button: same look as the text, underlined. */
+.devocal-warning-action { max-width: 100%; margin: 0; padding: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; background: none; color: inherit; font: inherit; line-height: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; pointer-events: auto; vertical-align: top; }
+.devocal-warning-action:focus-visible { outline: 1px solid currentColor; outline-offset: -1px; }
 .footer-information { opacity: 1; }
 .footer-controls { position: absolute; inset: 13px 0 auto; opacity: 0; pointer-events: none; transform: translateY(4px); }
 .player-footer[data-controls-visible="true"] .footer-information { opacity: 0; pointer-events: none; }

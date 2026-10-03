@@ -14,7 +14,7 @@
 1. **安装包未签名。** 运行时 Windows SmartScreen 可能提示“已保护你的电脑”，请点击“更多信息 → 仍要运行”。默认安装位置为 `%LOCALAPPDATA%\Tune Love\`，无需管理员权限。
 2. **杀毒软件可能误报。** Auto-Tune 控制需要向宿主（DAW）进程注入一个 agent，并挂钩插件的参数处理函数，这与恶意软件的常见行为相似，因此可能被杀毒软件误报。agent 的源码在仓库的 `reference/` 目录，可自行审阅与编译。
 3. **升级前请先关闭本程序和已连接的宿主。** 否则已加载的 agent 文件被占用，安装程序无法覆盖。
-4. **去人声需要 StemgenRT 模型，安装包不附带。** 程序已包含去人声功能，但模型权重不随安装包发布；缺少模型时，去人声开关会提示未找到模型。目前仅供开发者用 `npm run fetch:stemgenrt -- --accept` 下载到本机，程序会在 `%LOCALAPPDATA%\io.github.ylzhe.tunelove\models\stemgenrt-hop128.onnx` 查找；权重的许可尚待作者确认。
+4. **去人声需要 StemgenRT 模型，安装包不附带。** 在“设置 → 去人声”里点“下载模型（约 36 MB）”。阅读来源与许可说明并同意后，程序从作者仓库的固定提交下载；直连失败时，会自动改用第三方 GitHub 加速服务。文件一律按固定的 SHA-256 校验，不符即删除。也可以从本地文件导入。模型保存在 `%LOCALAPPDATA%\io.github.ylzhe.tunelove\models\stemgenrt-hop128\model.onnx`。权重的许可尚待作者确认；训练数据仅限非商业用途。
 5. **系统要求：Windows 10 版本 2004（build 19041）或更新。** 安装包已自带 VC++ 运行库（`msvcp140.dll` 等 4 个文件，位于安装目录），无需另装 Visual C++ Redistributable；如系统缺少 WebView2 Runtime，安装程序会自动下载安装（需要联网；Windows 11 已自带）。
 6. **仅供免费、非商业使用。** 本程序以 GPL-3.0 许可证发布，第三方许可文本见安装目录下的 `licenses\` 文件夹。
 

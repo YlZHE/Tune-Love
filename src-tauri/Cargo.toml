@@ -16,6 +16,9 @@ cc = "1"
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+# "Import a local model file": native file picker, called from Rust only (no JS permission needed).
+tauri-plugin-dialog = "2"
 nowplaying = "=0.1.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 base64 = "0.22"
@@ -23,6 +26,8 @@ rustfft = "6.4"
 devocal-core = { path = "../devocal/core" }
 # One app per user: a second instance would restore (undo) the first one's player hold.
 tauri-plugin-single-instance = "2.5"
+# In-app model download: Windows schannel TLS and the system proxy (no rustls/aws-lc toolchain).
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "system-proxy"] }
 
 [target.'cfg(windows)'.dependencies]
 png = "0.17.16"

@@ -52,7 +52,8 @@ export function parseDevocalStatus(value: unknown): DevocalStatus | null {
 export type DevocalLabelKind = "warning" | "neutral";
 // `detail` follows `text` on screen but stays out of the live region: it changes
 // often (the latency estimate) and must not be re-announced on every poll.
-export interface DevocalNotice { text: string; kind: DevocalLabelKind; detail?: string }
+// `action` turns the text into a button: "open-model-settings" opens settings at the model row.
+export interface DevocalNotice { text: string; kind: DevocalLabelKind; detail?: string; action?: "open-model-settings" }
 
 const warning = (text: string): DevocalNotice => ({ text, kind: "warning" });
 const neutral = (text: string, detail?: string): DevocalNotice => detail ? { text, kind: "neutral", detail } : { text, kind: "neutral" };
@@ -74,7 +75,8 @@ export function devocalNotice(s: DevocalStatus): DevocalNotice | null {
   if (s.phase === "attaching" || s.phase === "restarting") return neutral("正在接管播放器…");
   if (s.phase === "failed" && s.error?.startsWith("attach_failed")) return warning("无法接管这个播放器");
   if (s.phase === "failed") return warning("去人声引擎多次异常，已保持原声");
-  if (s.phase === "unavailable") return warning(s.error?.startsWith("engine_unavailable") ? "去人声引擎无法启动" : "未找到去人声模型");
+  if (s.phase === "unavailable" && s.error?.startsWith("engine_unavailable")) return warning("去人声引擎无法启动");
+  if (s.phase === "unavailable") return { text: "未找到去人声模型，请在设置中下载", kind: "warning", action: "open-model-settings" };
   if (modelFailed(s.error)) return warning("去人声模型加载失败，已保持原声");
   if (s.phase === "passthrough" && s.held) return neutral("原声直通");
   return null;

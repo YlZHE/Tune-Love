@@ -1,5 +1,5 @@
 use super::{
-    scale_match::{AutoTuneTarget, ScaleMatcher, FROZEN},
+    scale_match::{AutoTuneTarget, ScaleMatcher, FROZEN, GATE},
     song_cache::{song_id, SongCache},
     ChromaEvidence, MusicalKey,
 };
@@ -81,7 +81,7 @@ impl Stabilizer {
             running: true,
             status: "idle",
             updated_at_ms: 0,
-            matcher: ScaleMatcher::new(FROZEN),
+            matcher: ScaleMatcher::new(FROZEN, GATE),
             cache: None,
         }
     }
@@ -128,7 +128,7 @@ impl Stabilizer {
                 let remembered = song_id(&identity.track_key)
                     .and_then(|id| cache.lock().unwrap_or_else(|e| e.into_inner()).get(&id));
                 if let Some(hit) = remembered {
-                    self.matcher.seed(hit.key, hit.scale);
+                    self.matcher.seed(hit.key, hit.scale, hit.candidate);
                 }
             }
             return true;
@@ -285,6 +285,7 @@ impl Stabilizer {
         let required = if self.confirmed.is_some() { 5 } else { 3 };
         if self.pending_votes >= required {
             self.confirmed = Some(candidate);
+            self.matcher.set_name_hint(self.confirmed);
             self.clear_pending();
             self.updated_at_ms = now;
         }
@@ -306,7 +307,13 @@ impl Stabilizer {
             status: self.status,
             key: self.confirmed,
             updated_at_ms: self.updated_at_ms,
-            autotune_target: self.identity.as_ref().and_then(|_| self.matcher.target()),
+            // No target while analysis is unavailable: the UI falls back to the brand and
+            // nothing is written, instead of Chromatic for every song forever.
+            autotune_target: self
+                .identity
+                .as_ref()
+                .filter(|_| self.status != "unavailable")
+                .and_then(|_| self.matcher.target()),
         }
     }
 }
@@ -354,6 +361,37 @@ mod tests {
     }
 
     #[test]
+    fn a_remembered_uncertain_song_starts_chromatic_with_its_cached_candidate() {
+        use super::super::scale_match::{Candidate, Scale, TargetSource};
+        let cache = Arc::new(Mutex::new(SongCache::default()));
+        let track = serde_json::to_string(&["player", "Song", "Artist", "Album"]).unwrap();
+        let candidate = Some(Candidate {
+            key: 3,
+            scale: Scale::Major,
+        });
+        cache.lock().unwrap().put(
+            &song_id(&track).unwrap(),
+            &AutoTuneTarget {
+                key: Some(3),
+                scale: Scale::Chromatic,
+                candidate,
+                uncovered_notes: Vec::new(),
+                evidence_seconds: 60.0,
+                source: TargetSource::Analysis,
+            },
+            1,
+        );
+        let mut stabilizer = Stabilizer::new();
+        stabilizer.set_cache(cache);
+        stabilizer.observe(&obs(Some((&track, 1)), true, 1, 0), 1);
+        let target = stabilizer.snapshot().autotune_target.unwrap();
+        assert_eq!(
+            (target.key, target.scale, target.candidate, target.source),
+            (Some(3), Scale::Chromatic, candidate, TargetSource::Cache)
+        );
+    }
+
+    #[test]
     fn a_remembered_song_starts_from_its_cached_target_and_others_do_not() {
         use super::super::scale_match::{Scale, TargetSource};
         let cache = Arc::new(Mutex::new(SongCache::default()));
@@ -362,8 +400,10 @@ mod tests {
         cache.lock().unwrap().put(
             &song_id(&track).unwrap(),
             &AutoTuneTarget {
-                key: 6,
+                key: Some(6),
                 scale: Scale::Minor,
+                candidate: None,
+                uncovered_notes: Vec::new(),
                 evidence_seconds: 60.0,
                 source: TargetSource::Analysis,
             },
@@ -385,10 +425,15 @@ mod tests {
         let target = stabilizer.snapshot().autotune_target.unwrap();
         assert_eq!(
             (target.key, target.scale, target.source),
-            (6, Scale::Minor, TargetSource::Cache)
+            (Some(6), Scale::Minor, TargetSource::Cache)
         );
         stabilizer.observe(&seen(&other), 2);
-        assert!(stabilizer.snapshot().autotune_target.is_none());
+        let fresh = stabilizer.snapshot().autotune_target.unwrap();
+        assert_eq!(
+            (fresh.key, fresh.scale, fresh.candidate),
+            (None, Scale::Chromatic, None),
+            "a song without a remembered result starts Chromatic"
+        );
     }
 
     #[test]
@@ -397,9 +442,16 @@ mod tests {
         let observed = obs(Some(("track", 1)), true, 1, 0);
         let mut now = 1;
         stabilizer.observe(&observed, now);
-        assert!(
-            stabilizer.snapshot().autotune_target.is_none(),
-            "undecided before evidence"
+        let start = stabilizer.snapshot().autotune_target.unwrap();
+        assert_eq!(
+            (
+                start.key,
+                start.scale,
+                start.candidate,
+                start.evidence_seconds
+            ),
+            (None, super::super::Scale::Chromatic, None, 0.0),
+            "Chromatic without a key before evidence"
         );
         for step in 1..=30_u64 {
             let current = obs(Some(("track", 1)), true, 1, step * 48_000);
@@ -415,7 +467,10 @@ mod tests {
             );
         }
         let target = stabilizer.snapshot().autotune_target.unwrap();
-        assert_eq!((target.key, target.scale), (0, super::super::Scale::Major));
+        assert_eq!(
+            (target.key, target.scale),
+            (Some(0), super::super::Scale::Major)
+        );
         assert_eq!(target.evidence_seconds, 30.0);
 
         // A stale token (new epoch) must not feed evidence.
@@ -450,14 +505,8 @@ mod tests {
             true,
             now + 3,
         );
-        assert_eq!(
-            stabilizer
-                .snapshot()
-                .autotune_target
-                .unwrap()
-                .evidence_seconds,
-            30.0
-        );
+        // ...and while unavailable there is no target at all (the evidence is not lost, see below).
+        assert!(stabilizer.snapshot().autotune_target.is_none());
 
         // Pause keeps the song's evidence; a new track forgets it.
         stabilizer.observe(&obs(Some(("track", 1)), false, 2, 32 * 48_000), now + 4);
@@ -470,12 +519,60 @@ mod tests {
             30.0
         );
         stabilizer.observe(&obs(Some(("next", 2)), true, 3, 0), now + 5);
-        assert!(
-            stabilizer.snapshot().autotune_target.is_none(),
-            "new track starts undecided"
+        let next = stabilizer.snapshot().autotune_target.unwrap();
+        assert_eq!(
+            (next.key, next.scale, next.candidate, next.evidence_seconds),
+            (None, super::super::Scale::Chromatic, None, 0.0),
+            "new track starts Chromatic without a key"
         );
         stabilizer.observe(&obs(None, false, 3, 0), now + 6);
         assert!(stabilizer.snapshot().autotune_target.is_none());
+    }
+
+    #[test]
+    fn the_stable_key_names_the_relative_pair_and_a_new_song_forgets_it() {
+        fn ab_major_step() -> ChromaEvidence {
+            let mut chroma = [0.0; 12];
+            for pc in [8, 10, 0, 1, 3, 5, 7] {
+                chroma[pc] = 1.0;
+            }
+            ChromaEvidence {
+                chroma,
+                seconds: 1.0,
+                rms: 0.1,
+            }
+        }
+        fn play(stabilizer: &mut Stabilizer, track: &str, generation: u64, hint: MusicalKey) {
+            let mut now = 1;
+            stabilizer.observe(&obs(Some((track, generation)), true, generation, 0), now);
+            for step in 1..=30_u64 {
+                let current = obs(Some((track, generation)), true, generation, step * 48_000);
+                let token = stabilizer.begin(&current, now).expect("token");
+                now += 1;
+                stabilizer.complete_with_evidence(
+                    &token,
+                    &current,
+                    Some(hint),
+                    Some(ab_major_step()),
+                    false,
+                    now,
+                );
+            }
+        }
+        let named = |s: &Stabilizer| {
+            let t = s.snapshot().autotune_target.unwrap();
+            (t.key, t.scale)
+        };
+        let mut stabilizer = Stabilizer::new();
+        let f_minor = MusicalKey {
+            pitch_class: 5,
+            mode: Mode::Minor,
+        };
+        play(&mut stabilizer, "a", 1, f_minor);
+        assert_eq!(named(&stabilizer), (Some(5), super::super::Scale::Minor));
+        // Same notes on another song, stable result G# major: the name follows it, not the earlier song.
+        play(&mut stabilizer, "b", 2, key(8));
+        assert_eq!(named(&stabilizer), (Some(8), super::super::Scale::Major));
     }
 
     fn observation(
@@ -629,6 +726,20 @@ mod tests {
         let snapshot = state.snapshot();
         assert_eq!(snapshot.status, "unavailable");
         assert_eq!(snapshot.key, None);
+        assert!(snapshot.autotune_target.is_none());
+    }
+
+    #[test]
+    fn target_returns_when_analysis_recovers_from_unavailable() {
+        let mut state = Stabilizer::new();
+        let failed = observation("a", 1, 1, 40);
+        state.observe(&failed, 40);
+        let token = state.begin(&failed, 40).unwrap();
+        state.complete(&token, &failed, None, true, 41);
+        assert!(state.snapshot().autotune_target.is_none());
+        vote(&mut state, observation("a", 1, 1, 50), Some(key(0)), 50);
+        assert_ne!(state.snapshot().status, "unavailable");
+        assert!(state.snapshot().autotune_target.is_some());
     }
 
     #[test]

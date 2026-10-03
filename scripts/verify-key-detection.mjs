@@ -55,6 +55,8 @@ try {
         matchedIdentity: sourceMatches && trackMatches && generationMatches,
         pitchClass: detection.key?.pitchClass ?? null,
         mode: detection.key?.mode ?? null,
+        targetKey: detection.autotuneTarget ? detection.autotuneTarget.key : null,
+        targetScale: detection.autotuneTarget?.scale ?? null,
         detectionUpdatedAtMs: detection.updatedAtMs ?? null,
         detectionAgeMs: Number.isFinite(detection.updatedAtMs) ? observedAtMs - detection.updatedAtMs : null,
         mediaAgeMs: Number.isFinite(media.capturedAtMs) ? observedAtMs - media.capturedAtMs : null,
@@ -85,7 +87,7 @@ try {
     await page.waitForTimeout(sampleIntervalMs);
   }
 
-  expect(matched, "need a genuine matching detected key within the bounded sample window").not.toBeNull();
+  expect(matched, "need a genuine matching detected key with a Key/Scale target within the bounded sample window").not.toBeNull();
   const expectedLabel = observeLiveEvidence(liveEvidence, matched).expectedLabel;
   expect(matched.displayedLabel).toBe(expectedLabel);
   await expect.poll(async () => page.locator('.key-title-text.is-detected:not([aria-hidden="true"]):not([inert])').count(),

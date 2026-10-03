@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { autotuneTarget, keyLabel, type AutoTuneTarget } from "./keyDetection";
+import { autotuneTarget, sameTarget, type AutoTuneTarget } from "./keyDetection";
 
 const POLL_INTERVAL_MS = 1_000;
 
 // One native read per second, single-flight, paused while hidden; a read that
 // started before the window was hidden can never land as a fresh result.
-// The key label and the Key/Scale recommendation share this one IPC poll.
+// The Key/Scale recommendation (the title and the auto-write) comes from this one IPC poll.
 export function useKeyDetectionSnapshot(sourceId: string | null, trackKey: string,
   targetGeneration: number | undefined): unknown {
   const [snapshot, setSnapshot] = useState<unknown>(null);
@@ -68,15 +68,16 @@ export function useKeyDetectionSnapshot(sourceId: string | null, trackKey: strin
   return snapshot;
 }
 
-/** The validated key label and Key/Scale recommendation for the current track. */
+/** The Key/Scale recommendation for the current track. */
 export function useAutoTuneTarget(sourceId: string | null, trackKey: string,
-  targetGeneration: number | undefined): { keyLabel: string | null; target: AutoTuneTarget | null } {
+  targetGeneration: number | undefined): { target: AutoTuneTarget | null; evidenceSeconds: number } {
   const snapshot = useKeyDetectionSnapshot(sourceId, trackKey, targetGeneration);
   const target = autotuneTarget(snapshot, sourceId, trackKey, targetGeneration);
-  // Keep one object per (key, scale) so effects keyed on the target do not
+  // Keep one object per distinct target (see sameTarget) so effects keyed on it do not
   // re-run just because evidenceSeconds grew by another second.
   const stable = useRef<AutoTuneTarget | null>(null);
   if (!target) stable.current = null;
-  else if (!stable.current || stable.current.key !== target.key || stable.current.scale !== target.scale) stable.current = target;
-  return { keyLabel: keyLabel(snapshot, sourceId, trackKey, targetGeneration), target: stable.current };
+  else if (!stable.current || !sameTarget(stable.current, target)) stable.current = target;
+  // The live seconds are for display only; the write effect must keep using the stable target.
+  return { target: stable.current, evidenceSeconds: target?.evidenceSeconds ?? 0 };
 }

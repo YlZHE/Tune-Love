@@ -101,6 +101,8 @@ git commit -m "experiments(scale-match): Chromatic uncertainty gate calibration"
 
 ### Task 2: Rust 匹配器——Chromatic 门控、候选与定名
 
+> **2026-10-04 更新（用户选定第二轮默认点 A，Ruling 5）：** 门控统计量改用 chromatic-gate-02 的 `ratio`：集合外最大权重 ÷ 集合内最小权重（weights 同前，含先验 alpha）。冻结值：`ENTER = 3.0`、`EXIT = 1.5`、`EXIT_HOLD_SECONDS = 3`、`MIN_SECONDS = 3`。状态机与 Task 1 定义相同，只把 uncovered 换成该比值。以 `experiments/scale-match/chromatic_gate.py` 的 `gate_statistic("ratio", ...)` 为准；Rust 测试必须与其逐步输出一致。`uncovered` 字段已从 target 中删除（界面不用）。
+
 **Files:**
 - Modify: `src-tauri/src/key_detection/scale_match.rs`
 - Modify: `src-tauri/src/key_detection/stability.rs`（把稳定的 libKeyFinder 结果传给匹配器）
@@ -117,8 +119,7 @@ pub struct AutoTuneTarget {
     pub key: Option<u8>,              // 完全没有证据时 None；否则为当前叫法的主音
     pub scale: Scale,
     pub candidate: Option<Candidate>, // 当前集合按定名规则的叫法；Chromatic 时也给出
-    pub uncovered: f64,               // 0..1，当前集合盖不住的比例；无证据时 1.0
-    pub uncovered_notes: Vec<u8>,     // 集合外权重最高的音级，最多 2 个，且每个 ≥ 0.25 × uncovered，按权重降序
+    pub uncovered_notes: Vec<u8>,     // 集合外音级中权重 ≥ GATE.exit × 集合内最小权重者，最多 2 个，按权重降序
     pub evidence_seconds: f64,
     pub source: TargetSource,
 }
@@ -133,7 +134,7 @@ impl ScaleMatcher {
 pub fn transpose(target: AutoTuneTarget, semitones: i32) -> AutoTuneTarget; // 平移 key 与 candidate.key
 ```
 
-`target()` 在 `reset()` 之后、尚无证据时返回 `Some`（Chromatic、key 为 None、candidate 为 None、uncovered 1.0）。这样开头就能写入 Chromatic。Stabilizer 只在有 identity 时调用它（现状不变）。
+`target()` 在 `reset()` 之后、尚无证据时返回 `Some`（Chromatic、key 为 None、candidate 为 None、uncovered_notes 为空）。这样开头就能写入 Chromatic。Stabilizer 只在有 identity 时调用它（现状不变）。
 
 定名规则：集合由大调主音 `k` 标识，其关系小调主音为 `(k + 9) % 12`。
 - `set_name_hint(Some(MusicalKey))` 给出的稳定结果，如果正好是该集合的大调或关系小调，就用它的叫法；
@@ -152,7 +153,7 @@ pub fn transpose(target: AutoTuneTarget, semitones: i32) -> AutoTuneTarget; // �
   - `same_hint_twice_does_not_change_target`。
   - `ambiguous_evidence_still_chooses_major_or_minor`：删除，由上面两条取代。
   - `transpose_shifts_key_and_candidate`。
-  - `target_serializes_with_profile_compatible_names`：断言 `"chromatic"`、`"candidate"`、`"uncovered"`、`"uncoveredNotes"`。
+  - `target_serializes_with_profile_compatible_names`：断言 `"chromatic"`、`"candidate"`、`"uncoveredNotes"`。
   - Task 1 的四个离线测试场景，在 Rust 端用同样的证据序列各写一条，期望结果与 Python 一致（防止两边定义漂移）。
 - [ ] **Step 2: 运行测试，确认失败**
   Run: `cargo test --manifest-path src-tauri/Cargo.toml key_detection::scale_match`
@@ -201,14 +202,14 @@ pub fn transpose(target: AutoTuneTarget, semitones: i32) -> AutoTuneTarget; // �
 - Test: `src/keyDetection.test.ts`、`src/autoApplyTarget.test.ts`（没有则新建，沿用 `keyDetection.test.ts` 的测试框架）
 
 **Interfaces:**
-- Consumes: Task 2 的 JSON 形状（camelCase：`key | null`、`scale: "major" | "minor" | "chromatic"`、`candidate`、`uncovered`、`uncoveredNotes`、`evidenceSeconds`、`source`）。
+- Consumes: Task 2 的 JSON 形状（camelCase：`key | null`、`scale: "major" | "minor" | "chromatic"`、`candidate`、`uncoveredNotes`、`evidenceSeconds`、`source`）。
 - Produces:
 
 ```ts
 export type TargetScale = "major" | "minor" | "chromatic";
 export type Candidate = { key: number; scale: "major" | "minor" };
 export type AutoTuneTarget = { key: number | null; scale: TargetScale; candidate: Candidate | null;
-  uncovered: number; uncoveredNotes: number[]; evidenceSeconds: number; source: "analysis" | "cache" };
+  uncoveredNotes: number[]; evidenceSeconds: number; source: "analysis" | "cache" };
 export type OptionPair = { key: string | null; scale: "Major" | "Minor" | "Chromatic" };
 export function autotuneTarget(...): AutoTuneTarget | null;          // 校验新字段
 export function targetOptionLabels(target: AutoTuneTarget): OptionPair;
@@ -224,7 +225,7 @@ export function nextWrite(prev, target, state, trackKey, chromaticSupported: boo
 - 写入：`key` 为 null 时只调用 `setDiscrete("scale", ...)`。
 
 - [ ] **Step 1: 写测试**
-  - `autotuneTarget` 接受新形状，拒绝 `scale: "dorian"`、`uncovered` 不在 0..1、`key` 越界；
+  - `autotuneTarget` 接受新形状，拒绝 `scale: "dorian"`、`uncoveredNotes` 含越界音级、`key` 越界；
   - `titleLabel` 三种文字使用 profile 拼写（`G#`，不用 `G♯`）；
   - `nextWrite` 在无证据时返回 `{ key: null, scale: "Chromatic" }`；
   - 不支持 Chromatic 时改写为候选；无候选时返回 null；

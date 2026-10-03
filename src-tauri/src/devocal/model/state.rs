@@ -17,7 +17,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::download::{
-    download_file, install, io_error, meta_path, part_path, remove_if_present, ModelError, PartMeta, RetryPolicy, Update,
+    download_file, install, io_error, meta_path, meta_tmp_path, part_path, remove_if_present, ModelError, PartMeta, RetryPolicy, Update,
 };
 use super::fetch::Fetcher;
 use super::manifest::{candidates, FileSpec, Manifest, ModelSpec, SourceKind, STEMGENRT_ID};
@@ -509,7 +509,7 @@ impl ModelState {
         let mut first_error = None;
         for f in &spec.files {
             let path = dir.join(&f.file);
-            for p in [part_path(&path), meta_path(&path), path] {
+            for p in [part_path(&path), meta_path(&path), meta_tmp_path(&path), path] {
                 if let Err(e) = remove_for_delete(&p) {
                     first_error.get_or_insert(e);
                 }
@@ -531,7 +531,7 @@ impl ModelState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devocal::model::download::{meta_path, part_path};
+    use crate::devocal::model::download::{meta_path, meta_tmp_path, part_path};
     use crate::devocal::model::fake::{FakeFetcher, FakeReply};
     use crate::devocal::model::fetch::FetchError;
     use crate::devocal::model::manifest::STEMGENRT_ID;
@@ -901,10 +901,13 @@ mod tests {
         std::fs::write(t.a_file(), &t.a).unwrap();
         std::fs::write(part_path(&t.a_file()), b"part").unwrap();
         std::fs::write(meta_path(&t.a_file()), b"{}").unwrap();
+        // Left by a crash between writing the next .part.json and renaming it.
+        std::fs::write(meta_tmp_path(&t.a_file()), b"{").unwrap();
         std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
         assert_eq!(t.status("a").phase, ModelPhase::Installed);
         assert_eq!(t.state.delete("a"), Ok(()));
         assert!(!t.a_file().exists() && !part_path(&t.a_file()).exists() && !meta_path(&t.a_file()).exists());
+        assert!(!meta_tmp_path(&t.a_file()).exists());
         assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), b"mine");
         assert_eq!(t.status("a").phase, ModelPhase::Missing);
 

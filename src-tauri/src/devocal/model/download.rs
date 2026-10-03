@@ -107,6 +107,11 @@ pub fn meta_path(final_path: &Path) -> PathBuf {
     with_suffix(final_path, ".part.json")
 }
 
+/// `<file>.part.json.tmp`: the next `.part.json`, renamed over it once complete.
+pub fn meta_tmp_path(final_path: &Path) -> PathBuf {
+    with_suffix(final_path, ".part.json.tmp")
+}
+
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
@@ -158,6 +163,23 @@ pub fn install(part: &Path, final_path: &Path, sha256: &str) -> Result<(), Model
     fs::rename(part, final_path).map_err(|e| if install_denied(&e) { ModelError::InstallDenied } else { io_error(&e) })?;
     note_verified(final_path, sha256);
     Ok(())
+}
+
+/// Replaces `path` with `bytes` atomically: written and synced to `<path>.tmp`, then renamed over
+/// it, so a crash or full disk leaves either the old content or the new one, never a torn file.
+fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), ModelError> {
+    let tmp = with_suffix(path, ".tmp");
+    let written = (|| {
+        let mut file = File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    local(written)
 }
 
 fn install_denied(e: &std::io::Error) -> bool {
@@ -255,7 +277,7 @@ impl Part {
             sha256: self.sha256.clone(),
         };
         let json = serde_json::to_vec(&meta).map_err(|_| ModelError::WriteFailed)?;
-        local(fs::write(&self.meta_path, json))?;
+        replace_file(&self.meta_path, &json)?;
         self.unsaved = 0;
         Ok(())
     }
@@ -924,6 +946,27 @@ mod tests {
         assert_eq!(t.run(&f).await, Ok(()));
         assert_eq!(f.calls(), calls(&[(ORIGIN, 0)]));
         t.assert_installed();
+    }
+
+    #[test]
+    fn part_meta_is_replaced_atomically() {
+        let t = T::new("meta-atomic");
+        t.preset(&t.data[..100], Some(100), &t.spec.sha256);
+        let before = std::fs::read(t.meta()).unwrap();
+        let mut part = Part::open(&t.spec, &t.final_path, &|_| {}).unwrap();
+        assert_eq!(part.written, 100);
+        // The new record cannot be written beside the old one: the old one stays whole.
+        let tmp = meta_tmp_path(&t.final_path);
+        std::fs::create_dir_all(&tmp).unwrap();
+        part.append(&t.data[100..200]).unwrap();
+        assert!(part.save().is_err());
+        assert_eq!(std::fs::read(t.meta()).unwrap(), before);
+        std::fs::remove_dir(&tmp).unwrap();
+        // Written beside it, then renamed over it; nothing left behind.
+        part.save().unwrap();
+        let meta: PartMeta = serde_json::from_slice(&std::fs::read(t.meta()).unwrap()).unwrap();
+        assert_eq!(meta.written, 200);
+        assert!(!tmp.exists());
     }
 
     #[tokio::test]

@@ -1519,7 +1519,8 @@ impl Renderer {
             .store(now.saturating_sub(since) / 1000, Ordering::Relaxed);
         let frames = latency_frames(
             u64::from(sh.capture_packet_frames.load(Ordering::Relaxed)),
-            sh.in_ring_frames.load(Ordering::Relaxed) as u64,
+            u64::from(sh.in_ring_frames.load(Ordering::Relaxed))
+                + u64::from(sh.proc_in_flight_frames.load(Ordering::Relaxed)),
             (self.ctx.input.slots() / 2) as u64,
             padding as u64,
             u64::from(sh.proc_latency_frames.load(Ordering::Relaxed)),
@@ -1564,9 +1565,9 @@ fn system_path_frames(period: u64) -> u64 {
         + SYSTEM_PATH_PERIOD_TENTHS * period / 10
 }
 
-/// Estimated end-to-end added latency in frames: capture packet + ring A + ring B + device
-/// padding + processor latency + [`system_path_frames`] (zero when `period` is 0, i.e. there
-/// is no sink).
+/// Estimated end-to-end added latency in frames: capture packet + ring A (with the block being
+/// processed) + ring B + device padding + processor latency + [`system_path_frames`] (zero when
+/// `period` is 0, i.e. there is no sink).
 fn latency_frames(
     capture_packet: u64,
     ring_a: u64,
@@ -1642,6 +1643,7 @@ mod tests {
             last_input_us: AtomicU64::new(0),
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),
+            proc_in_flight_frames: AtomicU32::new(0),
             proc_latency_frames: AtomicU32::new(0),
             proc_hop: AtomicU32::new(128),
             output_failed: AtomicBool::new(false),
@@ -2787,6 +2789,38 @@ mod tests {
         let diag = &r.ctx.stats.diag;
         assert_eq!(diag.render_timeout_wakes.load(Ordering::Relaxed), 1);
         assert_eq!(diag.render_wakes.load(Ordering::Relaxed), 3);
+    }
+
+    /// Ruling 21 (b): the estimate counts the block the processing thread is working on. A
+    /// hop moving from ring A into the model and on to ring B leaves the estimate unchanged;
+    /// before, a device wake during inference read one hop (2.9 ms) low, so the estimate
+    /// seemed to rise by a hop when devocal was switched off.
+    #[test]
+    fn the_latency_estimate_counts_the_block_in_flight() {
+        let sink = FakeSink::new(300);
+        let (mut r, shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        shared.capture_packet_frames.store(441, Ordering::Relaxed);
+        shared.proc_latency_frames.store(128, Ordering::Relaxed);
+        let estimate = |r: &Renderer| {
+            r.publish(300);
+            r.ctx.stats.latency_ms_milli.load(Ordering::Relaxed)
+        };
+        // The hop waits in ring A.
+        shared.in_ring_frames.store(200, Ordering::Relaxed);
+        let waiting = estimate(&r);
+        // The model works on it: ring A holds the rest.
+        shared.in_ring_frames.store(72, Ordering::Relaxed);
+        shared.proc_in_flight_frames.store(128, Ordering::Relaxed);
+        let in_flight = estimate(&r);
+        // It reached ring B.
+        shared.proc_in_flight_frames.store(0, Ordering::Relaxed);
+        for _ in 0..128 * 2 {
+            tx.push(0.0).unwrap();
+        }
+        let in_ring_b = estimate(&r);
+        assert_eq!(in_flight, waiting);
+        assert_eq!(in_ring_b, waiting);
     }
 
     /// Integer-time model of the render path for one capture phase (brief, Task 7).

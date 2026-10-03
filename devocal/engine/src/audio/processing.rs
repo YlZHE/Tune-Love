@@ -3,6 +3,9 @@
 //! `Shared::render_wake` after each block so the render thread writes it on arrival (O2).
 //! Control messages are applied here, between blocks (caller obligation 4).
 //!
+//! The block being processed is published as in flight (`Shared::proc_in_flight_frames`) for
+//! the latency estimate: with the model running it is out of both rings for most of a hop.
+//!
 //! Positions: `in_pos` counts frames taken from ring A (processed or discarded), `out_pos`
 //! frames pushed to ring B. Input frame `x` of a block leaves the processor `latency` frames
 //! later, at output frame `x + (out_pos - in_pos) + latency`.
@@ -164,7 +167,13 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
                 }
             }
         }
+        // From here until it is pushed to ring B the block is in neither ring; publish it as
+        // in flight for the latency estimate (set first, so it is never missing in between).
+        ctx.shared
+            .proc_in_flight_frames
+            .store(st.hop as u32, Ordering::Relaxed);
         if !pop_block(&mut ctx.input, &mut st.in_block, &ctx.shared.in_ring_frames) {
+            ctx.shared.proc_in_flight_frames.store(0, Ordering::Relaxed);
             continue;
         }
         st.in_pos += st.hop as u64;
@@ -205,6 +214,7 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
             .load_ratio_milli
             .store((ratio * 1000.0).round() as u32, Ordering::Relaxed);
 
+        ctx.shared.proc_in_flight_frames.store(0, Ordering::Relaxed);
         if ctx.output.slots() >= st.hop * 2 {
             let _ = ctx.output.push_entire_slice(&st.out_block);
             st.out_pos += st.hop as u64;
@@ -465,6 +475,7 @@ mod tests {
             last_input_us: AtomicU64::new(0),
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),
+            proc_in_flight_frames: AtomicU32::new(0),
             proc_latency_frames: AtomicU32::new(0),
             proc_hop: AtomicU32::new(0),
             output_failed: AtomicBool::new(false),
@@ -519,6 +530,7 @@ mod tests {
             last_input_us: AtomicU64::new(0),
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),
+            proc_in_flight_frames: AtomicU32::new(0),
             proc_latency_frames: AtomicU32::new(0),
             proc_hop: AtomicU32::new(0),
             output_failed: AtomicBool::new(false),
@@ -551,6 +563,108 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(out_rx.slots(), 2 * HOP * 2);
+        shared.stop.store(true, Ordering::Release);
+        shared.wake.set();
+        thread.join().unwrap();
+    }
+
+    /// Ruling 21 (b): while the model works on a block, that block is in neither ring; the
+    /// thread publishes it as in flight (one hop), so the latency estimate does not read one
+    /// hop low during inference, and clears it once the block is in ring B.
+    #[test]
+    fn the_block_being_processed_is_published_as_in_flight() {
+        use super::super::OwnedEvent;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        /// Records the in-flight frames it sees during each `process` call.
+        struct Probe {
+            shared: Arc<Shared>,
+            min: Arc<AtomicU32>,
+            max: Arc<AtomicU32>,
+        }
+        impl Separator for Probe {
+            fn sample_rate(&self) -> u32 {
+                44_100
+            }
+            fn hop(&self) -> usize {
+                HOP
+            }
+            fn latency_frames(&self) -> usize {
+                HOP
+            }
+            fn process(&mut self, _input: &[f32], out: &mut [f32]) -> Result<(), String> {
+                let f = self.shared.proc_in_flight_frames.load(Ordering::Relaxed);
+                self.min.fetch_min(f, Ordering::Relaxed);
+                self.max.fetch_max(f, Ordering::Relaxed);
+                out.fill(0.0);
+                Ok(())
+            }
+            fn reset(&mut self) {}
+        }
+        let (mut in_tx, in_rx) = rtrb::RingBuffer::<f32>::new(HOP * 2 * 4);
+        let (_mk_tx, mk_rx) = rtrb::RingBuffer::<InputMarker>::new(8);
+        let (out_tx, out_rx) = rtrb::RingBuffer::<f32>::new(HOP * 2 * 4);
+        let (omk_tx, _omk_rx) = rtrb::RingBuffer::<u64>::new(8);
+        let (mut ctl_tx, ctl_rx) = rtrb::RingBuffer::<ProcCommand>::new(8);
+        let shared = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            start_us: now_us(),
+            run_id: 1,
+            last_input_us: AtomicU64::new(0),
+            capture_packet_frames: AtomicU32::new(0),
+            in_ring_frames: AtomicU32::new(0),
+            proc_in_flight_frames: AtomicU32::new(0),
+            proc_latency_frames: AtomicU32::new(0),
+            proc_hop: AtomicU32::new(0),
+            output_failed: AtomicBool::new(false),
+            preroll_request: AtomicBool::new(false),
+            underrun_snapshot: AtomicU64::new(0),
+            wake: OwnedEvent::new().unwrap(),
+            render_wake: OwnedEvent::new().unwrap(),
+        });
+        let (min, max) = (
+            Arc::new(AtomicU32::new(u32::MAX)),
+            Arc::new(AtomicU32::new(0)),
+        );
+        let probe = Probe {
+            shared: shared.clone(),
+            min: min.clone(),
+            max: max.clone(),
+        };
+        let ctx = ProcessingCtx {
+            processor: Processor::new(Some(Box::new(probe))),
+            input: in_rx,
+            in_markers: mk_rx,
+            output: out_tx,
+            out_markers: omk_tx,
+            control: ctl_rx,
+            shared: shared.clone(),
+            stats: Arc::new(AudioStats::default()),
+        };
+        let thread = std::thread::spawn(move || run(ctx));
+        assert!(ctl_tx.push(ProcCommand::SetDevocal(true)).is_ok());
+        shared.wake.set();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while ctl_tx.slots() < 8 && std::time::Instant::now() < deadline {
+            shared.wake.set();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        in_tx.push_entire_slice(&[0.25f32; 4 * HOP * 2]).unwrap();
+        shared.wake.set();
+        while out_rx.slots() < 4 * HOP * 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(out_rx.slots(), 4 * HOP * 2, "all four blocks in ring B");
+        assert_eq!(
+            min.load(Ordering::Relaxed),
+            HOP as u32,
+            "in flight on every call"
+        );
+        assert_eq!(max.load(Ordering::Relaxed), HOP as u32);
+        assert_eq!(
+            shared.proc_in_flight_frames.load(Ordering::Relaxed),
+            0,
+            "nothing in flight once the blocks are in ring B"
+        );
         shared.stop.store(true, Ordering::Release);
         shared.wake.set();
         thread.join().unwrap();

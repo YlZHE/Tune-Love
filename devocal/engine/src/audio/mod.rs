@@ -97,7 +97,8 @@ pub struct AudioStats {
     /// `LoadMonitor::ratio() * 1000` while the model runs, 0 otherwise.
     pub load_ratio_milli: AtomicU32,
     /// Estimated end-to-end added latency in microseconds (milli-milliseconds): capture
-    /// packet + ring A + ring B + device padding + processor latency + the calibrated system
+    /// packet + ring A (with the block being processed) + ring B + device padding + processor
+    /// latency + the calibrated system
     /// path (about 3.2 render periods, see `render::SYSTEM_PATH_PERIOD_TENTHS`).
     pub latency_ms_milli: AtomicU32,
     /// Capture packets flagged discontinuous / timestamp error, plus ring overflows.
@@ -618,6 +619,10 @@ pub(crate) struct Shared {
     pub capture_packet_frames: AtomicU32,
     /// Frames waiting in ring A (published by the processing thread).
     pub in_ring_frames: AtomicU32,
+    /// Frames the processing thread has taken from ring A and not yet pushed to ring B: one
+    /// hop while it processes a block (for the model, most of a hop's time), else 0. Part of
+    /// the latency estimate; without it a device wake during inference reads one hop low.
+    pub proc_in_flight_frames: AtomicU32,
     /// Processor latency and hop (published by the processing thread).
     pub proc_latency_frames: AtomicU32,
     pub proc_hop: AtomicU32,
@@ -682,6 +687,7 @@ impl AudioHandle {
             last_input_us: AtomicU64::new(0),
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),
+            proc_in_flight_frames: AtomicU32::new(0),
             proc_latency_frames: AtomicU32::new(processor.latency_frames() as u32),
             proc_hop: AtomicU32::new(processor.hop() as u32),
             output_failed: AtomicBool::new(false),
@@ -1152,6 +1158,7 @@ mod tests {
             last_input_us: AtomicU64::new(0),
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),
+            proc_in_flight_frames: AtomicU32::new(0),
             proc_latency_frames: AtomicU32::new(0),
             proc_hop: AtomicU32::new(128),
             output_failed: AtomicBool::new(false),

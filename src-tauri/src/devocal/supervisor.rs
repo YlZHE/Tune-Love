@@ -379,6 +379,17 @@ impl<L: EngineLink> Supervisor<L> {
         let Some(model) = model else {
             self.unavailable = true;
             self.error = Some("model_not_found".into());
+            // With no engine running, a wish left from an earlier enable must not survive this
+            // failed one: otherwise a later install (which clears `unavailable`) would spawn an
+            // engine, take over the player and turn devocal on with nobody asking. A running
+            // engine is left as it is; it already holds the player.
+            if self.engine.is_none() {
+                self.want_hold = false;
+                self.want_devocal = false;
+                self.user_on_pending = false;
+                self.model_retry = false;
+                self.restarting = false;
+            }
             return;
         };
         self.want_hold = true;
@@ -1624,6 +1635,52 @@ mod tests {
         r.sup.enable(Some(model()));
         r.sup.tick(100, Some(player(7)), true);
         assert_eq!(r.spawns(), 1);
+    }
+
+    #[test]
+    fn an_install_after_a_failed_enable_does_not_start_devocal_by_itself() {
+        // Devocal was on, the engine crashed past its restart budget, the model file went away,
+        // and the user's enable found no model.
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, Some(p.clone()), true);
+        for t in [1_000u64, 2_000, 3_000, 4_000] {
+            r.last().exit();
+            r.sup.tick(t, Some(p.clone()), true);
+        }
+        assert_eq!(r.phase(), "failed");
+        assert_eq!(r.spawns(), 4);
+        r.sup.enable(None);
+        assert_eq!(r.phase(), "unavailable");
+        // An install without auto-enable: nothing starts or takes over the player.
+        r.sup.model_installed();
+        r.sup.tick(70_000, Some(p.clone()), true);
+        r.sup.tick(70_100, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 4, "no engine spawned");
+        let s = r.sup.status();
+        assert_eq!(s.phase, "off");
+        assert!(!s.held);
+        // The user's next enable works as usual.
+        r.sup.enable(Some(model()));
+        r.sup.tick(70_200, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 5);
+    }
+
+    #[test]
+    fn a_failed_enable_while_restarting_stops_the_restart() {
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(model()));
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().exit();
+        r.sup.tick(1_000, None, true);
+        assert_eq!(r.phase(), "restarting");
+        r.sup.enable(None);
+        r.sup.model_installed();
+        r.sup.tick(1_100, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 1, "no restart after the failed enable");
+        assert_eq!(r.phase(), "off");
     }
 
     #[test]

@@ -172,14 +172,17 @@ fn is_installed(state: &ModelState, id: &str) -> bool {
 /// Blocking. `Some(statuses)` if the model is already installed, after enabling de-vocal when
 /// the request asks for it; `None` if the job is still to be started.
 fn settle_installed(app: &AppHandle, state: &ModelState, req: &ModelRequest) -> Option<Vec<ModelStatus>> {
-    match next_step(req, is_installed(state, &req.id)) {
-        Next::Start => None,
-        Next::EnableNow => {
-            enable_devocal(app);
-            Some(state.statuses())
-        }
-        Next::Nothing => Some(state.statuses()),
+    let next = next_step(req, is_installed(state, &req.id));
+    if next == Next::Start {
+        return None;
     }
+    // The model is in place (perhaps put there outside the app, by the fetch script or a manual
+    // copy): a missing-model state of de-vocal no longer applies, as after an install here.
+    app.state::<super::DevocalState>().model_installed();
+    if next == Next::EnableNow {
+        enable_devocal(app);
+    }
+    Some(state.statuses())
 }
 
 /// Runs `f` (which may hash files) on a blocking thread; errors become machine codes. A panic in

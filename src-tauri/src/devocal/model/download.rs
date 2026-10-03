@@ -3,6 +3,7 @@
 //! renaming a complete `.part` whose hash matched.
 
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,9 @@ use super::verify::note_verified;
 
 /// `.part.json` is rewritten after every this many newly written bytes.
 const META_INTERVAL: u64 = 1 << 20;
+
+/// How often a pending network wait or backoff checks the cancel flag.
+const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelError {
@@ -85,6 +89,9 @@ pub enum Update {
     Verifying,
     /// `received`: bytes of this file now in `.part`.
     Downloading { received: u64, source: SourceKind },
+    /// This source was given up; `error` is what the download would have failed with had it
+    /// been the only source. The download goes on with the next one.
+    SourceFailed { source: SourceKind, error: ModelError },
 }
 
 /// `<file>.part`, next to the file.
@@ -233,9 +240,9 @@ impl Part {
         Ok(())
     }
 
-    /// Flushes the data, then records how much of it there is.
+    /// Puts the data on disk, then records how much of it there is.
     fn save(&mut self) -> Result<(), ModelError> {
-        local(self.file.flush())?;
+        local(self.file.sync_data())?;
         let meta = PartMeta {
             source: self.source.clone(),
             url: self.url.clone(),
@@ -251,6 +258,8 @@ impl Part {
 
     /// Saves what is there for a later resume and reports the cancellation.
     fn cancel(&mut self) -> ModelError {
+        // Only logged on purpose: a stale `.part.json` still describes a valid prefix of `.part`
+        // (resume takes `min(written, .part length)`), so the user's cancel stays a cancel.
         if let Err(e) = self.save() {
             eprintln!("model download: could not record the partial download: {}", e.code());
         }
@@ -305,15 +314,53 @@ pub async fn download_file<F: Fetcher>(
     }
 }
 
+/// Why a source attempt failed: the error it would mean for the user, plus detail for the log.
+struct Failure {
+    error: ModelError,
+    reason: String,
+}
+
+impl Failure {
+    fn new(error: ModelError, reason: impl Into<String>) -> Failure {
+        Failure { error, reason: reason.into() }
+    }
+
+    fn fetch(e: &FetchError) -> Failure {
+        let error = match e {
+            FetchError::Timeout => ModelError::Timeout,
+            FetchError::Status(code) => ModelError::HttpStatus(*code),
+            // Bad ranges, certificate rejections and redirect loops: the address is unusable.
+            FetchError::Connect | FetchError::BadRange | FetchError::Network(_) | FetchError::Fatal(_) => {
+                ModelError::Network
+            }
+        };
+        Failure::new(error, describe(e))
+    }
+}
+
 enum Outcome {
     /// `.part` holds exactly `bytes` bytes.
     Complete,
     /// Try this source again after the backoff.
-    Retry(String),
+    Retry(Failure),
     /// Try this source again at once, from byte 0 (it refused the range).
-    RetryFromZero(String),
+    RetryFromZero(Failure),
     /// Give up on this source.
-    Drop(String),
+    Drop(Failure),
+}
+
+/// Runs `fut` to completion unless `cancel` gets set first (checked every [`CANCEL_POLL`]).
+async fn unless_cancelled<T>(cancel: &AtomicBool, fut: impl Future<Output = T>) -> Option<T> {
+    let cancelled = async {
+        while !cancel.load(Ordering::SeqCst) {
+            tokio::time::sleep(CANCEL_POLL).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        value = fut => Some(value),
+        () = cancelled => None,
+    }
 }
 
 /// Fills `part` up to the file size from the first source that manages it.
@@ -330,31 +377,41 @@ async fn fetch_into<F: Fetcher>(
     for candidate in candidates {
         let mut use_range = true;
         let mut made = 0;
-        let reason = loop {
+        let failure = loop {
             made += 1;
-            let reason = match attempt(fetcher, candidate, file, part, cancel, progress, use_range).await? {
+            let failure = match attempt(fetcher, candidate, file, part, cancel, progress, &mut use_range).await? {
                 Outcome::Complete => return Ok(()),
-                Outcome::Drop(reason) => break reason,
-                Outcome::RetryFromZero(reason) => {
+                Outcome::Drop(failure) => break failure,
+                Outcome::RetryFromZero(failure) => {
                     use_range = false;
                     if made >= attempts {
-                        break reason;
+                        break failure;
                     }
                     continue;
                 }
-                Outcome::Retry(reason) => reason,
+                Outcome::Retry(failure) => failure,
             };
             if made >= attempts {
-                break reason;
+                break failure;
             }
-            tokio::time::sleep(policy.backoff * made).await;
+            if unless_cancelled(cancel, tokio::time::sleep(policy.backoff * made)).await.is_none() {
+                return Err(part.cancel());
+            }
         };
-        eprintln!("model download: {} from {} failed: {reason}", file.file, candidate.kind.label());
+        eprintln!(
+            "model download: {} from {} failed: {} ({})",
+            file.file,
+            candidate.kind.label(),
+            failure.reason,
+            failure.error.code()
+        );
+        progress(Update::SourceFailed { source: candidate.kind.clone(), error: failure.error });
     }
     Err(ModelError::AllSourcesFailed)
 }
 
 /// One GET from one source, written into `part`. Local write errors and cancellation are `Err`.
+/// `use_range` is set again once a from-zero response is accepted, so a later retry resumes.
 async fn attempt<F: Fetcher>(
     fetcher: &F,
     candidate: &Candidate,
@@ -362,26 +419,32 @@ async fn attempt<F: Fetcher>(
     part: &mut Part,
     cancel: &AtomicBool,
     progress: &(dyn Fn(Update) + Send + Sync),
-    use_range: bool,
+    use_range: &mut bool,
 ) -> Result<Outcome, ModelError> {
     if cancel.load(Ordering::SeqCst) {
         return Err(part.cancel());
     }
-    let offset = if use_range { part.written } else { 0 };
-    let opened = match fetcher.open(&candidate.url, offset).await {
+    let offset = if *use_range { part.written } else { 0 };
+    let Some(opened) = unless_cancelled(cancel, fetcher.open(&candidate.url, offset)).await else {
+        return Err(part.cancel());
+    };
+    let opened = match opened {
         Ok(opened) => opened,
         // The source does not accept our resume point; the whole file may still work.
-        Err(FetchError::Status(416)) if offset > 0 => {
-            return Ok(Outcome::RetryFromZero(format!("range from {offset} not satisfiable")))
+        Err(e @ FetchError::Status(416)) if offset > 0 => {
+            return Ok(Outcome::RetryFromZero(Failure::new(
+                ModelError::HttpStatus(416),
+                format!("range from {offset} not satisfiable ({})", describe(&e)),
+            )))
         }
-        Err(e) if e.retryable() => return Ok(Outcome::Retry(describe(&e))),
-        Err(e) => return Ok(Outcome::Drop(describe(&e))),
+        Err(e) if e.retryable() => return Ok(Outcome::Retry(Failure::fetch(&e))),
+        Err(e) => return Ok(Outcome::Drop(Failure::fetch(&e))),
     };
     if cancel.load(Ordering::SeqCst) {
         return Err(part.cancel());
     }
     if opened.html {
-        return Ok(Outcome::Drop(format!("returned a web page ({})", ModelError::SourceHtml.code())));
+        return Ok(Outcome::Drop(Failure::new(ModelError::SourceHtml, "returned a web page")));
     }
     // A 206 must state the full size and it must match; a 200 may omit it.
     let total_ok = match opened.status {
@@ -390,28 +453,32 @@ async fn attempt<F: Fetcher>(
         _ => false,
     };
     if !total_ok {
-        return Ok(Outcome::Drop(format!(
-            "status {} with total {:?}, expected {} ({})",
-            opened.status,
-            opened.total,
-            file.bytes,
-            ModelError::SizeMismatch.code()
+        return Ok(Outcome::Drop(Failure::new(
+            ModelError::SizeMismatch,
+            format!("status {} with total {:?}, expected {}", opened.status, opened.total, file.bytes),
         )));
     }
     // A 200 is the whole file from byte 0, even when a range was asked for: never append it.
     if opened.status == 200 || offset == 0 {
         part.restart()?;
+        *use_range = true;
     }
     part.source = candidate.kind.label();
     part.url = candidate.url.clone();
     let mut body = opened.body;
     loop {
-        match body.next_chunk().await {
+        let Some(next) = unless_cancelled(cancel, body.next_chunk()).await else {
+            return Err(part.cancel());
+        };
+        match next {
             Ok(Some(chunk)) => {
                 if part.written + chunk.len() as u64 > file.bytes {
                     part.restart()?;
                     part.save()?;
-                    return Ok(Outcome::Drop(format!("sent more than {} bytes", file.bytes)));
+                    return Ok(Outcome::Drop(Failure::new(
+                        ModelError::SizeMismatch,
+                        format!("sent more than {} bytes", file.bytes),
+                    )));
                 }
                 part.append(&chunk)?;
                 progress(Update::Downloading { received: part.written, source: candidate.kind.clone() });
@@ -422,11 +489,14 @@ async fn attempt<F: Fetcher>(
             Ok(None) if part.written == file.bytes => return Ok(Outcome::Complete),
             Ok(None) => {
                 part.save()?;
-                return Ok(Outcome::Retry(format!("body ended at {} of {} bytes", part.written, file.bytes)));
+                return Ok(Outcome::Retry(Failure::new(
+                    ModelError::Network,
+                    format!("body ended at {} of {} bytes", part.written, file.bytes),
+                )));
             }
             Err(e) => {
                 part.save()?;
-                return Ok(Outcome::Retry(describe(&e)));
+                return Ok(Outcome::Retry(Failure::fetch(&e)));
             }
         }
     }
@@ -966,6 +1036,198 @@ mod tests {
         assert!(!t.final_path.exists());
     }
 
+    fn source_failures(log: &[Update]) -> Vec<(SourceKind, ModelError)> {
+        log.iter()
+            .filter_map(|u| match u {
+                Update::SourceFailed { source, error } => Some((source.clone(), error.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn html_source_reports_source_html_once_then_installs_from_the_next() {
+        let t = T::new("dl-html-report");
+        let m1 = mirror("ghfast.top");
+        let ghfast = SourceKind::Mirror("ghfast.top".into());
+        // download_file follows whatever order it is given: here a mirror first, then the origin.
+        let cands = vec![
+            Candidate { kind: ghfast.clone(), url: m1.clone() },
+            Candidate { kind: SourceKind::Origin, url: ORIGIN.into() },
+        ];
+        let f = FakeFetcher::new();
+        let page = FakeReply::Serve { status: 200, total: None, html: true, chunks: vec![b"<html>".to_vec()], then: None };
+        f.script(&m1, vec![page]);
+        f.script(ORIGIN, vec![ok200(&t.data)]);
+        let log = Mutex::new(Vec::new());
+        let r = download_file(&f, &t.spec, &t.final_path, &cands, &POLICY, &AtomicBool::new(false), &|u| {
+            log.lock().unwrap().push(u)
+        })
+        .await;
+        assert_eq!(r, Ok(()));
+        t.assert_installed();
+        let log = log.into_inner().unwrap();
+        assert_eq!(source_failures(&log), vec![(ghfast.clone(), ModelError::SourceHtml)]);
+        let failed_at = log.iter().position(|u| matches!(u, Update::SourceFailed { .. })).unwrap();
+        assert!(log[failed_at + 1..].iter().any(|u| matches!(u, Update::Downloading { source: SourceKind::Origin, .. })));
+    }
+
+    #[tokio::test]
+    async fn every_failed_source_reports_its_own_error_in_order() {
+        let t = T::new("dl-report-all");
+        let f = FakeFetcher::new();
+        let (m1, m2) = (mirror("ghfast.top"), mirror("ghproxy.net"));
+        f.script(ORIGIN, vec![FakeReply::Fail(FetchError::Status(404))]);
+        let page = FakeReply::Serve { status: 200, total: None, html: true, chunks: vec![], then: None };
+        f.script(&m1, vec![page]);
+        f.script(&m2, vec![serve(200, Some(SIZE as u64 - 1), &t.data[1..])]);
+        let log = Mutex::new(Vec::new());
+        let r = t.run_with(&f, &AtomicBool::new(false), &|u| log.lock().unwrap().push(u)).await;
+        assert_eq!(r, Err(ModelError::AllSourcesFailed));
+        assert_eq!(source_failures(&log.into_inner().unwrap()), vec![
+            (SourceKind::Origin, ModelError::HttpStatus(404)),
+            (SourceKind::Mirror("ghfast.top".into()), ModelError::SourceHtml),
+            (SourceKind::Mirror("ghproxy.net".into()), ModelError::SizeMismatch),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_and_fatal_errors_report_the_closest_error() {
+        let t = T::new("dl-report-retry");
+        let f = FakeFetcher::new();
+        let (m1, m2) = (mirror("ghfast.top"), mirror("ghproxy.net"));
+        f.script(ORIGIN, vec![
+            FakeReply::Fail(FetchError::Connect),
+            FakeReply::Fail(FetchError::Status(503)),
+            FakeReply::Fail(FetchError::Timeout),
+        ]);
+        f.script(&m1, vec![FakeReply::Fail(FetchError::Fatal("certificate (os error -2146762487)".into()))]);
+        let long = {
+            let mut d = t.data.clone();
+            d.push(0);
+            d
+        };
+        f.script(&m2, vec![serve(200, None, &long)]);
+        let log = Mutex::new(Vec::new());
+        let r = t.run_with(&f, &AtomicBool::new(false), &|u| log.lock().unwrap().push(u)).await;
+        assert_eq!(r, Err(ModelError::AllSourcesFailed));
+        assert_eq!(source_failures(&log.into_inner().unwrap()), vec![
+            (SourceKind::Origin, ModelError::Timeout),
+            (SourceKind::Mirror("ghfast.top".into()), ModelError::Network),
+            (SourceKind::Mirror("ghproxy.net".into()), ModelError::SizeMismatch),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn after_a_from_zero_restart_a_mid_body_failure_resumes_with_a_range() {
+        let t = T::new("dl-416-resume");
+        t.preset(&t.data[..HALF], Some(HALF as u64), &t.spec.sha256);
+        let quarter = SIZE / 4;
+        let broken = FakeReply::Serve {
+            status: 200,
+            total: Some(SIZE as u64),
+            html: false,
+            chunks: chunks(&t.data[..quarter]),
+            then: Some(FetchError::Network("reset".into())),
+        };
+        let f = FakeFetcher::new();
+        f.script(ORIGIN, vec![FakeReply::Fail(FetchError::Status(416)), broken, ok206(&t.data, quarter)]);
+        assert_eq!(t.run(&f).await, Ok(()));
+        assert_eq!(f.calls(), calls(&[(ORIGIN, HALF), (ORIGIN, 0), (ORIGIN, quarter)]));
+        t.assert_installed();
+    }
+
+    #[tokio::test]
+    async fn meta_is_saved_every_mib_while_downloading() {
+        let data: Vec<u8> = (0..(3 << 19)).map(|i: u32| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        let spec = spec_for(&data, ORIGIN, false);
+        let final_path = temp_dir("dl-meta-interval").join("m").join("model.onnx");
+        let cands = candidates(&spec, None, &[]);
+        let f = FakeFetcher::new();
+        f.script(ORIGIN, vec![FakeReply::Serve {
+            status: 200,
+            total: Some(data.len() as u64),
+            html: false,
+            chunks: data.chunks(64 * 1024).map(<[u8]>::to_vec).collect(),
+            then: None,
+        }]);
+        let meta = meta_path(&final_path);
+        let seen = Mutex::new(Vec::new());
+        let r = download_file(&f, &spec, &final_path, &cands, &POLICY, &AtomicBool::new(false), &|u| {
+            if let Update::Downloading { received, .. } = u {
+                let saved = std::fs::read(&meta).ok().and_then(|b| serde_json::from_slice::<PartMeta>(&b).ok());
+                seen.lock().unwrap().push((received, saved.map(|m| m.written)));
+            }
+        })
+        .await;
+        assert_eq!(r, Ok(()));
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.iter().all(|(received, _)| *received <= data.len() as u64));
+        assert!(seen.iter().filter(|(r, _)| *r < 1 << 20).all(|(_, w)| w.is_none()), "no save before 1 MiB");
+        let at_mib = seen.iter().find(|(r, _)| *r >= 1 << 20).unwrap();
+        assert_eq!(at_mib.1, Some(at_mib.0), "saved when 1 MiB was reached, with what was written");
+        assert!(at_mib.0 >= 1 << 20);
+    }
+
+    /// A fetcher whose body never yields a chunk.
+    struct StalledBody;
+
+    struct Pending;
+
+    impl crate::devocal::model::fetch::Body for Pending {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, FetchError> {
+            std::future::pending().await
+        }
+    }
+
+    impl Fetcher for StalledBody {
+        type Body = Pending;
+        async fn open(&self, _url: &str, _offset: u64) -> Result<crate::devocal::model::fetch::Opened<Pending>, FetchError> {
+            Ok(crate::devocal::model::fetch::Opened { status: 200, total: None, html: false, body: Pending })
+        }
+    }
+
+    /// Starts `download_file` on a task, sets cancel after `after`, and returns how long the
+    /// download took to return after that, with its result.
+    async fn cancel_after<F: Fetcher>(fetcher: F, policy: RetryPolicy, after: Duration) -> (Duration, Result<(), ModelError>) {
+        let t = T::new("dl-cancel-prompt");
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let task = {
+            let (cancel, spec, path, cands) = (cancel.clone(), t.spec.clone(), t.final_path.clone(), t.cands.clone());
+            tokio::spawn(async move { download_file(&fetcher, &spec, &path, &cands, &policy, &cancel, &|_| {}).await })
+        };
+        tokio::time::sleep(after).await;
+        cancel.store(true, Ordering::SeqCst);
+        let set = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), task).await.expect("download_file ignored cancel").unwrap();
+        (set.elapsed(), result)
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_an_open_that_never_completes() {
+        let f = FakeFetcher::new();
+        let _never_notified = f.gate();
+        let (took, r) = cancel_after(f, POLICY, Duration::from_millis(100)).await;
+        assert_eq!(r, Err(ModelError::Cancelled));
+        assert!(took < Duration::from_millis(500), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_a_body_that_never_yields() {
+        let (took, r) = cancel_after(StalledBody, POLICY, Duration::from_millis(100)).await;
+        assert_eq!(r, Err(ModelError::Cancelled));
+        assert!(took < Duration::from_millis(500), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_the_backoff() {
+        let f = FakeFetcher::new(); // every open fails with Connect
+        let slow = RetryPolicy { retries: 2, backoff: Duration::from_secs(30) };
+        let (took, r) = cancel_after(f, slow, Duration::from_millis(100)).await;
+        assert_eq!(r, Err(ModelError::Cancelled));
+        assert!(took < Duration::from_millis(500), "{took:?}");
+    }
+
     #[tokio::test]
     async fn progress_reports_source_kind() {
         let t = T::new("dl-progress");
@@ -1014,6 +1276,17 @@ mod tests {
         assert!(file_verified(&t.final_path, &t.spec));
     }
 
+    #[test]
+    fn install_replaces_an_existing_unlocked_file() {
+        let t = T::new("dl-install-replace");
+        t.preset(&t.data, None, "");
+        std::fs::write(&t.final_path, b"an older, different model").unwrap();
+        assert_eq!(install(&t.part(), &t.final_path, &t.spec.sha256), Ok(()));
+        assert!(!t.part().exists());
+        assert_eq!(std::fs::read(&t.final_path).unwrap(), t.data);
+        assert!(file_verified(&t.final_path, &t.spec));
+    }
+
     #[cfg(windows)]
     #[test]
     fn install_reports_install_denied_when_target_locked() {
@@ -1032,6 +1305,7 @@ mod tests {
     fn io_errors_map_to_disk_full_or_write_failed() {
         use std::io::{Error, ErrorKind};
         assert_eq!(io_error(&Error::from(ErrorKind::StorageFull)), ModelError::DiskFull);
+        assert_eq!(io_error(&Error::from(ErrorKind::QuotaExceeded)), ModelError::DiskFull);
         assert_eq!(io_error(&Error::from(ErrorKind::PermissionDenied)), ModelError::WriteFailed);
         assert_eq!(io_error(&Error::other("x")), ModelError::WriteFailed);
     }

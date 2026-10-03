@@ -6,7 +6,8 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchError {
-    /// Could not connect (refused, DNS, TLS handshake, connect timeout).
+    /// Could not connect (refused, DNS, TLS handshake (other than certificate rejection, which is
+    /// `Fatal`), connect timeout).
     Connect,
     /// A read stalled longer than the read timeout.
     Timeout,

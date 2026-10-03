@@ -215,17 +215,27 @@ const DIAG_POLL_MS: u64 = 50;
 
 /// Logs counter deltas once a second until `shared.stop`, then one partial last line.
 fn diag_loop(stats: Arc<AudioStats>, shared: Arc<Shared>, gains: Arc<SharedGains>) {
-    diag_loop_with(stats, shared, gains, 1_000_000, |l| eprintln!("{l}"));
+    diag_loop_with(
+        stats,
+        shared,
+        gains,
+        1_000_000,
+        || thread::sleep(Duration::from_millis(DIAG_POLL_MS)),
+        now_us,
+        |l| eprintln!("{l}"),
+    );
 }
 
-/// [`diag_loop`] with its own interval and sink. Emits a start line, a line every
-/// `interval_us`, and on stop a last line (marked partial) covering the time since the
-/// previous one. Only this detached thread formats strings.
+/// [`diag_loop`] with its own interval, poll wait, clock (microseconds) and sink. Emits a
+/// start line, a line every `interval_us`, and on stop a last line (marked partial) covering
+/// the time since the previous one. Only this detached thread formats strings.
 pub(crate) fn diag_loop_with(
     stats: Arc<AudioStats>,
     shared: Arc<Shared>,
     gains: Arc<SharedGains>,
     interval_us: u64,
+    mut wait: impl FnMut(),
+    mut clock: impl FnMut() -> u64,
     mut emit: impl FnMut(String),
 ) {
     let d = &stats.diag;
@@ -286,7 +296,7 @@ pub(crate) fn diag_loop_with(
     ];
     let run = shared.run_id;
     let mut last = read();
-    let mut last_us = now_us();
+    let mut last_us = clock();
     let unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
@@ -311,9 +321,9 @@ pub(crate) fn diag_loop_with(
         diag_line(run, t_us, span_us, &fields, &tail, partial)
     };
     loop {
-        thread::sleep(Duration::from_millis(DIAG_POLL_MS));
+        wait();
         let stopping = shared.stop.load(Ordering::Acquire);
-        let t = now_us();
+        let t = clock();
         let span = t.saturating_sub(last_us);
         if !stopping && span < interval_us {
             continue;
@@ -1181,35 +1191,38 @@ mod tests {
         );
     }
 
+    /// Ruling 17 (4): the loop runs on the test thread against a simulated clock (each poll
+    /// wait advances it 50 ms; the stop comes after the fifth), so machine load cannot shift
+    /// the lines: start, full lines at 100 and 200 ms, a partial one of 50 ms at 250 ms.
     #[test]
     fn diag_loop_emits_a_final_partial_line_after_stop() {
+        use std::cell::Cell;
         let stats = Arc::new(AudioStats::default());
         let shared = Arc::new(test_shared());
         let gains = Arc::new(SharedGains::new(1.0, 1.0));
-        let (tx, rx) = mpsc::channel::<String>();
-        let (st, sh, g) = (stats, shared.clone(), gains);
-        let t = thread::spawn(move || {
-            diag_loop_with(st, sh, g, 100_000, move |l| {
-                let _ = tx.send(l);
-            })
-        });
-        // Mid-way between the polls at 200 and 250 ms, so the stop is seen at 250 ms and the
-        // partial line spans ~50 ms (< 100) with 25 ms of slack either way.
-        thread::sleep(Duration::from_millis(225));
-        shared.stop.store(true, Ordering::Release);
-        let stopped_at = Instant::now();
-        while !t.is_finished() && stopped_at.elapsed() < Duration::from_millis(200) {
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert!(t.is_finished(), "diag thread did not stop within 200 ms");
-        t.join().unwrap();
-        let lines: Vec<String> = rx.try_iter().collect();
-        assert!(lines.len() >= 4, "{lines:?}");
+        let t0 = 7_000_000u64;
+        let clock = Cell::new(t0);
+        let polls = Cell::new(0u32);
+        let mut lines = Vec::new();
+        diag_loop_with(
+            stats.clone(),
+            shared.clone(),
+            gains,
+            100_000,
+            || {
+                clock.set(clock.get() + 50_000);
+                polls.set(polls.get() + 1);
+                stats.diag.render_wakes.fetch_add(3, Ordering::Relaxed);
+                if polls.get() == 5 {
+                    shared.stop.store(true, Ordering::Release);
+                }
+            },
+            || clock.get(),
+            |l| lines.push(l),
+        );
+        assert_eq!(polls.get(), 5, "returns at the first poll after the stop");
+        assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(lines[0].contains(" start "), "{}", lines[0]);
-        let (last, mid) = lines[1..].split_last().unwrap();
-        assert!(mid.iter().all(|l| !l.contains("partial")), "{lines:?}");
-        assert_eq!(mid.len(), 2, "{lines:?}");
-        assert!(last.ends_with(" partial"), "{last}");
         let field = |l: &str, key: &str| -> f64 {
             l.split_whitespace()
                 .find_map(|w| w.strip_prefix(key))
@@ -1217,11 +1230,21 @@ mod tests {
                 .parse()
                 .unwrap()
         };
+        let (last, full) = lines[1..].split_last().unwrap();
+        assert!(!full.is_empty(), "at least one full line: {lines:?}");
+        for l in full {
+            assert!(!l.contains("partial"), "{l}");
+            assert_eq!(field(l, "span_ms="), 100.0, "{l}");
+            assert_eq!(field(l, "r_wakes="), 6.0, "two polls' counts: {l}");
+        }
+        assert!(last.ends_with(" partial"), "{last}");
         assert!(field(last, "span_ms=") < 100.0, "{last}");
+        assert_eq!(field(last, "span_ms="), 50.0, "{last}");
         let run = format!("run={}", shared.run_id);
         assert!(lines.iter().all(|l| l.contains(&run)), "{lines:?}");
         let ts: Vec<f64> = lines.iter().map(|l| field(l, "t=")).collect();
         assert!(ts.windows(2).all(|w| w[1] > w[0]), "{ts:?}");
+        assert_eq!(ts, vec![7.0, 7.1, 7.2, 7.25]);
     }
 
     #[test]

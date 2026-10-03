@@ -488,7 +488,14 @@ mod tests {
             assert!(ctl_tx.push(c).is_ok());
         }
         shared.wake.set();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Stop once the thread has taken every command (it applies a command in the pass that
+        // pops it, before it looks at the stop flag again); generous bound for loaded machines.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while ctl_tx.slots() < 8 && std::time::Instant::now() < deadline {
+            shared.wake.set();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(ctl_tx.slots(), 8, "commands taken within 2 s");
         shared.stop.store(true, Ordering::Release);
         shared.wake.set();
         thread.join().unwrap()
@@ -537,9 +544,9 @@ mod tests {
         );
         in_tx.push_entire_slice(&[0.25f32; 2 * HOP * 2]).unwrap();
         shared.wake.set();
-        assert!(shared.render_wake.wait(100), "woken by the pushed blocks");
+        assert!(shared.render_wake.wait(2_000), "woken by the pushed blocks");
         // Both blocks reach ring B.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while out_rx.slots() < 2 * HOP * 2 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }

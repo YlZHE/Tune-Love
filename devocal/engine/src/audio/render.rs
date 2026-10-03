@@ -1258,6 +1258,14 @@ impl Renderer {
                 self.preroll_left = n;
                 self.preroll_fade = true;
                 self.headroom.add_preroll(n, now);
+                if self.drop_faded {
+                    // A decay still discarding: the output already faded to silence, and the
+                    // pre-roll writes ring B's frames after its silence, so the skip ends
+                    // here (it would otherwise cut later frames without a fade).
+                    self.drop_pending = 0;
+                    self.end_drop();
+                    self.preroll_fade = false;
+                }
             }
         }
         // O1: headroom no longer needed leaves the target now; the audio it holds is skipped
@@ -2499,6 +2507,40 @@ mod tests {
             "no longer discarding"
         );
         assert_eq!(r.ctx.input.slots() / 2, 100);
+    }
+
+    /// A pre-roll that starts while a decay is still discarding ends the discard (the output
+    /// is already at silence; no fade-out of its own, no later cut).
+    #[test]
+    fn a_preroll_ends_a_decay_skip_still_discarding() {
+        let sink = FakeSink::new(0);
+        let (padding, out) = (sink.padding.clone(), sink.out.clone());
+        let (mut r, shared, mut tx) = test_renderer(Some(sink));
+        r.after_open();
+        r.deadline_mode = true;
+        let fade = r.fade_frames;
+        let t = 10 * SEC;
+        padding.store(128, Ordering::Relaxed);
+        arrive(&r, &mut tx, 300, t);
+        r.drop_pending = 400;
+        r.drop_is_decay = true;
+        r.fill_at(Wake::Device, t).unwrap();
+        assert!(r.drop_faded && r.drop_pending > 0);
+        let first = out.lock().unwrap().len();
+        shared.preroll_request.store(true, Ordering::Release);
+        arrive(&r, &mut tx, 128, t + MS);
+        r.fill_at(Wake::Data, t + MS).unwrap();
+        assert_eq!((r.drop_pending, r.drop_faded), (0, false));
+        assert_eq!(
+            decay_frames(&r),
+            (300 - fade) as u64,
+            "nothing more discarded"
+        );
+        // Silence first (no fade-out from full level), then the block fading in.
+        let o = out.lock().unwrap();
+        assert!(o.len() > first);
+        assert_eq!(o[first], 0.0);
+        assert!(o[first..].iter().all(|s| s.abs() <= 0.5));
     }
 
     #[test]

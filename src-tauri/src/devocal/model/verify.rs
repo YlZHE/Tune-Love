@@ -41,6 +41,10 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 /// True if the file has the spec's size and SHA-256 (hash cached by path + mtime + size).
+///
+/// The cache trusts an unchanged (mtime, size). Anything that puts new bytes at a path must
+/// therefore either rename a file into place (which gives a fresh entry) or call
+/// [`note_verified`] right after; the downloader does both.
 pub fn file_verified(path: &Path, spec: &FileSpec) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
@@ -66,6 +70,9 @@ pub fn file_verified(path: &Path, spec: &FileSpec) -> bool {
 }
 
 /// Remembers a hash that was just computed while installing, so the next check does not redo it.
+///
+/// `sha256` must be the hash the caller computed over the bytes now at `path`, never the
+/// manifest's expected value: passing the expected value would let an unverified file pass.
 pub fn note_verified(path: &Path, sha256: &str) {
     if let Ok(meta) = std::fs::metadata(path) {
         if let Ok(mtime) = meta.modified() {

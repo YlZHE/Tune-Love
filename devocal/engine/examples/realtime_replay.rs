@@ -21,6 +21,11 @@
 
 #[path = "../src/dsp.rs"]
 mod dsp;
+/// Debug builds: `TUNE_LOVE_DEVOCAL_DUMP=<dir>` also writes the engine's live dump format
+/// (in/sep/out + blocks.csv), so the live analysis can be checked against a known run.
+#[cfg(debug_assertions)]
+#[path = "../src/audio/dump.rs"]
+mod dump;
 #[path = "../src/ort_window.rs"]
 mod ort_window;
 #[path = "../src/processor.rs"]
@@ -204,6 +209,8 @@ fn main() -> Result<(), String> {
             writeln!(blocks, "block,pos,t0_us,t1_us,timeouts,stage").map_err(io)?;
             let mut out = Vec::with_capacity(feed.len());
             let mut obuf = vec![0.0f32; WINDOWED_HOP * 2];
+            #[cfg(debug_assertions)]
+            let mut dump = dump::Dump::from_env(0);
             let period = Duration::from_secs_f64(packet as f64 / 44_100.0);
             let start = Instant::now();
             let (mut avail, mut pos, mut b) = (0usize, 0usize, 0usize);
@@ -218,10 +225,29 @@ fn main() -> Result<(), String> {
                 while pos + WINDOWED_HOP <= avail {
                     let input = &feed[pos * 2..(pos + WINDOWED_HOP) * 2];
                     let t0 = epoch.elapsed().as_micros();
-                    p.process_block(input, &mut obuf);
+                    let _rep = p.process_block(input, &mut obuf);
                     let t1 = epoch.elapsed().as_micros();
                     pos += WINDOWED_HOP;
                     out.extend_from_slice(&obuf);
+                    #[cfg(debug_assertions)]
+                    if let Some(d) = dump.as_mut() {
+                        let (r, ran) = (_rep.stage, _rep.ran_model);
+                        d.block(
+                            input,
+                            ran.then(|| p.accompaniment()),
+                            &obuf,
+                            dump::BlockMeta {
+                                in_pos: (pos - WINDOWED_HOP) as u64,
+                                out_pos: Some((pos - WINDOWED_HOP) as u64),
+                                stage: r,
+                                ran_model: ran,
+                                sep_latency: p.latency_frames() as u32,
+                                out_latency: p.output_latency_frames() as u32,
+                                model_resets: p.model_resets(),
+                                t_us: t0 as u64,
+                            },
+                        );
+                    }
                     let (to, _) = p.window_stats().unwrap_or((0, 0.0));
                     writeln!(blocks, "{b},{pos},{t0},{t1},{to},{:?}", p.stage()).map_err(io)?;
                     b += 1;

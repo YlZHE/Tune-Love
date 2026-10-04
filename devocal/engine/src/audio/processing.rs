@@ -186,6 +186,8 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
     st.underrun_base = ctx.stats.underruns.load(Ordering::Acquire);
     publish_config(&ctx, &st);
     publish_state(&ctx);
+    #[cfg(debug_assertions)]
+    let mut dump = super::dump::Dump::from_env(ctx.shared.run_id);
 
     'outer: while !ctx.shared.stop.load(Ordering::Acquire) {
         while let Ok(cmd) = ctx.control.pop() {
@@ -295,7 +297,26 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
             .store((ratio * 1000.0).round() as u32, Ordering::Relaxed);
         publish_window_stats(&ctx);
 
-        if ctx.output.slots() >= st.hop * 2 {
+        let fits = ctx.output.slots() >= st.hop * 2;
+        #[cfg(debug_assertions)]
+        if let Some(d) = dump.as_mut() {
+            d.block(
+                &st.in_block,
+                report.ran_model.then(|| ctx.processor.accompaniment()),
+                &st.out_block,
+                super::dump::BlockMeta {
+                    in_pos: st.in_pos - st.hop as u64,
+                    out_pos: fits.then_some(st.out_pos),
+                    stage: report.stage,
+                    ran_model: report.ran_model,
+                    sep_latency: ctx.processor.latency_frames() as u32,
+                    out_latency: ctx.processor.output_latency_frames() as u32,
+                    model_resets: ctx.processor.model_resets(),
+                    t_us: t0,
+                },
+            );
+        }
+        if fits {
             let _ = ctx.output.push_entire_slice(&st.out_block);
             // Cleared only once the block is in ring B: for a moment it counts twice (never
             // zero times) in the latency estimate (ruling 23).

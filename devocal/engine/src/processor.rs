@@ -214,6 +214,9 @@ pub struct Processor {
     pass: Vec<f32>,
     /// Accompaniment block from the model.
     acc: Vec<f32>,
+    /// Debug builds only (audio dump): model streams started (installs and resets) so far.
+    #[cfg(debug_assertions)]
+    model_resets: u32,
 }
 
 impl Processor {
@@ -237,6 +240,8 @@ impl Processor {
             input: Vec::new(),
             pass: Vec::new(),
             acc: Vec::new(),
+            #[cfg(debug_assertions)]
+            model_resets: 0,
         };
         match separator {
             Some(s) => {
@@ -261,7 +266,24 @@ impl Processor {
         let passthrough = s.passthrough_latency_frames();
         let old = self.separator.replace(s);
         self.configure(hop, latency, passthrough);
+        #[cfg(debug_assertions)]
+        {
+            self.model_resets += 1;
+        }
         old
+    }
+
+    /// Debug builds only (audio dump): the model's accompaniment for the last block (valid
+    /// when that block ran the model).
+    #[cfg(debug_assertions)]
+    pub fn accompaniment(&self) -> &[f32] {
+        &self.acc
+    }
+
+    /// Debug builds only (audio dump): model streams started so far (installs and resets).
+    #[cfg(debug_assertions)]
+    pub fn model_resets(&self) -> u32 {
+        self.model_resets
     }
 
     /// Removes the model so it can be reused (e.g. after the processing thread ends); the
@@ -307,6 +329,10 @@ impl Processor {
                     if let Some(sep) = self.separator.as_mut() {
                         // The model may hold stale or poisoned state (after an error).
                         sep.reset();
+                        #[cfg(debug_assertions)]
+                        {
+                            self.model_resets += 1;
+                        }
                         self.fallback = None;
                         self.warm_left = self.warm_frames;
                         self.stage = Stage::WarmingUp;
@@ -389,6 +415,10 @@ impl Processor {
     pub fn on_discontinuity(&mut self) {
         if let Some(sep) = self.separator.as_mut() {
             sep.reset();
+            #[cfg(debug_assertions)]
+            {
+                self.model_resets += 1;
+            }
         }
         let delay = match self.stage {
             Stage::Devocal | Stage::FadingOut => self.latency_frames,

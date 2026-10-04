@@ -30,6 +30,8 @@
 
 pub mod capture;
 mod confirm;
+#[cfg(debug_assertions)]
+mod dump;
 pub mod endpoint;
 mod processing;
 pub mod render;

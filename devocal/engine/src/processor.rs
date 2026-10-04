@@ -233,6 +233,11 @@ impl Processor {
         self.separator.as_ref().is_some_and(|s| s.overloaded())
     }
 
+    /// The installed model's [`Separator::window_stats`].
+    pub fn window_stats(&self) -> Option<(u64, f32)> {
+        self.separator.as_ref().and_then(|s| s.window_stats())
+    }
+
     /// Input discontinuity (seek, glitch): clears the model state and the passthrough delay.
     /// The stage is kept, except that a warm-up or fade-in in progress (re)starts the warm-up,
     /// so the fresh model state still gets the full warm-up before it becomes audible.

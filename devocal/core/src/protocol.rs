@@ -131,6 +131,13 @@ pub struct Metrics {
     pub device: Option<Device>,
     #[serde(default)]
     pub device_note: Option<DeviceNote>,
+    /// Window models: segments played dry (late or failed inference) since the model was
+    /// loaded. `None` for a streaming model or no model.
+    #[serde(default)]
+    pub window_timeouts: Option<u64>,
+    /// Window models: mean inference time / hop over the last 10 s of windows.
+    #[serde(default)]
+    pub window_duty: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -276,6 +283,8 @@ mod tests {
             input_silent_ms: 900,
             device: Some(Device::Gpu),
             device_note: Some(DeviceNote::GpuUnavailable),
+            window_timeouts: Some(4),
+            window_duty: Some(0.25),
         });
         let line = encode(&ev).unwrap();
         assert!(line.contains("\"event\":\"metrics\""));
@@ -283,6 +292,7 @@ mod tests {
         assert!(line.contains("\"inputSilentMs\":900"));
         assert!(line.contains("\"device\":\"gpu\""));
         assert!(line.contains("\"deviceNote\":\"gpu_unavailable\""));
+        assert!(line.contains("\"windowTimeouts\":4,\"windowDuty\":0.25"));
         assert_eq!(decode_event(&line).unwrap(), ev);
     }
 
@@ -315,6 +325,8 @@ mod tests {
             input_silent_ms: 4,
             device: None,
             device_note: None,
+            window_timeouts: None,
+            window_duty: None,
         });
         let line = encode(&ev).unwrap();
         match decode_event(&line).unwrap() {
@@ -362,7 +374,10 @@ mod tests {
         )
         .unwrap();
         match ev {
-            Event::Metrics(m) => assert_eq!((m.device, m.device_note), (None, None)),
+            Event::Metrics(m) => {
+                assert_eq!((m.device, m.device_note), (None, None));
+                assert_eq!((m.window_timeouts, m.window_duty), (None, None));
+            }
             other => panic!("unexpected {other:?}"),
         }
     }

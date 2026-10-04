@@ -317,6 +317,10 @@ impl Separator for WindowedSeparator {
             || (self.shared.duty_full.load(Ordering::Relaxed) && self.duty_10s() > DUTY_LIMIT)
     }
 
+    fn window_stats(&self) -> Option<(u64, f32)> {
+        Some((self.timeouts, self.duty_10s()))
+    }
+
     fn process(&mut self, input: &[f32], out_accompaniment: &mut [f32]) -> Result<(), String> {
         check_block(WINDOWED_HOP, input, out_accompaniment)?;
         if !input.iter().all(|s| s.is_finite()) {
@@ -887,6 +891,7 @@ mod tests {
             assert!(!sep.overloaded(), "overloaded after {} runs", sep.submitted);
         }
         assert_eq!(sep.timeouts(), 2);
+        assert_eq!(sep.window_stats(), Some((2, sep.duty_10s())));
     }
 
     #[test]

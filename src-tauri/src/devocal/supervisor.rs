@@ -1327,6 +1327,8 @@ mod tests {
             input_silent_ms: 0,
             device: None,
             device_note: None,
+            window_timeouts: None,
+            window_duty: None,
         })
     }
 
@@ -2220,6 +2222,8 @@ mod tests {
             input_silent_ms: 3_500,
             device: None,
             device_note: None,
+            window_timeouts: None,
+            window_duty: None,
         }));
         r.sup.tick(1_000, Some(p.clone()), true);
         let s = r.sup.status();

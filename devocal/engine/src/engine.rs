@@ -145,6 +145,9 @@ pub struct AudioSnapshot {
     /// Blocks silenced by the safety guard.
     pub unattenuated_blocks: u64,
     pub headroom_frames: u32,
+    /// [`Metrics::window_timeouts`] / [`Metrics::window_duty`] of the installed model.
+    pub window_timeouts: Option<u64>,
+    pub window_duty: Option<f32>,
 }
 
 /// The audio side as the engine core sees it: [`RealAudio`] wraps [`AudioHandle`]; tests use
@@ -1262,6 +1265,8 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             input_silent_ms: s.input_silent_ms,
             device: self.device.map(|(d, _)| d),
             device_note: self.device.and_then(|(_, n)| n),
+            window_timeouts: s.window_timeouts,
+            window_duty: s.window_duty,
         }));
     }
 }
@@ -1347,6 +1352,7 @@ impl AudioPort for RealAudio {
             return AudioSnapshot::default();
         };
         let s = &h.stats;
+        let (window_timeouts, window_duty) = s.window_stats();
         AudioSnapshot {
             underruns: s.underruns.load(Ordering::Relaxed),
             input_silent_ms: s.input_silent_ms.load(Ordering::Relaxed),
@@ -1354,6 +1360,8 @@ impl AudioPort for RealAudio {
             latency_ms: s.latency_ms_milli.load(Ordering::Relaxed) as f32 / 1000.0,
             unattenuated_blocks: s.unattenuated_blocks.load(Ordering::Relaxed),
             headroom_frames: s.headroom_frames.load(Ordering::Relaxed),
+            window_timeouts,
+            window_duty,
         }
     }
 
@@ -2522,6 +2530,8 @@ mod tests {
             latency_ms: 21.5,
             unattenuated_blocks: 0,
             headroom_frames: 0,
+            window_timeouts: Some(6),
+            window_duty: Some(0.125),
         });
         let m = metrics(&r.run(1_000));
         assert_eq!(m.len(), 1);
@@ -2531,6 +2541,7 @@ mod tests {
         assert_eq!(m.input_silent_ms, 40);
         assert_eq!(m.load_ratio, 0.25);
         assert_eq!(m.latency_ms, 21.5);
+        assert_eq!((m.window_timeouts, m.window_duty), (Some(6), Some(0.125)));
         assert!((m.attenuation - HELD_VOLUME / 0.8).abs() < 1e-9);
         assert!(m.attenuation_epoch >= 1);
     }

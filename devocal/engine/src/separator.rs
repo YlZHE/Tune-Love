@@ -25,6 +25,11 @@ pub trait Separator: Send {
     fn overloaded(&self) -> bool {
         false
     }
+    /// Window models: (segments played dry since load, 10 s duty). Cheap and lock-free like
+    /// `overloaded`; `None` for streaming models.
+    fn window_stats(&self) -> Option<(u64, f32)> {
+        None
+    }
 }
 
 /// Block size used by `DelayOnly`; matches StemgenRT.

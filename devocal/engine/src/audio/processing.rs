@@ -293,6 +293,7 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
         ctx.stats
             .load_ratio_milli
             .store((ratio * 1000.0).round() as u32, Ordering::Relaxed);
+        publish_window_stats(&ctx);
 
         if ctx.output.slots() >= st.hop * 2 {
             let _ = ctx.output.push_entire_slice(&st.out_block);
@@ -333,6 +334,21 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
 fn begin_gap(ctx: &mut ProcessingCtx, st: &mut State) {
     let _ = ctx.out_markers.push(st.out_pos);
     st.fade_in.start(ctx.processor.output_latency_frames());
+}
+
+/// The installed model's dry segments and duty for the metrics and the diag line (two relaxed
+/// stores, no allocation).
+fn publish_window_stats(ctx: &ProcessingCtx) {
+    let (plus1, duty) = ctx
+        .processor
+        .window_stats()
+        .map_or((0, 0.0), |(t, d)| (t + 1, d));
+    ctx.stats
+        .window_timeouts_plus1
+        .store(plus1, Ordering::Relaxed);
+    ctx.stats
+        .window_duty_bits
+        .store(duty.to_bits(), Ordering::Relaxed);
 }
 
 /// Spec 6: the window model's own timeouts / duty (an atomic read, no lock), for a block that
@@ -802,6 +818,25 @@ mod tests {
         fn overloaded(&self) -> bool {
             true
         }
+        fn window_stats(&self) -> Option<(u64, f32)> {
+            Some((5, 0.4))
+        }
+    }
+
+    /// Spec 8 / Task 9: the window model's dry segments and duty reach the engine's metrics
+    /// and the diag line; a streaming model reports none.
+    #[test]
+    fn window_stats_are_published() {
+        use crate::separator::DelayOnly;
+        let (ctx, _st) = ctx_for(Processor::new(Some(Box::new(Overloaded))));
+        publish_window_stats(&ctx);
+        assert_eq!(ctx.stats.window_stats(), (Some(5), Some(0.4)));
+        let (ctx, _st) = ctx_for(Processor::new(Some(Box::new(DelayOnly::new(HOP)))));
+        publish_window_stats(&ctx);
+        assert_eq!(ctx.stats.window_stats(), (None, None));
+        let (ctx, _st) = ctx_for(Processor::new(None));
+        publish_window_stats(&ctx);
+        assert_eq!(ctx.stats.window_stats(), (None, None));
     }
 
     /// Fix round 1: while a swap is pending the engine already reports the new model, so the

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { approxLatency, devocalLabel, devocalLabelKind, devocalNotice, isDevocalActive, parseDevocalStatus, OFF_STATUS, type DevocalStatus } from "./devocal";
+import { approxLatency, deviceLine, devocalLabel, devocalLabelKind, devocalNotice, isDevocalActive, parseDevocalStatus, OFF_STATUS, type DevocalStatus } from "./devocal";
 
 const status = (patch: Partial<DevocalStatus>): DevocalStatus => ({ ...OFF_STATUS, ...patch });
 
@@ -64,14 +64,14 @@ describe("devocalLabel", () => {
     expect(devocalLabel(status({ phase: "devocal", held: true, error: "model_load_failed: x" }))).toBe("去人声中");
   });
   it("tells a missing model apart from an engine that cannot start", () => {
-    expect(devocalLabel(status({ phase: "unavailable", error: "model_not_found" }))).toBe("未找到去人声模型，请在设置中下载");
+    expect(devocalLabel(status({ phase: "unavailable", error: "model_not_found:stemgenrt-hop128" }))).toBe("未找到去人声模型，请在设置中下载");
     expect(devocalLabel(status({ phase: "unavailable", error: "engine_unavailable: spawn failed" }))).toBe("去人声引擎无法启动");
     expect(devocalLabel(status({ phase: "unavailable", error: "engine_unavailable" }))).toBe("去人声引擎无法启动");
     expect(devocalLabel(status({ phase: "unavailable", error: null }))).toBe("未找到去人声模型，请在设置中下载");
     expect(devocalLabel(status({ phase: "unavailable", error: "no_model: x" }))).toBe("未找到去人声模型，请在设置中下载");
   });
   it("offers to open the model settings only for a missing model", () => {
-    expect(devocalNotice(status({ phase: "unavailable", error: "model_not_found" })))
+    expect(devocalNotice(status({ phase: "unavailable", error: "model_not_found:stemgenrt-hop128" })))
       .toEqual({ text: "未找到去人声模型，请在设置中下载", kind: "warning", action: "open-model-settings" });
     expect(devocalNotice(status({ phase: "unavailable", error: "engine_unavailable: spawn failed" })))
       .toEqual({ text: "去人声引擎无法启动", kind: "warning" });
@@ -102,7 +102,7 @@ describe("devocalLabelKind", () => {
     ["model load failed", { phase: "passthrough", held: true, error: "model_load_failed: x" }, "warning"],
     ["restarting", { phase: "restarting" }, "neutral"],
     ["failed", { phase: "failed" }, "warning"],
-    ["unavailable, model missing", { phase: "unavailable", error: "model_not_found" }, "warning"],
+    ["unavailable, model missing", { phase: "unavailable", error: "model_not_found:stemgenrt-hop128" }, "warning"],
     ["unavailable, engine missing", { phase: "unavailable", error: "engine_unavailable: x" }, "warning"],
     ["unavailable, no error", { phase: "unavailable" }, "warning"],
     ["passthrough while held", { phase: "passthrough", held: true }, "neutral"],
@@ -131,7 +131,8 @@ describe("isDevocalActive", () => {
 describe("parseDevocalStatus", () => {
   it("accepts a well-formed status", () => {
     const value = { phase: "devocal", held: true, latencyMs: 12, loadRatio: 0.4, fallbackReason: null,
-      sessionOverridden: false, inputSilent: false, waitingForPlayer: false, error: null };
+      sessionOverridden: false, inputSilent: false, waitingForPlayer: false, error: null,
+      modelId: "bytesep-mobilenet-1s", device: "gpu", deviceNote: null };
     expect(parseDevocalStatus(value)).toEqual(value);
     expect(parseDevocalStatus({ ...value, phase: "attaching", waitingForPlayer: true })?.waitingForPlayer).toBe(true);
   });
@@ -154,5 +155,48 @@ describe("approxLatency", () => {
     expect(approxLatency(72.4)).toBe("约 70 ms");
     expect(approxLatency(72.5)).toBe("约 75 ms");
     expect(approxLatency(0)).toBe("约 0 ms");
+  });
+});
+
+describe("device fields", () => {
+  it("parses model id, device and note, rejecting unknown values", () => {
+    const parsed = parseDevocalStatus({ phase: "devocal", modelId: "bytesep-mobilenet-1s", device: "gpu", deviceNote: "gpu_overloaded" });
+    expect(parsed).toMatchObject({ modelId: "bytesep-mobilenet-1s", device: "gpu", deviceNote: "gpu_overloaded" });
+    expect(parseDevocalStatus({ phase: "devocal", modelId: 3, device: "tpu", deviceNote: "x" }))
+      .toMatchObject({ modelId: null, device: null, deviceNote: null });
+    expect(parseDevocalStatus({ phase: "off" })).toMatchObject({ modelId: null, device: null, deviceNote: null });
+  });
+});
+
+describe("deviceLine", () => {
+  const live = (patch: Partial<DevocalStatus>) => status({ phase: "devocal", held: true, ...patch });
+  it("names the device in use", () => {
+    expect(deviceLine(live({ device: "gpu" }), "bytesep-mobilenet-1s")).toBe("正在使用：GPU");
+    expect(deviceLine(live({ device: "cpu" }), "bytesep-mobilenet-1s")).toBe("正在使用：CPU");
+  });
+  it("says so when auto fell back to the CPU", () => {
+    expect(deviceLine(live({ device: "cpu", deviceNote: "gpu_unavailable" }), "bytesep-mobilenet-1s")).toBe("GPU 不可用，已改用 CPU");
+    expect(deviceLine(live({ device: "cpu", deviceNote: "gpu_check_failed" }), "bytesep-mobilenet-1s")).toBe("GPU 不可用，已改用 CPU");
+  });
+  it("says a GPU-only model cannot run", () => {
+    expect(deviceLine(status({ phase: "passthrough", held: true, error: "gpu_required: no gpu" }), "htdemucs-ft-vocals-1s"))
+      .toBe("所选模型需要 GPU，当前不可用");
+    expect(devocalLabel(status({ phase: "passthrough", held: true, error: "gpu_required: no gpu" }))).toBe("所选模型需要 GPU，当前不可用");
+    expect(devocalLabelKind(status({ phase: "passthrough", held: true, error: "gpu_required: no gpu" }))).toBe("warning");
+  });
+  it("tells an overload switch to StemgenRT from one to the CPU", () => {
+    expect(deviceLine(live({ device: "cpu", modelId: "stemgenrt-hop128", deviceNote: "gpu_overloaded" }), "htdemucs-ft-vocals-1s"))
+      .toBe("GPU 负载过高，已改用 StemgenRT");
+    expect(deviceLine(live({ device: "cpu", modelId: "bytesep-mobilenet-1s", deviceNote: "gpu_overloaded" }), "bytesep-mobilenet-1s"))
+      .toBe("GPU 负载过高，已改用 CPU");
+    expect(deviceLine(live({ device: "cpu", modelId: "stemgenrt-hop128", deviceNote: "gpu_overloaded" }), "stemgenrt-hop128"))
+      .toBe("GPU 负载过高，已改用 CPU");
+  });
+  it("shows the model-load failure of an explicit GPU choice", () => {
+    expect(deviceLine(status({ phase: "passthrough", held: true, error: "model_load_failed: dml" }), "bytesep-mobilenet-1s"))
+      .toBe("去人声模型加载失败，已保持原声");
+  });
+  it("shows nothing before the engine reports", () => {
+    expect(deviceLine(OFF_STATUS, "stemgenrt-hop128")).toBeNull();
   });
 });

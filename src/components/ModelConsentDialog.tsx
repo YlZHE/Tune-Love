@@ -23,7 +23,9 @@ export function ModelConsentDialog({ model, mirrorPrefix, onAccept, onCancel }: 
     <AlertDialog.Content maxWidth="520px" className="model-consent">
       <AlertDialog.Title>下载去人声模型</AlertDialog.Title>
       {model && <AlertDialogPrimitive.Description asChild><div className="model-consent-body">
-        <p>模型：{model.name}。用于实时去人声；模型不随安装包发布，需要下载到本机。</p>
+        <p>模型：{model.name}。{model.tier === "quality"
+          ? `高质量去人声，有附加延迟，歌词可能与播放不同步${model.devices.cpu ? "" : "；仅支持 GPU"}`
+          : "用于实时去人声"}；模型不随安装包发布，需要下载到本机。</p>
         <p>来源：{model.source}{commit && <>，固定提交 <code>{commit}</code></>}。</p>
         <div>
           <p>大小：{formatMiB(modelTotalBytes(model))} MB（{modelTotalBytes(model).toLocaleString("en-US")} 字节）</p>

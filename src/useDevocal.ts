@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { readDevocalModelPreference } from "./devocalModelPreferences";
 import { isDevocalActive, OFF_STATUS, parseDevocalStatus, type DevocalStatus } from "./devocal";
 
 type DevocalAction = "enable" | "disable" | "release";
@@ -43,7 +44,7 @@ export function useDevocal(): { status: DevocalStatus; enabled: boolean; toggle(
     epoch.current++;
     if (action === "enable" && mounted.current) setEnabling(true);
     try {
-      const next = parseDevocalStatus(await invoke("devocal_command", { request: { action } }));
+      const next = parseDevocalStatus(await invoke("devocal_command", { request: action === "enable" ? { action, ...readDevocalModelPreference() } : { action } }));
       if (mounted.current && next) setStatus(next);
     } finally {
       epoch.current++;

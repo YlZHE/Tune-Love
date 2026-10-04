@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Button, TextField } from "@radix-ui/themes";
+import { Button, RadioGroup, TextField } from "@radix-ui/themes";
 import { UserSound } from "@phosphor-icons/react";
 import { isValidMirrorPrefix, readMirrorPrefix, saveMirrorPrefix } from "../modelDownload";
 import { useDevocal } from "../useDevocal";
+import { deviceLine } from "../devocal";
+import { setDevocalModelPreference, useDevocalModelPreference, type DevocalDevice } from "../devocalModelPreferences";
 import type { SettingsSectionRequest } from "../settingsSection";
 import { ModelSection } from "./ModelSection";
 import "./DevocalSettings.css";
@@ -26,6 +28,27 @@ function MirrorPrefixField() {
       {invalid && <p role="alert" className="color-error">须以 https:// 开头、以 / 结尾；未保存，不使用自定义前缀</p>}
     </div>
   </details>;
+}
+
+// Compute device: a saved preference sent with the next enable. The line below shows what the
+// engine reported for the device actually in use (nothing while it is not running).
+function DeviceSection({ onError }: { onError(text: string): void }) {
+  const selection = useDevocalModelPreference();
+  const { status } = useDevocal();
+  const choose = (device: string) => {
+    try { setDevocalModelPreference({ ...selection, device: device as DevocalDevice }); onError(""); }
+    catch { onError("未能保存计算设备选择，请重试"); }
+  };
+  return <div className="model-device">
+    <h3 id="devocal-device-title">计算设备</h3>
+    <RadioGroup.Root className="model-device-options" orientation="horizontal" aria-labelledby="devocal-device-title"
+      value={selection.device} onValueChange={choose}>
+      <RadioGroup.Item value="auto">自动</RadioGroup.Item>
+      <RadioGroup.Item value="cpu">CPU</RadioGroup.Item>
+      <RadioGroup.Item value="gpu">GPU</RadioGroup.Item>
+    </RadioGroup.Root>
+    <p className="model-row-note devocal-device-status" aria-live="polite">{deviceLine(status, selection.modelId)}</p>
+  </div>;
 }
 
 // `request` says how settings were last opened. From the main window's missing-model hint
@@ -56,6 +79,7 @@ export function DevocalSettings({ request = null }: { request?: SettingsSectionR
         <p>开启去人声后，本应用会接管当前播放器的声音输出。音量合成器里播放器那一栏接近 0 是正常的，声音由本应用发出；要调音量请调本应用。点‘释放播放器’可立即交还。</p></div>
     </div>
     <ModelSection autoEnablePending={autoEnablePending} onAutoEnableConsumed={consumeAutoEnable} focusSeq={focusSeq} />
+    <DeviceSection onError={setError} />
     <div className="devocal-settings-actions">
       <Button variant="soft" color="gray" disabled={!status.held}
         onClick={() => { setError(""); release().catch(() => setError("未能释放播放器，请重试")); }}>释放播放器</Button>

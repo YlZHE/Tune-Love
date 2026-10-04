@@ -1,3 +1,5 @@
+import { STEMGENRT_ID } from "./modelDownload";
+
 export type DevocalPhase = "off" | "attaching" | "passthrough" | "devocal" | "fallback" | "releasing" | "restarting" | "failed" | "unavailable";
 
 export interface DevocalStatus {
@@ -12,11 +14,16 @@ export interface DevocalStatus {
   // phase, so an older reader still sees "attaching"; missing means false.
   waitingForPlayer: boolean;
   error: string | null;
+  // The model actually running (differs from the selection after a GPU-overload switch).
+  modelId: string | null;
+  device: "cpu" | "gpu" | null;
+  deviceNote: "gpu_unavailable" | "gpu_check_failed" | "gpu_overloaded" | null;
 }
 
 export const OFF_STATUS: DevocalStatus = {
   phase: "off", held: false, latencyMs: null, loadRatio: null, fallbackReason: null,
   sessionOverridden: false, inputSilent: false, waitingForPlayer: false, error: null,
+  modelId: null, device: null, deviceNote: null,
 };
 
 const PHASES: readonly DevocalPhase[] = ["off", "attaching", "passthrough", "devocal", "fallback", "releasing", "restarting", "failed", "unavailable"];
@@ -44,6 +51,9 @@ export function parseDevocalStatus(value: unknown): DevocalStatus | null {
     inputSilent: raw.inputSilent === true,
     waitingForPlayer: raw.waitingForPlayer === true,
     error: typeof raw.error === "string" ? raw.error : null,
+    modelId: typeof raw.modelId === "string" ? raw.modelId : null,
+    device: raw.device === "cpu" || raw.device === "gpu" ? raw.device : null,
+    deviceNote: raw.deviceNote === "gpu_unavailable" || raw.deviceNote === "gpu_check_failed" || raw.deviceNote === "gpu_overloaded" ? raw.deviceNote : null,
   };
 }
 
@@ -64,6 +74,9 @@ export const approxLatency = (ms: number): string => `约 ${Math.round(ms / 5) *
 // The engine has no usable model (gave up loading it, or has none loaded).
 const modelFailed = (error: string | null) => !!error && (error.startsWith("model_load_failed") || error.startsWith("no_model"));
 
+const GPU_REQUIRED_TEXT = "所选模型需要 GPU，当前不可用";
+const gpuRequired = (error: string | null) => !!error && error.startsWith("gpu_required");
+
 // First matching row wins. null means "show nothing".
 export function devocalNotice(s: DevocalStatus): DevocalNotice | null {
   if (s.sessionOverridden) return warning("播放器音量被调整，请调本应用音量");
@@ -77,6 +90,7 @@ export function devocalNotice(s: DevocalStatus): DevocalNotice | null {
   if (s.phase === "failed") return warning("去人声引擎多次异常，已保持原声");
   if (s.phase === "unavailable" && s.error?.startsWith("engine_unavailable")) return warning("去人声引擎无法启动");
   if (s.phase === "unavailable") return { text: "未找到去人声模型，请在设置中下载", kind: "warning", action: "open-model-settings" };
+  if (gpuRequired(s.error)) return warning(GPU_REQUIRED_TEXT);
   if (modelFailed(s.error)) return warning("去人声模型加载失败，已保持原声");
   if (s.phase === "passthrough" && s.held) return neutral("原声直通");
   return null;
@@ -88,3 +102,15 @@ export const devocalLabel = (s: DevocalStatus): string | null => {
   return notice ? notice.text + (notice.detail ?? "") : null;
 };
 export const devocalLabelKind = (s: DevocalStatus): DevocalLabelKind | null => devocalNotice(s)?.kind ?? null;
+
+// The compute-device line in settings. `selectedModelId` is the user's choice; the status
+// carries the model that is actually running. Null (engine not running) shows nothing.
+export function deviceLine(s: DevocalStatus, selectedModelId: string): string | null {
+  if (gpuRequired(s.error)) return GPU_REQUIRED_TEXT;
+  if (s.deviceNote === "gpu_overloaded")
+    return s.modelId === STEMGENRT_ID && selectedModelId !== STEMGENRT_ID ? "GPU 负载过高，已改用 StemgenRT" : "GPU 负载过高，已改用 CPU";
+  if (s.device === "gpu") return "正在使用：GPU";
+  if (s.device === "cpu") return s.deviceNote ? "GPU 不可用，已改用 CPU" : "正在使用：CPU";
+  // An explicit GPU choice that cannot load reports the load failure, not a CPU fallback.
+  return modelFailed(s.error) ? "去人声模型加载失败，已保持原声" : null;
+}

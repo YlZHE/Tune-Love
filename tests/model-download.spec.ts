@@ -364,7 +364,7 @@ const emitEvent = (page: Page, event: string, payload: unknown) => page.evaluate
 const AUTO_ENABLE_NOTE = "下载完成后将自动开启去人声";
 
 test("main: the missing-model warning opens settings at the model row", async ({ page }) => {
-  await prepare(page, "/", { devocal: { phase: "unavailable", error: "model_not_found" } });
+  await prepare(page, "/", { devocal: { phase: "unavailable", error: "model_not_found:stemgenrt-hop128" } });
   const warning = page.locator(".devocal-warning[aria-live=polite]");
   const button = warning.getByRole("button", { name: "未找到去人声模型，请在设置中下载", exact: true });
   // Visible without hovering the window, and still the only announced text.

@@ -47,6 +47,8 @@ async function prepare(page: Page, view = "/", initial: Record<string, unknown> 
 
 const reveal = (page: Page) => page.locator(".music-window").hover({ position: { x: 18, y: 45 } });
 const requests = (page: Page) => page.evaluate(() => (window as any).devocalRequests as { action: string }[]);
+// Every enable carries the saved selection (the default here: StemgenRT on auto).
+const ENABLE = { action: "enable", modelId: "stemgenrt-hop128", device: "auto" };
 
 test("the toggle sends enable then disable and follows the reported status", async ({ page }) => {
   await prepare(page); await reveal(page);
@@ -56,10 +58,10 @@ test("the toggle sends enable then disable and follows the reported status", asy
   const on = page.getByRole("button", { name: "关闭去人声", exact: true });
   await expect(on).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByText("去人声中 · 延迟约 45 ms", { exact: true })).toBeVisible();
-  expect(await requests(page)).toEqual([{ action: "enable" }]);
+  expect(await requests(page)).toEqual([ENABLE]);
   await on.click();
   await expect(page.getByRole("button", { name: "开启去人声", exact: true })).toHaveAttribute("aria-pressed", "false");
-  expect(await requests(page)).toEqual([{ action: "enable" }, { action: "disable" }]);
+  expect(await requests(page)).toEqual([ENABLE, { action: "disable" }]);
   await expect(page.getByText(/去人声中/)).toHaveCount(0);
   await expect(page.getByText("原声直通", { exact: true })).toBeVisible();
 });
@@ -88,7 +90,7 @@ test("the button shows pressed while enabling and ignores clicks until the reque
   await expect(pending).toHaveAttribute("aria-pressed", "true");
   await pending.click({ clickCount: 3, delay: 20 });
   await expect(page.getByText("去人声中 · 延迟约 45 ms", { exact: true })).toBeVisible();
-  expect(await requests(page)).toEqual([{ action: "enable" }]);
+  expect(await requests(page)).toEqual([ENABLE]);
 });
 
 test("a rejected enable restores the button and tells the user", async ({ page }) => {
@@ -98,7 +100,7 @@ test("a rejected enable restores the button and tells the user", async ({ page }
   await page.getByRole("button", { name: "开启去人声", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("去人声未能切换");
   await expect(page.getByRole("button", { name: "开启去人声", exact: true })).toHaveAttribute("aria-pressed", "false");
-  expect(await requests(page)).toEqual([{ action: "enable" }]);
+  expect(await requests(page)).toEqual([ENABLE]);
 });
 
 test("a rejected enable shows the Error message when there is one", async ({ page }) => {
@@ -139,7 +141,7 @@ test("a warning stays visible without hover but a neutral label waits for hover"
 });
 
 test("only one polite live region carries text at a time", async ({ page }) => {
-  await prepare(page, "/", { phase: "unavailable", error: "model_not_found" });
+  await prepare(page, "/", { phase: "unavailable", error: "model_not_found:stemgenrt-hop128" });
   await expect(page.getByText("未找到去人声模型，请在设置中下载", { exact: true })).toHaveCount(1);
   await expect.poll(() => page.locator(".devocal-warning, .devocal-status").evaluateAll(els => els.filter(el => el.textContent).length)).toBe(1);
   await page.evaluate(() => { (window as any).devocal = { ...(window as any).devocal, phase: "passthrough", held: true, error: null }; });
@@ -185,7 +187,7 @@ test("clicking the toggle after a fallback retries devocal", async ({ page }) =>
   await expect(button).toHaveAttribute("aria-pressed", "false");
   await button.click();
   await expect(page.getByRole("button", { name: "关闭去人声", exact: true })).toHaveAttribute("aria-pressed", "true");
-  expect(await requests(page)).toEqual([{ action: "enable" }]);
+  expect(await requests(page)).toEqual([ENABLE]);
   await expect(page.getByText("性能不足，已退回原声")).toHaveCount(0);
   await expect(page.getByText("去人声中 · 延迟约 45 ms", { exact: true })).toBeVisible();
 });
@@ -197,7 +199,7 @@ test("a model that failed to load is a visible warning and the toggle retries it
   await expect(page.locator(".footer-controls")).toHaveCSS("opacity", "0");
   await reveal(page);
   await page.getByRole("button", { name: "开启去人声", exact: true }).click();
-  expect(await requests(page)).toEqual([{ action: "enable" }]);
+  expect(await requests(page)).toEqual([ENABLE]);
   await expect(warning).toHaveCount(0);
 });
 

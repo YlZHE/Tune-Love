@@ -76,7 +76,8 @@
 //! fallback. "On" requested while a load is pending is sent after the model is installed;
 //! a failed load clears it. A new audio run starts "off" and gets the user's toggle once.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -94,6 +95,7 @@ use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCES
 use crate::audio::endpoint::session_endpoint;
 use crate::audio::{now_us, AudioConfig, AudioHandle, SharedGains};
 use crate::dsp::SAMPLE_RATE;
+use crate::gpu_check::{gpu_check, run_window, PASS_SDR_DB};
 use crate::holder::{AttachRamp, Holder, HolderPhase, CONFIRM_WINDOW_US};
 use crate::notify::{SessionSignals, SessionWatcher};
 use crate::ort_window::{resolve_device, window_params, OrtWindowModel};
@@ -171,6 +173,10 @@ pub trait AudioPort {
     fn take_fallback_log(&self) -> Option<String> {
         None
     }
+    /// A window model reported its own overload since the last call (cleared by the call).
+    fn take_window_overload(&self) -> bool {
+        false
+    }
     fn stats(&self) -> AudioSnapshot;
     /// Frames captured from the player since the audio started (0 while stopped).
     fn input_frames(&self) -> u64;
@@ -187,6 +193,9 @@ pub struct ModelSpec {
     pub device: String,
     pub threads: u16,
     pub windowed: Option<WindowedSpec>,
+    /// Set by the engine (never by the app): this model fell behind on the GPU earlier in
+    /// this session, so the GPU is not used for it again (spec 6).
+    pub gpu_banned: bool,
 }
 
 /// A loaded model and the device it runs on (`note`: why it is not on the GPU although
@@ -219,51 +228,99 @@ pub type LoadResult = mpsc::Receiver<Result<Loaded, LoadFailure>>;
 /// receiver dropped before the result arrives abandons the load.
 pub type ModelLoader = Box<dyn FnMut(&ModelSpec) -> LoadResult>;
 
+/// Why the GPU was refused for a window model: the note for `auto` and the message for an
+/// explicit `gpu` (or a GPU-only model).
+type GpuRefusal = (DeviceNote, String);
+
+/// Device and note for a window model (spec 4.4 and 6). `gpu_probe` is asked only when the
+/// GPU is a candidate and the model is not banned from it.
+fn choose_device(
+    spec: &ModelSpec,
+    gpu_probe: impl FnOnce() -> Result<(), GpuRefusal>,
+) -> Result<(Device, Option<DeviceNote>), LoadFailure> {
+    let mut refused: Option<GpuRefusal> = None;
+    let device = resolve_device(&spec.device, &spec.windowed, || {
+        let r = if spec.gpu_banned {
+            Err((
+                DeviceNote::GpuOverloaded,
+                "the GPU was overloaded (fell behind) earlier in this session".to_string(),
+            ))
+        } else {
+            gpu_probe()
+        };
+        refused = r.err();
+        refused.is_none()
+    })
+    .map_err(|code| {
+        let why = refused.as_ref().map_or_else(
+            || "this model has no path on the selected device".to_string(),
+            |(_, m)| m.clone(),
+        );
+        let message = match code {
+            ErrorCode::BadDevice => format!(
+                "device {:?} is not supported (auto, cpu or gpu)",
+                spec.device
+            ),
+            ErrorCode::GpuRequired => format!("this model runs on the GPU only; {why}"),
+            _ => why,
+        };
+        LoadFailure { code, message }
+    })?;
+    // A refusal that still loads is `auto` falling back to the CPU.
+    Ok((device, refused.map(|(note, _)| note)))
+}
+
 /// Builds the separator for `spec`: StemgenRT (CPU) or a window model on the device
 /// [`resolve_device`] picks. Blocking (session creation, warm-up); runs on a loader thread.
 fn load_model(spec: &ModelSpec) -> Result<Loaded, LoadFailure> {
-    let bad = |code| LoadFailure {
-        code,
-        message: format!(
-            "device {:?} is not supported (auto, cpu or gpu)",
-            spec.device
-        ),
-    };
     let Some(w) = &spec.windowed else {
-        resolve_device(&spec.device, &None, || false).map_err(bad)?;
+        // StemgenRT: CPU only; validates the device, never probes the GPU.
+        choose_device(spec, || Ok(()))?;
         return Ok(Loaded {
             separator: Box::new(StemgenRt::load(&spec.path, spec.threads)?),
             device: Device::Cpu,
             note: None,
         });
     };
-    // The GPU probe is the real GPU session (kept when it works).
-    let mut gpu: Option<Result<OrtWindowModel, String>> = None;
-    let device = resolve_device(&spec.device, &spec.windowed, || {
-        let r = OrtWindowModel::load(&spec.path, Device::Gpu, 1, w.vocals_index);
-        let ok = r.is_ok();
-        gpu = Some(r);
-        ok
-    })
-    .map_err(|code| {
-        let why = match &gpu {
-            Some(Err(e)) => format!("the GPU (DirectML) is not usable: {e}"),
-            _ => "this model has no path on the selected device".to_string(),
-        };
-        match code {
-            ErrorCode::BadDevice => bad(code),
-            ErrorCode::GpuRequired => LoadFailure {
-                code,
-                message: format!("this model runs on the GPU only; {why}"),
+    // The GPU probe is the real GPU session (kept when it passes the self-check). The CPU
+    // reference session exists only while a self-check runs (cache miss).
+    let mut gpu: Option<OrtWindowModel> = None;
+    let (device, note) = choose_device(spec, || {
+        let mut m =
+            OrtWindowModel::load(&spec.path, Device::Gpu, 1, w.vocals_index).map_err(|e| {
+                (
+                    DeviceNote::GpuUnavailable,
+                    format!("the GPU (DirectML) is not usable: {e}"),
+                )
+            })?;
+        let models_dir = spec.path.parent().unwrap_or(Path::new("."));
+        let passed = gpu_check(
+            models_dir,
+            &spec.path,
+            |x| run_window(&mut m, x),
+            |x| {
+                let mut cpu =
+                    OrtWindowModel::load(&spec.path, Device::Cpu, w.cpu_threads, w.vocals_index)?;
+                run_window(&mut cpu, x)
             },
-            _ => LoadFailure { code, message: why },
+        );
+        if !passed {
+            return Err((
+                DeviceNote::GpuCheckFailed,
+                format!(
+                    "the GPU self-check failed (SDR of the GPU output against the CPU's \
+                     below {PASS_SDR_DB} dB)"
+                ),
+            ));
         }
+        gpu = Some(m);
+        Ok(())
     })?;
     let params = window_params(w, device)?;
     let model = match device {
         Device::Gpu => gpu
             .take()
-            .ok_or_else(|| "GPU session missing".to_string())??,
+            .ok_or_else(|| "GPU session missing".to_string())?,
         Device::Cpu => {
             OrtWindowModel::load(&spec.path, Device::Cpu, w.cpu_threads, w.vocals_index)?
         }
@@ -276,8 +333,6 @@ fn load_model(spec: &ModelSpec) -> Result<Loaded, LoadFailure> {
         )
         .into());
     }
-    let note = (spec.device == "auto" && device == Device::Cpu && matches!(gpu, Some(Err(_))))
-        .then_some(DeviceNote::GpuUnavailable);
     Ok(Loaded {
         separator: Box::new(WindowedSeparator::new(Box::new(model), params)),
         device,
@@ -380,6 +435,9 @@ pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     model: Option<ModelSpec>,
     /// Device (and why not the GPU) of `model`, reported in the metrics.
     device: Option<(Device, Option<DeviceNote>)>,
+    /// Models that fell behind on the GPU in this engine process (spec 6): every later load
+    /// of them is marked `gpu_banned`.
+    gpu_banned: HashSet<String>,
     /// A loaded model waiting for the next audio start.
     staged: Option<Box<dyn Separator>>,
     pending_load: Option<PendingLoad>,
@@ -428,6 +486,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             loader,
             model: None,
             device: None,
+            gpu_banned: HashSet::new(),
             staged: None,
             pending_load: None,
             phase: Phase::Idle,
@@ -547,6 +606,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
                     device,
                     threads,
                     windowed,
+                    gpu_banned: false,
                 },
                 now_us,
                 &mut ev,
@@ -564,6 +624,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         self.poll_model(now_us, &mut ev);
         self.start_pending_attach(now_us, &mut ev);
         self.check_audio(now_us, &mut ev);
+        self.check_window_overload();
         self.step_holder(now_us, &mut ev);
         self.periodic(now_us, &mut ev);
         self.gains
@@ -744,9 +805,50 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
     }
 
     /// Starts a load; a pending older one is abandoned (its result is dropped on its worker).
-    fn start_load(&mut self, spec: ModelSpec, reload: bool) {
+    fn start_load(&mut self, mut spec: ModelSpec, reload: bool) {
+        spec.gpu_banned = self.gpu_banned.contains(&spec.id);
         let rx = (self.loader)(&spec);
         self.pending_load = Some(PendingLoad { spec, reload, rx });
+    }
+
+    /// Spec 6, a window model that fell behind (the processing thread already forced
+    /// `Fallback(Overload)` and does not retry it). On the GPU the model is banned from the
+    /// GPU for this session; a model with a CPU path is reloaded on the CPU through the usual
+    /// swap, a GPU-only one stays in the fallback for the app to replace. On the CPU it is a
+    /// plain overload.
+    fn check_window_overload(&mut self) {
+        if !self.audio.take_window_overload() {
+            return;
+        }
+        let (Some(spec), Some((Device::Gpu, _))) = (&self.model, self.device) else {
+            return;
+        };
+        eprintln!(
+            "devocal engine: model {} fell behind on the GPU; no GPU for it in this session",
+            spec.id
+        );
+        self.gpu_banned.insert(spec.id.clone());
+        self.device = Some((Device::Gpu, Some(DeviceNote::GpuOverloaded)));
+        let has_cpu = spec
+            .windowed
+            .as_ref()
+            .is_some_and(|w| w.cpu_hop_ms.is_some());
+        match &self.pending_load {
+            None if has_cpu => {
+                let spec = ModelSpec {
+                    device: "auto".into(),
+                    ..spec.clone()
+                };
+                self.start_load(spec, false);
+            }
+            // A newer load of this model started before the ban: restart it under the ban.
+            // Any other newer load simply wins.
+            Some(p) if p.spec.id == spec.id && !p.spec.gpu_banned => {
+                let (spec, reload) = (p.spec.clone(), p.reload);
+                self.start_load(spec, reload);
+            }
+            _ => {}
+        }
     }
 
     /// Installs or reports a finished load.
@@ -1229,6 +1331,12 @@ impl AudioPort for RealAudio {
         self.handle.as_ref().and_then(|h| h.take_fallback_log())
     }
 
+    fn take_window_overload(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|h| h.take_window_overload())
+    }
+
     fn stats(&self) -> AudioSnapshot {
         let Some(h) = &self.handle else {
             return AudioSnapshot::default();
@@ -1615,6 +1723,8 @@ mod tests {
         /// Captured frames reported by `input_frames`; `None` = `u64::MAX` (plenty of
         /// reference audio, so `begin_attach` runs on the first tick as before).
         input_frames: Option<u64>,
+        /// A window model overload waiting for `take_window_overload`.
+        window_overload: bool,
     }
 
     /// Audio double: records every call; the test sets stage, failures and stats.
@@ -1655,6 +1765,11 @@ mod tests {
         }
         fn set_input_frames(&self, frames: u64) {
             self.0.borrow_mut().input_frames = Some(frames);
+        }
+        /// The processing thread forced `Fallback(Overload)` for a window model overload.
+        fn window_overload(&self) {
+            self.set_stage(Stage::Fallback, Some(FallbackReason::Overload));
+            self.0.borrow_mut().window_overload = true;
         }
     }
 
@@ -1726,6 +1841,9 @@ mod tests {
         }
         fn take_follow_request(&self) -> bool {
             std::mem::take(&mut self.0.borrow_mut().follow_request)
+        }
+        fn take_window_overload(&self) -> bool {
+            std::mem::take(&mut self.0.borrow_mut().window_overload)
         }
         fn stats(&self) -> AudioSnapshot {
             self.st().stats
@@ -1801,11 +1919,14 @@ mod tests {
         calls: usize,
         manual: bool,
         pending: Vec<(ModelSpec, LoadSender)>,
+        /// The spec of the latest load.
+        last: Option<ModelSpec>,
         resets: Arc<AtomicUsize>,
     }
 
     /// A `TestSep` for any path except `*bad.onnx` (load error) and `*gpureq.onnx`
-    /// (`GpuRequired`). Device: `gpu` -> Gpu, `auto` -> Cpu with a GpuUnavailable note.
+    /// (`GpuRequired`). Device: `gpu` -> Gpu, `auto` -> Cpu with a GpuUnavailable note. A
+    /// GPU-banned spec mirrors `choose_device`: `gpu` fails, `auto` is Cpu + GpuOverloaded.
     fn fake_load(spec: &ModelSpec, resets: &Arc<AtomicUsize>) -> Result<Loaded, LoadFailure> {
         let path = spec.path.to_string_lossy();
         if path.ends_with("bad.onnx") {
@@ -1815,8 +1936,11 @@ mod tests {
                 code: ErrorCode::GpuRequired,
                 message: "needs the GPU".into(),
             })
+        } else if spec.gpu_banned && spec.device == "gpu" {
+            Err("the GPU fell behind (overloaded)".to_string().into())
         } else {
             let (device, note) = match spec.device.as_str() {
+                "auto" if spec.gpu_banned => (Device::Cpu, Some(DeviceNote::GpuOverloaded)),
                 "gpu" => (Device::Gpu, None),
                 "auto" => (Device::Cpu, Some(DeviceNote::GpuUnavailable)),
                 _ => (Device::Cpu, None),
@@ -1837,6 +1961,7 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             let mut l = loads.borrow_mut();
             l.calls += 1;
+            l.last = Some(spec.clone());
             if l.manual {
                 l.pending.push((spec.clone(), tx));
             } else {
@@ -2086,6 +2211,187 @@ mod tests {
         assert!(error_messages(&ev)[0].contains("needs the GPU"));
         let ev = r.send(Command::SetMode { devocal: true });
         assert_eq!(errors(&ev), vec![ErrorCode::NoModel]);
+    }
+
+    /// A window model like bytesep (`cpu`: has a CPU hop) or HTDemucs (GPU only).
+    fn windowed_spec(cpu: bool) -> WindowedSpec {
+        WindowedSpec {
+            window_ms: 1000,
+            lookahead_ms: 100,
+            gpu_hop_ms: Some(300),
+            cpu_hop_ms: cpu.then_some(300),
+            cpu_threads: 2,
+            vocals_index: 0,
+        }
+    }
+
+    fn set_windowed(id: &str, device: &str, cpu: bool) -> Command {
+        Command::SetModel {
+            id: id.into(),
+            path: PathBuf::from(format!("{id}.onnx")),
+            device: device.into(),
+            threads: 1,
+            windowed: Some(windowed_spec(cpu)),
+        }
+    }
+
+    fn spec(device: &str, cpu: bool, gpu_banned: bool) -> ModelSpec {
+        ModelSpec {
+            id: "m".into(),
+            path: PathBuf::from("m.onnx"),
+            device: device.into(),
+            threads: 1,
+            windowed: Some(windowed_spec(cpu)),
+            gpu_banned,
+        }
+    }
+
+    fn no_probe() -> Result<(), GpuRefusal> {
+        panic!("the GPU must not be probed here")
+    }
+
+    #[test]
+    fn a_failed_self_check_gives_auto_the_cpu_and_gpu_an_error() {
+        use DeviceNote::*;
+        let refuse = |note| move || Err((note, format!("refused: {note:?}")));
+        assert_eq!(
+            choose_device(&spec("auto", true, false), refuse(GpuCheckFailed)).unwrap(),
+            (Device::Cpu, Some(GpuCheckFailed))
+        );
+        let e = choose_device(&spec("gpu", true, false), refuse(GpuCheckFailed)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::ModelLoadFailed);
+        assert!(e.message.contains("GpuCheckFailed"), "{}", e.message);
+        let e = choose_device(&spec("auto", false, false), refuse(GpuCheckFailed)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::GpuRequired);
+        assert!(e.message.contains("GpuCheckFailed"), "{}", e.message);
+        // DirectML unavailable: as before.
+        assert_eq!(
+            choose_device(&spec("auto", true, false), refuse(GpuUnavailable)).unwrap(),
+            (Device::Cpu, Some(GpuUnavailable))
+        );
+        // Usable GPU; explicit CPU never probes.
+        assert_eq!(
+            choose_device(&spec("auto", true, false), || Ok(())).unwrap(),
+            (Device::Gpu, None)
+        );
+        assert_eq!(
+            choose_device(&spec("cpu", true, false), no_probe).unwrap(),
+            (Device::Cpu, None)
+        );
+        let e = choose_device(&spec("dml", true, false), no_probe).unwrap_err();
+        assert_eq!(e.code, ErrorCode::BadDevice);
+    }
+
+    #[test]
+    fn a_gpu_banned_model_is_not_probed_and_reports_the_overload() {
+        assert_eq!(
+            choose_device(&spec("auto", true, true), no_probe).unwrap(),
+            (Device::Cpu, Some(DeviceNote::GpuOverloaded))
+        );
+        let e = choose_device(&spec("gpu", true, true), no_probe).unwrap_err();
+        assert_eq!(e.code, ErrorCode::ModelLoadFailed);
+        assert!(e.message.contains("overloaded"), "{}", e.message);
+        assert_eq!(
+            choose_device(&spec("cpu", true, true), no_probe).unwrap(),
+            (Device::Cpu, None)
+        );
+        let e = choose_device(&spec("auto", false, true), no_probe).unwrap_err();
+        assert_eq!(e.code, ErrorCode::GpuRequired);
+    }
+
+    /// hello, a window model on the GPU, attach, devocal on.
+    fn attached_with(tag: &str, model: Command) -> Rig {
+        let mut r = Rig::new(tag);
+        r.send(Command::Hello { version: PROTOCOL });
+        assert!(errors(&r.send(model)).is_empty());
+        r.send(attach());
+        r.run(100);
+        r.send(Command::SetMode { devocal: true });
+        r.run(10);
+        assert_eq!(r.core.phase(), Phase::Active);
+        assert_eq!(r.loads(), 1);
+        r
+    }
+
+    fn last_metrics(ev: &[Event]) -> devocal_core::protocol::Metrics {
+        metrics(ev).pop().expect("metrics")
+    }
+
+    #[test]
+    fn a_gpu_overload_of_a_cpu_capable_model_reloads_it_on_the_cpu_for_the_session() {
+        let mut r = attached_with("overload-cpu", set_windowed("bytesep", "gpu", true));
+        r.audio().window_overload();
+        let ev = r.run(1_100);
+        assert_eq!(r.loads(), 2, "reloaded");
+        let last = r.loads.borrow().last.clone().unwrap();
+        assert_eq!((last.device.as_str(), last.gpu_banned), ("auto", true));
+        assert_eq!(
+            r.audio().st().separators,
+            1,
+            "swapped through set_separator"
+        );
+        let m = last_metrics(&ev);
+        assert_eq!(
+            (m.device, m.device_note),
+            (Some(Device::Cpu), Some(DeviceNote::GpuOverloaded))
+        );
+        // Not back on the GPU in this session: an explicit gpu is an error, auto stays on
+        // the CPU, and the reload at the next attach keeps the ban.
+        let ev = r.send(set_windowed("bytesep", "gpu", true));
+        assert_eq!(errors(&ev), vec![ErrorCode::ModelLoadFailed]);
+        assert!(error_messages(&ev)[0].contains("overloaded"));
+        r.send(set_windowed("bytesep", "auto", true));
+        assert!(r.loads.borrow().last.as_ref().unwrap().gpu_banned);
+        let m = last_metrics(&r.run(1_100));
+        assert_eq!(
+            (m.device, m.device_note),
+            (Some(Device::Cpu), Some(DeviceNote::GpuOverloaded))
+        );
+        // Another model is not banned.
+        r.send(set_windowed("other", "gpu", true));
+        assert!(!r.loads.borrow().last.as_ref().unwrap().gpu_banned);
+    }
+
+    #[test]
+    fn a_gpu_overload_of_a_gpu_only_model_stays_in_fallback_for_the_app() {
+        let mut r = attached_with("overload-gpu-only", set_windowed("htdemucs", "gpu", false));
+        r.audio().window_overload();
+        let ev = r.run(1_100);
+        assert_eq!(r.loads(), 1, "the engine does not switch models itself");
+        assert_eq!(
+            states(&ev),
+            vec![(
+                Phase::Active,
+                Some(Mode::Fallback),
+                Some(FallbackReason::Overload)
+            )]
+        );
+        let m = last_metrics(&ev);
+        assert_eq!(
+            (m.device, m.device_note, m.fallback_reason),
+            (
+                Some(Device::Gpu),
+                Some(DeviceNote::GpuOverloaded),
+                Some(FallbackReason::Overload)
+            )
+        );
+        r.send(set_windowed("htdemucs", "auto", false));
+        assert!(r.loads.borrow().last.as_ref().unwrap().gpu_banned);
+    }
+
+    #[test]
+    fn an_overload_of_a_window_model_on_the_cpu_is_a_plain_overload() {
+        let mut r = attached_with("overload-on-cpu", set_windowed("bytesep", "cpu", true));
+        r.audio().window_overload();
+        let ev = r.run(1_100);
+        assert_eq!(r.loads(), 1);
+        let m = last_metrics(&ev);
+        assert_eq!(
+            (m.device, m.device_note, m.fallback_reason),
+            (Some(Device::Cpu), None, Some(FallbackReason::Overload))
+        );
+        r.send(set_windowed("bytesep", "gpu", true));
+        assert!(!r.loads.borrow().last.as_ref().unwrap().gpu_banned);
     }
 
     #[test]

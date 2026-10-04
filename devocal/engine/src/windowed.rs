@@ -197,11 +197,6 @@ impl WindowedSeparator {
         f32::from_bits(self.shared.duty_bits.load(Ordering::Relaxed))
     }
 
-    /// 3 consecutive timeouts since the last `reset` (latched), or `duty_10s() > 0.3`.
-    pub fn overloaded(&self) -> bool {
-        self.tripped || self.duty_10s() > DUTY_LIMIT
-    }
-
     fn hist_at(&self, frame: i64, ch: usize) -> f32 {
         if frame < 0 {
             0.0
@@ -308,6 +303,11 @@ impl Separator for WindowedSeparator {
 
     fn passthrough_latency_frames(&self) -> usize {
         WINDOWED_HOP
+    }
+
+    /// 3 consecutive timeouts since the last `reset` (latched), or `duty_10s() > 0.3`.
+    fn overloaded(&self) -> bool {
+        self.tripped || self.duty_10s() > DUTY_LIMIT
     }
 
     fn process(&mut self, input: &[f32], out_accompaniment: &mut [f32]) -> Result<(), String> {

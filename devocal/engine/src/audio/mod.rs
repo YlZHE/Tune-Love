@@ -282,8 +282,12 @@ impl StarvationDetail {
 pub(crate) struct FallbackLog {
     detail: [AtomicU64; DETAIL_FIELDS],
     forced_detail: [AtomicU64; DETAIL_FIELDS],
-    /// The fallback's trigger: 1 underrun, 2 load.
+    /// The fallback's trigger: 1 underrun, 2 load, 3 the window model itself (timeouts or
+    /// duty, `Separator::overloaded`).
     pub trigger: AtomicU8,
+    /// A window model reported overload; the engine takes it ([`AudioHandle::take_window_overload`])
+    /// and decides by device (spec 6: CPU reload or GPU banned).
+    pub window_overload: AtomicBool,
     pub forced_at_us: AtomicU64,
     pub load_milli: AtomicU32,
     /// The processor's stage just before it was forced ([`stage_code`]).
@@ -332,7 +336,11 @@ pub(crate) fn fallback_line(run: u32, log: &FallbackLog, now_us: u64) -> String 
         "devocal audio: run={run} forced fallback (overload) {} ms ago: trigger={} load={:.3} \
          stage={} retry={}",
         now_us.saturating_sub(at) / 1000,
-        if trigger == 2 { "load" } else { "underrun" },
+        match trigger {
+            2 => "load",
+            3 => "window",
+            _ => "underrun",
+        },
         log.load_milli.load(Ordering::Relaxed) as f64 / 1000.0,
         log.stage.load(Ordering::Relaxed),
         if log.retry_armed.load(Ordering::Relaxed) {
@@ -1101,6 +1109,14 @@ impl AudioHandle {
             ));
         }
         None
+    }
+
+    /// Returns and clears the window model's overload report (spec 6).
+    pub fn take_window_overload(&self) -> bool {
+        self.shared
+            .fallback_log
+            .window_overload
+            .swap(false, Ordering::AcqRel)
     }
 
     /// Returns and clears the safety guard's request to run `Holder::follow()` now.

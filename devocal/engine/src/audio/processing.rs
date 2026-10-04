@@ -273,14 +273,16 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
         let underrun = (underruns > st.underrun_base)
             .then(|| unpack_starvation(ctx.shared.underrun_snapshot.load(Ordering::Acquire)));
         let overloaded = report.ran_model && st.load.overloaded();
+        // Spec 6: the window model's own timeouts / duty (an atomic read, no lock).
+        let window = report.ran_model && ctx.processor.model_overloaded();
         if should_force_fallback(
             underrun,
             st.user_on,
             report.ran_model,
-            overloaded,
+            overloaded || window,
             ctx.processor.stage(),
         ) {
-            force_overload(&mut ctx, &mut st, overloaded, t1);
+            force_overload(&mut ctx, &mut st, overloaded, window, t1);
         }
         st.underrun_base = underruns;
         publish_state(&ctx);
@@ -334,28 +336,50 @@ fn begin_gap(ctx: &mut ProcessingCtx, st: &mut State) {
     st.fade_in.start(ctx.processor.output_latency_frames());
 }
 
-/// Forces `Fallback(Overload)` (load or underrun), records it for the engine log and
-/// schedules the ruling 24 retry. A fallback already under way is not recorded again.
-fn force_overload(ctx: &mut ProcessingCtx, st: &mut State, overloaded: bool, now: u64) {
+/// Forces `Fallback(Overload)` (load, underrun or `window`: the window model's own overload),
+/// records it for the engine log and schedules the ruling 24 retry. A window overload is
+/// flagged for the engine (spec 6) and never retried: retrying would put the model that
+/// just fell behind back on (on the GPU, against "not back to the GPU this session"). A
+/// fallback already under way is not recorded again.
+fn force_overload(
+    ctx: &mut ProcessingCtx,
+    st: &mut State,
+    overloaded: bool,
+    window: bool,
+    now: u64,
+) {
     let fresh = ctx.processor.fallback_reason().is_none();
     let stage = ctx.processor.stage();
     ctx.processor.force_fallback(FallbackReason::Overload);
-    if overloaded {
+    if overloaded || window {
         st.load.reset();
+    }
+    if window {
+        st.retry.user_off();
+        ctx.shared
+            .fallback_log
+            .window_overload
+            .store(true, Ordering::Release);
     }
     if !fresh {
         return;
     }
     let log = &ctx.shared.fallback_log;
-    log.trigger
-        .store(if overloaded { 2 } else { 1 }, Ordering::Relaxed);
+    let trigger = if window {
+        3
+    } else if overloaded {
+        2
+    } else {
+        1
+    };
+    log.trigger.store(trigger, Ordering::Relaxed);
     log.forced_at_us.store(now, Ordering::Relaxed);
     log.load_milli
         .store((st.load.ratio() * 1000.0).round() as u32, Ordering::Relaxed);
     log.stage.store(stage_code(stage), Ordering::Relaxed);
     log.retry_armed
-        .store(st.retry.forced(now), Ordering::Relaxed);
-    if !overloaded {
+        .store(!window && st.retry.forced(now), Ordering::Relaxed);
+    if trigger == 1 {
         log.keep_forced_detail();
     }
     log.forced.fetch_add(1, Ordering::Release);
@@ -697,14 +721,14 @@ mod tests {
         assert_eq!(ctx.processor.stage(), Stage::WarmingUp);
         assert!(ctx.shared.preroll_request.swap(false, Ordering::AcqRel));
         let t = 10_000_000;
-        force_overload(&mut ctx, &mut st, false, t);
+        force_overload(&mut ctx, &mut st, false, false, t);
         assert_eq!(ctx.processor.stage(), Stage::Fallback);
         let log = &ctx.shared.fallback_log;
         assert_eq!(log.forced.load(Ordering::Acquire), 1);
         assert_eq!(log.trigger.load(Ordering::Relaxed), 1, "underrun");
         assert!(log.retry_armed.load(Ordering::Relaxed));
         // Forcing again while already falling back records nothing new.
-        force_overload(&mut ctx, &mut st, false, t + 1);
+        force_overload(&mut ctx, &mut st, false, false, t + 1);
         assert_eq!(ctx.shared.fallback_log.forced.load(Ordering::Acquire), 1);
 
         assert!(!retry_overload(
@@ -727,7 +751,7 @@ mod tests {
 
         // The retry falls back again: no further retry.
         let t2 = t + 2 * OVERLOAD_RETRY_DELAY_US;
-        force_overload(&mut ctx, &mut st, true, t2);
+        force_overload(&mut ctx, &mut st, true, false, t2);
         let log = &ctx.shared.fallback_log;
         assert_eq!(log.forced.load(Ordering::Acquire), 2);
         assert_eq!(log.trigger.load(Ordering::Relaxed), 2, "load");
@@ -744,12 +768,54 @@ mod tests {
         apply_command(&mut ctx, &mut st, ProcCommand::SetDevocal(true));
         assert_eq!(ctx.processor.stage(), Stage::WarmingUp);
         let t3 = t2 + 20 * OVERLOAD_RETRY_DELAY_US;
-        force_overload(&mut ctx, &mut st, false, t3);
+        force_overload(&mut ctx, &mut st, false, false, t3);
         assert!(retry_overload(
             &mut ctx,
             &mut st,
             t3 + OVERLOAD_RETRY_DELAY_US
         ));
+    }
+
+    /// Spec 6: a window model's own overload forces `Fallback(Overload)`, is flagged for the
+    /// engine (which decides by device) and is never retried here (a retry would put the
+    /// model that just fell behind back on, e.g. on the GPU).
+    #[test]
+    fn a_window_model_overload_is_flagged_for_the_engine_and_not_retried() {
+        use crate::separator::DelayOnly;
+        let (mut ctx, mut st) = ctx_for(Processor::new(Some(Box::new(DelayOnly::new(HOP)))));
+        apply_command(&mut ctx, &mut st, ProcCommand::SetDevocal(true));
+        let t = 10_000_000;
+        force_overload(&mut ctx, &mut st, false, true, t);
+        assert_eq!(ctx.processor.stage(), Stage::Fallback);
+        assert_eq!(
+            ctx.processor.fallback_reason(),
+            Some(FallbackReason::Overload)
+        );
+        let log = &ctx.shared.fallback_log;
+        assert!(log.window_overload.load(Ordering::Acquire));
+        assert_eq!(log.trigger.load(Ordering::Relaxed), 3);
+        assert!(!log.retry_armed.load(Ordering::Relaxed));
+        assert!(!st.retry.pending());
+        assert!(!retry_overload(
+            &mut ctx,
+            &mut st,
+            t + 10 * OVERLOAD_RETRY_DELAY_US
+        ));
+        assert_eq!(ctx.processor.stage(), Stage::Fallback);
+
+        // An ordinary overload already scheduled a retry: a window overload during its
+        // fade-out still cancels it.
+        let (mut ctx, mut st) = ctx_for(Processor::new(Some(Box::new(DelayOnly::new(HOP)))));
+        apply_command(&mut ctx, &mut st, ProcCommand::SetDevocal(true));
+        force_overload(&mut ctx, &mut st, true, false, t);
+        assert!(st.retry.pending());
+        force_overload(&mut ctx, &mut st, false, true, t + 1);
+        assert!(!st.retry.pending());
+        assert!(ctx
+            .shared
+            .fallback_log
+            .window_overload
+            .load(Ordering::Acquire));
     }
 
     /// Runs the processing thread without devices (rings only) and stops it.
@@ -995,7 +1061,7 @@ mod tests {
             shortfall: 58,
             ..StarvationDetail::default()
         });
-        force_overload(&mut ctx, &mut st, false, t);
+        force_overload(&mut ctx, &mut st, false, false, t);
         assert_eq!(ctx.shared.fallback_log.forced_detail().shortfall, 58);
         assert_eq!(ctx.processor.stage(), Stage::Fallback);
         st.pending = Some(Box::new(DelayOnly::new(HOP)));

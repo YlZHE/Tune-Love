@@ -26,6 +26,10 @@ pub struct OrtWindowModel {
     /// Output stems (1 for a plain `[1, 2, W]` output).
     stems: usize,
     vocals_index: usize,
+    /// Debug builds only: `TUNE_LOVE_WINDOWED_SLOW_MS`, extra sleep per run (read once at load)
+    /// so tests can force timeouts. Not compiled into release builds.
+    #[cfg(debug_assertions)]
+    slow: Option<std::time::Duration>,
 }
 
 impl OrtWindowModel {
@@ -104,6 +108,11 @@ impl OrtWindowModel {
             window,
             stems,
             vocals_index,
+            #[cfg(debug_assertions)]
+            slow: std::env::var("TUNE_LOVE_WINDOWED_SLOW_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .map(std::time::Duration::from_millis),
         };
         let silence = vec![0.0f32; window * CHANNELS];
         model.run(&silence, &mut vec![0.0f32; window * CHANNELS])?;
@@ -117,6 +126,10 @@ impl OrtWindowModel {
 
 impl WindowModel for OrtWindowModel {
     fn run(&mut self, input: &[f32], vocals: &mut [f32]) -> Result<(), String> {
+        #[cfg(debug_assertions)]
+        if let Some(d) = self.slow {
+            std::thread::sleep(d);
+        }
         let w = self.window;
         if input.len() != w * CHANNELS || vocals.len() != w * CHANNELS {
             return Err(format!(

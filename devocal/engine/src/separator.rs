@@ -20,6 +20,11 @@ pub trait Separator: Send {
     fn process(&mut self, input: &[f32], out_accompaniment: &mut [f32]) -> Result<(), String>;
     /// Clears all streaming state, as if freshly loaded.
     fn reset(&mut self);
+    /// The model itself cannot keep up (window models: spec 4.1 timeouts / duty). Must be a
+    /// cheap, lock-free read: polled on the processing thread after every model block.
+    fn overloaded(&self) -> bool {
+        false
+    }
 }
 
 /// Block size used by `DelayOnly`; matches StemgenRT.

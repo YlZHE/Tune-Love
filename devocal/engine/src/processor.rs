@@ -228,6 +228,11 @@ impl Processor {
         self.fallback
     }
 
+    /// The installed model reports that it cannot keep up ([`Separator::overloaded`]).
+    pub fn model_overloaded(&self) -> bool {
+        self.separator.as_ref().is_some_and(|s| s.overloaded())
+    }
+
     /// Input discontinuity (seek, glitch): clears the model state and the passthrough delay.
     /// The stage is kept, except that a warm-up or fade-in in progress (re)starts the warm-up,
     /// so the fresh model state still gets the full warm-up before it becomes audible.
@@ -426,6 +431,39 @@ mod tests {
         fn reset(&mut self) {
             self.resets.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// Reports `Separator::overloaded` from a shared flag.
+    struct OverloadSep(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Separator for OverloadSep {
+        fn sample_rate(&self) -> u32 {
+            44_100
+        }
+        fn hop(&self) -> usize {
+            HOP
+        }
+        fn latency_frames(&self) -> usize {
+            HOP
+        }
+        fn process(&mut self, _input: &[f32], out: &mut [f32]) -> Result<(), String> {
+            out.fill(ACC);
+            Ok(())
+        }
+        fn reset(&mut self) {}
+        fn overloaded(&self) -> bool {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn model_overload_is_read_from_the_installed_model() {
+        assert!(!Processor::new(None).model_overloaded());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let p = Processor::new(Some(Box::new(OverloadSep(flag.clone()))));
+        assert!(!p.model_overloaded());
+        flag.store(true, Ordering::Relaxed);
+        assert!(p.model_overloaded());
     }
 
     /// Like `ConstSep`, but the `fail_at`-th `process` call (1-based) returns `Err`.

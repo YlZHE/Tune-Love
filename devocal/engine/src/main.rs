@@ -7,6 +7,7 @@ mod audio;
 #[allow(dead_code)]
 mod dsp;
 mod engine;
+mod gpu_check;
 #[allow(dead_code)]
 mod holder;
 #[allow(dead_code)]

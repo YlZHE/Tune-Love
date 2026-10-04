@@ -621,10 +621,12 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
     /// Advances the engine to `now_us` (see the module docs for the order).
     pub fn tick(&mut self, now_us: u64) -> Vec<Event> {
         let mut ev = Vec::new();
+        // Before `poll_model`: a flag raised before this tick belongs to the model in use, not
+        // to one installed in this tick.
+        self.check_window_overload();
         self.poll_model(now_us, &mut ev);
         self.start_pending_attach(now_us, &mut ev);
         self.check_audio(now_us, &mut ev);
-        self.check_window_overload();
         self.step_holder(now_us, &mut ev);
         self.periodic(now_us, &mut ev);
         self.gains
@@ -823,11 +825,14 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         let (Some(spec), Some((Device::Gpu, _))) = (&self.model, self.device) else {
             return;
         };
+        // Already handled (the flag repeats while the model fades out).
+        if !self.gpu_banned.insert(spec.id.clone()) {
+            return;
+        }
         eprintln!(
             "devocal engine: model {} fell behind on the GPU; no GPU for it in this session",
             spec.id
         );
-        self.gpu_banned.insert(spec.id.clone());
         self.device = Some((Device::Gpu, Some(DeviceNote::GpuOverloaded)));
         let has_cpu = spec
             .windowed
@@ -2377,6 +2382,23 @@ mod tests {
         );
         r.send(set_windowed("htdemucs", "auto", false));
         assert!(r.loads.borrow().last.as_ref().unwrap().gpu_banned);
+    }
+
+    /// Fix round 1: an overload flag taken in the tick that installs a new model belongs to
+    /// the old model; the new one is neither banned nor reloaded.
+    #[test]
+    fn an_overload_taken_in_the_installing_tick_is_not_blamed_on_the_new_model() {
+        let mut r = attached_with("overload-swap", set_windowed("bytesep", "gpu", true));
+        r.manual_loads();
+        r.send(set_windowed("other", "gpu", true));
+        assert!(r.finish_load(0));
+        r.audio().window_overload();
+        let ev = r.run(1_100);
+        assert_eq!(r.loads(), 2, "no reload of the new model");
+        let m = last_metrics(&ev);
+        assert_eq!((m.device, m.device_note), (Some(Device::Gpu), None));
+        r.send(set_windowed("other", "gpu", true));
+        assert!(!r.loads.borrow().last.as_ref().unwrap().gpu_banned);
     }
 
     #[test]

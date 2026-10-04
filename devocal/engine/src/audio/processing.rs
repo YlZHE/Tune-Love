@@ -273,8 +273,7 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
         let underrun = (underruns > st.underrun_base)
             .then(|| unpack_starvation(ctx.shared.underrun_snapshot.load(Ordering::Acquire)));
         let overloaded = report.ran_model && st.load.overloaded();
-        // Spec 6: the window model's own timeouts / duty (an atomic read, no lock).
-        let window = report.ran_model && ctx.processor.model_overloaded();
+        let window = window_overloaded(&ctx, &st, report.ran_model);
         if should_force_fallback(
             underrun,
             st.user_on,
@@ -334,6 +333,13 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
 fn begin_gap(ctx: &mut ProcessingCtx, st: &mut State) {
     let _ = ctx.out_markers.push(st.out_pos);
     st.fade_in.start(ctx.processor.output_latency_frames());
+}
+
+/// Spec 6: the window model's own timeouts / duty (an atomic read, no lock), for a block that
+/// ran the model. Not while a swap is pending: the engine already holds the new model's spec,
+/// and the old model fading out is about to be dropped.
+fn window_overloaded(ctx: &ProcessingCtx, st: &State, ran_model: bool) -> bool {
+    ran_model && st.pending.is_none() && ctx.processor.model_overloaded()
 }
 
 /// Forces `Fallback(Overload)` (load, underrun or `window`: the window model's own overload),
@@ -774,6 +780,40 @@ mod tests {
             &mut st,
             t3 + OVERLOAD_RETRY_DELAY_US
         ));
+    }
+
+    /// Overload reported by a test model.
+    struct Overloaded;
+    impl Separator for Overloaded {
+        fn sample_rate(&self) -> u32 {
+            44_100
+        }
+        fn hop(&self) -> usize {
+            HOP
+        }
+        fn latency_frames(&self) -> usize {
+            HOP
+        }
+        fn process(&mut self, _input: &[f32], out: &mut [f32]) -> Result<(), String> {
+            out.fill(0.0);
+            Ok(())
+        }
+        fn reset(&mut self) {}
+        fn overloaded(&self) -> bool {
+            true
+        }
+    }
+
+    /// Fix round 1: while a swap is pending the engine already reports the new model, so the
+    /// fading-out old model's overload is not flagged (it is about to be dropped).
+    #[test]
+    fn no_window_overload_while_a_swap_is_pending() {
+        use crate::separator::DelayOnly;
+        let (ctx, mut st) = ctx_for(Processor::new(Some(Box::new(Overloaded))));
+        assert!(window_overloaded(&ctx, &st, true));
+        assert!(!window_overloaded(&ctx, &st, false));
+        st.pending = Some(Box::new(DelayOnly::new(HOP)));
+        assert!(!window_overloaded(&ctx, &st, true));
     }
 
     /// Spec 6: a window model's own overload forces `Fallback(Overload)`, is flagged for the

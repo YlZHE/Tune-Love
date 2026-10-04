@@ -60,8 +60,8 @@ fn check_with_adapter(
     pass
 }
 
-/// SDR of `test` against `reference` in dB; -inf for a length mismatch or non-finite output,
-/// +inf for identical outputs.
+/// SDR of `test` against `reference` in dB; -inf for a length mismatch, non-finite output or
+/// a silent reference (proves nothing), +inf for identical outputs.
 fn sdr_db(reference: &[f32], test: &[f32]) -> f64 {
     if reference.len() != test.len() || !test.iter().all(|v| v.is_finite()) {
         return f64::NEG_INFINITY;
@@ -71,7 +71,9 @@ fn sdr_db(reference: &[f32], test: &[f32]) -> f64 {
         sig += f64::from(r) * f64::from(r);
         err += (f64::from(r) - f64::from(t)).powi(2);
     }
-    if err == 0.0 {
+    if sig == 0.0 {
+        f64::NEG_INFINITY
+    } else if err == 0.0 {
         f64::INFINITY
     } else {
         10.0 * (sig / err).log10()
@@ -294,6 +296,20 @@ mod tests {
         std::fs::write(dir.model(), b"model bytes v2").unwrap();
         assert!(check(&dir, Some(ADAPTER), 0.0, &calls));
         assert_eq!(calls.get(), 3);
+    }
+
+    /// A silent reference proves nothing: identical all-zero outputs fail.
+    #[test]
+    fn a_silent_reference_fails() {
+        let dir = TempDir::new("silent");
+        let zeros = |x: &[f32]| Ok(vec![0.0; x.len()]);
+        assert!(!check_with_adapter(
+            Some(ADAPTER.into()),
+            &dir.0,
+            &dir.model(),
+            zeros,
+            zeros
+        ));
     }
 
     #[test]

@@ -349,7 +349,8 @@ pub(crate) fn fallback_line(run: u32, log: &FallbackLog, now_us: u64) -> String 
             "none"
         },
     );
-    if trigger != 2 {
+    // The underrun detail belongs to underrun triggers only.
+    if trigger == 1 {
         let d = log.forced_detail();
         l.push_str(&format!(
             " | starved {} ms before: verdict={} wake={} padding={} ring_b={} shortfall={} \

@@ -6,11 +6,13 @@ edition = "2021"
 [dependencies]
 devocal-core = { path = "../core" }
 # ort 2.0.0-rc.13 is the latest 2.x release on 2026-10-02 (2.0 final not yet published);
-# it wraps ONNX Runtime 1.28. CPU only: `download-binaries` fetches pyke's prebuilt ONNX
-# Runtime at build time and links it statically (no onnxruntime.dll to ship). Pinned
+# it wraps ONNX Runtime 1.28. `download-binaries` fetches pyke's prebuilt ONNX
+# Runtime at build time and links it statically (no onnxruntime.dll to ship); the prebuilt library includes DirectML (`directml`:
+# GPU sessions of the window models; StemgenRT stays on the CPU). Pinned
 # exactly because release candidates may break the API.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = [
     "std",
+    "directml",
     "download-binaries",
     "tls-native",
 ] }

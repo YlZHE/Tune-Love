@@ -52,7 +52,7 @@ pub struct StemgenRt {
     prev: Vec<f32>,
 }
 
-fn fixed_f32_shape(name: &str, dtype: &ValueType) -> Result<Vec<i64>, String> {
+pub(crate) fn fixed_f32_shape(name: &str, dtype: &ValueType) -> Result<Vec<i64>, String> {
     match dtype {
         ValueType::Tensor { ty, shape, .. } if *ty == TensorElementType::Float32 => {
             if shape.iter().any(|&d| d <= 0) {

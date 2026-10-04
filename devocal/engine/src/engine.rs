@@ -83,8 +83,8 @@ use std::thread;
 use std::time::Duration;
 
 use devocal_core::protocol::{
-    decode_command, encode, Command, ErrorCode, Event, FallbackReason, Metrics, Mode, Phase,
-    ProtocolError, PROTOCOL,
+    decode_command, encode, Command, Device, DeviceNote, ErrorCode, Event, FallbackReason, Metrics,
+    Mode, Phase, ProtocolError, WindowedSpec, PROTOCOL,
 };
 use devocal_core::sessions::SessionVolumes;
 use devocal_core::sessions_win::WinSessions;
@@ -96,11 +96,13 @@ use crate::audio::{now_us, AudioConfig, AudioHandle, SharedGains};
 use crate::dsp::SAMPLE_RATE;
 use crate::holder::{AttachRamp, Holder, HolderPhase, CONFIRM_WINDOW_US};
 use crate::notify::{SessionSignals, SessionWatcher};
+use crate::ort_window::{resolve_device, window_params, OrtWindowModel};
 use crate::pipe::{pipe_name, Accepted, PipeServer};
 use crate::processor::{Processor, Stage};
 use crate::separator::Separator;
 use crate::state::{next, Input};
 use crate::stemgen::StemgenRt;
+use crate::windowed::WindowedSeparator;
 
 /// Main loop period.
 pub const TICK_US: u64 = 1_000;
@@ -176,28 +178,127 @@ pub trait AudioPort {
     fn stop(&mut self) -> Option<Box<dyn Separator>>;
 }
 
+/// A model as requested by `set_model`.
+#[derive(Debug, Clone)]
+pub struct ModelSpec {
+    pub id: String,
+    pub path: PathBuf,
+    /// `auto`, `cpu` or `gpu` as sent by the app.
+    pub device: String,
+    pub threads: u16,
+    pub windowed: Option<WindowedSpec>,
+}
+
+/// A loaded model and the device it runs on (`note`: why it is not on the GPU although
+/// `auto` preferred it).
+pub struct Loaded {
+    pub separator: Box<dyn Separator>,
+    pub device: Device,
+    pub note: Option<DeviceNote>,
+}
+
+#[derive(Debug)]
+pub struct LoadFailure {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+impl From<String> for LoadFailure {
+    fn from(message: String) -> Self {
+        LoadFailure {
+            code: ErrorCode::ModelLoadFailed,
+            message,
+        }
+    }
+}
+
 /// Result channel of one model load.
-pub type LoadResult = mpsc::Receiver<Result<Box<dyn Separator>, String>>;
+pub type LoadResult = mpsc::Receiver<Result<Loaded, LoadFailure>>;
 
-/// Starts loading a model (path, inference threads) off the main loop; the result arrives on
-/// the returned channel. A receiver dropped before the result arrives abandons the load.
-pub type ModelLoader = Box<dyn FnMut(PathBuf, u16) -> LoadResult>;
+/// Starts loading a model off the main loop; the result arrives on the returned channel. A
+/// receiver dropped before the result arrives abandons the load.
+pub type ModelLoader = Box<dyn FnMut(&ModelSpec) -> LoadResult>;
 
-/// Loads StemgenRT models, each on its own worker thread.
-pub fn stemgen_loader() -> ModelLoader {
-    Box::new(|path: PathBuf, threads: u16| {
+/// Builds the separator for `spec`: StemgenRT (CPU) or a window model on the device
+/// [`resolve_device`] picks. Blocking (session creation, warm-up); runs on a loader thread.
+fn load_model(spec: &ModelSpec) -> Result<Loaded, LoadFailure> {
+    let bad = |code| LoadFailure {
+        code,
+        message: format!(
+            "device {:?} is not supported (auto, cpu or gpu)",
+            spec.device
+        ),
+    };
+    let Some(w) = &spec.windowed else {
+        resolve_device(&spec.device, &None, || false).map_err(bad)?;
+        return Ok(Loaded {
+            separator: Box::new(StemgenRt::load(&spec.path, spec.threads)?),
+            device: Device::Cpu,
+            note: None,
+        });
+    };
+    // The GPU probe is the real GPU session (kept when it works).
+    let mut gpu: Option<Result<OrtWindowModel, String>> = None;
+    let device = resolve_device(&spec.device, &spec.windowed, || {
+        let r = OrtWindowModel::load(&spec.path, Device::Gpu, 1, w.vocals_index);
+        let ok = r.is_ok();
+        gpu = Some(r);
+        ok
+    })
+    .map_err(|code| {
+        let why = match &gpu {
+            Some(Err(e)) => format!("the GPU (DirectML) is not usable: {e}"),
+            _ => "this model has no path on the selected device".to_string(),
+        };
+        match code {
+            ErrorCode::BadDevice => bad(code),
+            ErrorCode::GpuRequired => LoadFailure {
+                code,
+                message: format!("this model runs on the GPU only; {why}"),
+            },
+            _ => LoadFailure { code, message: why },
+        }
+    })?;
+    let params = window_params(w, device)?;
+    let model = match device {
+        Device::Gpu => gpu
+            .take()
+            .ok_or_else(|| "GPU session missing".to_string())??,
+        Device::Cpu => {
+            OrtWindowModel::load(&spec.path, Device::Cpu, w.cpu_threads, w.vocals_index)?
+        }
+    };
+    if model.window_frames() != params.window_frames {
+        return Err(format!(
+            "the model window is {} frames, the manifest says {}",
+            model.window_frames(),
+            params.window_frames
+        )
+        .into());
+    }
+    let note = (spec.device == "auto" && device == Device::Cpu && matches!(gpu, Some(Err(_))))
+        .then_some(DeviceNote::GpuUnavailable);
+    Ok(Loaded {
+        separator: Box::new(WindowedSeparator::new(Box::new(model), params)),
+        device,
+        note,
+    })
+}
+
+/// Loads models, each on its own worker thread.
+pub fn model_loader() -> ModelLoader {
+    Box::new(|spec: &ModelSpec| {
         let (tx, rx) = mpsc::channel();
         let on_spawn_error = tx.clone();
+        let spec = spec.clone();
         let spawned = thread::Builder::new()
             .name("devocal-model-load".into())
             .spawn(move || {
-                let model =
-                    StemgenRt::load(&path, threads).map(|m| Box::new(m) as Box<dyn Separator>);
                 // A superseded load: the receiver is gone and the model is dropped here.
-                let _ = tx.send(model);
+                let _ = tx.send(load_model(&spec));
             });
         if let Err(e) = spawned {
-            let _ = on_spawn_error.send(Err(format!("starting the model loader: {e}")));
+            let _ = on_spawn_error.send(Err(format!("starting the model loader: {e}").into()));
         }
         rx
     })
@@ -241,12 +342,6 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Event {
     }
 }
 
-struct ModelSpec {
-    id: String,
-    path: PathBuf,
-    threads: u16,
-}
-
 struct PendingLoad {
     spec: ModelSpec,
     /// Reloading the current model (its separator did not come back), not a new `set_model`.
@@ -283,6 +378,8 @@ pub struct EngineCore<S: SessionVolumes, A: AudioPort> {
     loader: ModelLoader,
     /// The model last loaded successfully (in the audio, staged, or being reloaded).
     model: Option<ModelSpec>,
+    /// Device (and why not the GPU) of `model`, reported in the metrics.
+    device: Option<(Device, Option<DeviceNote>)>,
     /// A loaded model waiting for the next audio start.
     staged: Option<Box<dyn Separator>>,
     pending_load: Option<PendingLoad>,
@@ -330,6 +427,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             gains: Arc::new(SharedGains::new(1.0, 0.0)),
             loader,
             model: None,
+            device: None,
             staged: None,
             pending_load: None,
             phase: Phase::Idle,
@@ -441,7 +539,18 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
                 path,
                 device,
                 threads,
-            } => self.set_model(id, path, &device, threads, now_us, &mut ev),
+                windowed,
+            } => self.set_model(
+                ModelSpec {
+                    id,
+                    path,
+                    device,
+                    threads,
+                    windowed,
+                },
+                now_us,
+                &mut ev,
+            ),
             Command::Release => self.release(now_us, &mut ev),
             Command::Shutdown => self.begin_exit(now_us, &mut ev),
         }
@@ -611,15 +720,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
         }
     }
 
-    fn set_model(
-        &mut self,
-        id: String,
-        path: PathBuf,
-        device: &str,
-        threads: u16,
-        now_us: u64,
-        ev: &mut Vec<Event>,
-    ) {
+    fn set_model(&mut self, spec: ModelSpec, now_us: u64, ev: &mut Vec<Event>) {
         if self.exit_requested {
             ev.push(error(
                 ErrorCode::Protocol,
@@ -627,21 +728,24 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             ));
             return;
         }
-        if device != "cpu" {
+        if !matches!(spec.device.as_str(), "auto" | "cpu" | "gpu") {
             ev.push(error(
                 ErrorCode::BadDevice,
-                format!("device {device:?} is not supported (only \"cpu\")"),
+                format!(
+                    "device {:?} is not supported (auto, cpu or gpu)",
+                    spec.device
+                ),
             ));
             return;
         }
-        self.start_load(ModelSpec { id, path, threads }, false);
+        self.start_load(spec, false);
         // A loader that finished at once is installed now.
         self.poll_model(now_us, ev);
     }
 
     /// Starts a load; a pending older one is abandoned (its result is dropped on its worker).
     fn start_load(&mut self, spec: ModelSpec, reload: bool) {
-        let rx = (self.loader)(spec.path.clone(), spec.threads);
+        let rx = (self.loader)(&spec);
         self.pending_load = Some(PendingLoad { spec, reload, rx });
     }
 
@@ -654,15 +758,20 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             Ok(r) => r,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                Err("the model loader ended without a result".to_string())
+                Err("the model loader ended without a result".to_string().into())
             }
         };
         let Some(PendingLoad { spec, reload, .. }) = self.pending_load.take() else {
             return;
         };
         match result {
-            Ok(model) => {
+            Ok(Loaded {
+                separator: model,
+                device,
+                note,
+            }) => {
                 self.model = Some(spec);
+                self.device = Some((device, note));
                 if self.audio_live() {
                     // The audio side fades out, swaps and turns back on if it was on (caller
                     // obligation 3); a pending user "on" is sent after the swap.
@@ -675,16 +784,18 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             }
             Err(e) => {
                 ev.push(error(
-                    ErrorCode::ModelLoadFailed,
+                    e.code,
                     format!(
-                        "{} model {} from {} failed: {e}",
+                        "{} model {} from {} failed: {}",
                         if reload { "reloading" } else { "loading" },
                         spec.id,
-                        spec.path.display()
+                        spec.path.display(),
+                        e.message
                     ),
                 ));
                 if reload {
                     self.model = None;
+                    self.device = None;
                 }
                 // A previously loaded model stays in use; without one a pending "on" is
                 // dropped.
@@ -1042,6 +1153,8 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             attenuation_epoch: self.holder.attenuation_epoch(),
             session_overridden: self.overridden_total,
             input_silent_ms: s.input_silent_ms,
+            device: self.device.map(|(d, _)| d),
+            device_note: self.device.and_then(|(_, n)| n),
         }));
     }
 }
@@ -1367,7 +1480,7 @@ pub fn run(args: Args) -> i32 {
         WinSessions,
         args.restore_file,
         RealAudio::default(),
-        stemgen_loader(),
+        model_loader(),
     );
     // Without notifications the engine still follows every 0.5 s.
     let mut watcher = match SessionWatcher::start(core.signals()) {
@@ -1434,7 +1547,6 @@ mod tests {
     use devocal_core::protocol::{ErrorCode, PROTOCOL};
     use devocal_core::sessions::{FakeSessions, SessionInfo, HELD_VOLUME};
     use std::cell::{Cell, RefCell};
-    use std::path::Path;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1681,38 +1793,54 @@ mod tests {
         }
     }
 
-    type LoadSender = mpsc::Sender<Result<Box<dyn Separator>, String>>;
+    type LoadSender = mpsc::Sender<Result<Loaded, LoadFailure>>;
 
     /// Loads finish at once, or (`manual`) when the test says so.
     #[derive(Default)]
     struct FakeLoads {
         calls: usize,
         manual: bool,
-        pending: Vec<(PathBuf, LoadSender)>,
+        pending: Vec<(ModelSpec, LoadSender)>,
         resets: Arc<AtomicUsize>,
     }
 
-    /// A `TestSep` for any path except `*bad.onnx`.
-    fn fake_load(path: &Path, resets: &Arc<AtomicUsize>) -> Result<Box<dyn Separator>, String> {
-        if path.to_string_lossy().ends_with("bad.onnx") {
-            Err("cannot load model".into())
+    /// A `TestSep` for any path except `*bad.onnx` (load error) and `*gpureq.onnx`
+    /// (`GpuRequired`). Device: `gpu` -> Gpu, `auto` -> Cpu with a GpuUnavailable note.
+    fn fake_load(spec: &ModelSpec, resets: &Arc<AtomicUsize>) -> Result<Loaded, LoadFailure> {
+        let path = spec.path.to_string_lossy();
+        if path.ends_with("bad.onnx") {
+            Err("cannot load model".to_string().into())
+        } else if path.ends_with("gpureq.onnx") {
+            Err(LoadFailure {
+                code: ErrorCode::GpuRequired,
+                message: "needs the GPU".into(),
+            })
         } else {
-            Ok(Box::new(TestSep {
-                inner: DelayOnly::new(128),
-                resets: resets.clone(),
-            }))
+            let (device, note) = match spec.device.as_str() {
+                "gpu" => (Device::Gpu, None),
+                "auto" => (Device::Cpu, Some(DeviceNote::GpuUnavailable)),
+                _ => (Device::Cpu, None),
+            };
+            Ok(Loaded {
+                separator: Box::new(TestSep {
+                    inner: DelayOnly::new(128),
+                    resets: resets.clone(),
+                }),
+                device,
+                note,
+            })
         }
     }
 
     fn loader(loads: Rc<RefCell<FakeLoads>>) -> ModelLoader {
-        Box::new(move |path: PathBuf, _threads: u16| {
+        Box::new(move |spec: &ModelSpec| {
             let (tx, rx) = mpsc::channel();
             let mut l = loads.borrow_mut();
             l.calls += 1;
             if l.manual {
-                l.pending.push((path, tx));
+                l.pending.push((spec.clone(), tx));
             } else {
-                let _ = tx.send(fake_load(&path, &l.resets));
+                let _ = tx.send(fake_load(spec, &l.resets));
             }
             rx
         })
@@ -1781,8 +1909,8 @@ mod tests {
         /// Completes manual load `i`; false if the engine had abandoned it.
         fn finish_load(&self, i: usize) -> bool {
             let l = self.loads.borrow();
-            let (path, tx) = &l.pending[i];
-            tx.send(fake_load(path, &l.resets)).is_ok()
+            let (spec, tx) = &l.pending[i];
+            tx.send(fake_load(spec, &l.resets)).is_ok()
         }
 
         fn resets(&self) -> usize {
@@ -1811,6 +1939,7 @@ mod tests {
             path: PathBuf::from(path),
             device: device.into(),
             threads: 1,
+            windowed: None,
         }
     }
 
@@ -1918,6 +2047,43 @@ mod tests {
         assert_eq!(errors(&ev), vec![ErrorCode::BadDevice]);
         assert_eq!(r.loads(), 0, "the model is not loaded");
         // Still no model.
+        let ev = r.send(Command::SetMode { devocal: true });
+        assert_eq!(errors(&ev), vec![ErrorCode::NoModel]);
+    }
+
+    #[test]
+    fn gpu_and_auto_are_accepted_and_the_device_is_reported() {
+        for (device, want, note) in [
+            ("cpu", Device::Cpu, None),
+            ("gpu", Device::Gpu, None),
+            ("auto", Device::Cpu, Some(DeviceNote::GpuUnavailable)),
+        ] {
+            let mut r = Rig::new("device-reported");
+            let ev = r.send(set_model("model.onnx", device));
+            assert!(errors(&ev).is_empty(), "{device}: {ev:?}");
+            let ev = r.run(1_100);
+            let m = metrics(&ev);
+            assert!(!m.is_empty(), "{device}");
+            assert_eq!(m[0].device, Some(want), "{device}");
+            assert_eq!(m[0].device_note, note, "{device}");
+        }
+    }
+
+    #[test]
+    fn no_device_is_reported_before_a_model_loads() {
+        let mut r = Rig::new("no-device");
+        let ev = r.run(1_100);
+        let m = metrics(&ev);
+        assert!(!m.is_empty());
+        assert_eq!((m[0].device, m[0].device_note), (None, None));
+    }
+
+    #[test]
+    fn the_loader_error_code_is_passed_through() {
+        let mut r = Rig::new("gpu-required");
+        let ev = r.send(set_model("gpureq.onnx", "cpu"));
+        assert_eq!(errors(&ev), vec![ErrorCode::GpuRequired]);
+        assert!(error_messages(&ev)[0].contains("needs the GPU"));
         let ev = r.send(Command::SetMode { devocal: true });
         assert_eq!(errors(&ev), vec![ErrorCode::NoModel]);
     }

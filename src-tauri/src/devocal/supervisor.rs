@@ -739,6 +739,8 @@ impl<L: EngineLink> Supervisor<L> {
                 }
             }
             ErrorCode::BadDevice => self.error = Some(format!("bad_device: {message}")),
+            // The app sends only StemgenRT on the CPU for now (Task 7 handles the new codes).
+            ErrorCode::GpuRequired => self.error = Some(format!("gpu_required: {message}")),
         }
     }
 
@@ -964,6 +966,7 @@ impl<L: EngineLink> Supervisor<L> {
             path: path.clone(),
             device: MODEL_DEVICE.into(),
             threads: MODEL_THREADS,
+            windowed: None,
         };
         if let Err(e) = encode(&cmd) {
             self.unavailable = true;
@@ -1138,6 +1141,8 @@ mod tests {
             attenuation_epoch: epoch,
             session_overridden: 0,
             input_silent_ms: 0,
+            device: None,
+            device_note: None,
         })
     }
 
@@ -1154,6 +1159,7 @@ mod tests {
             path: model(),
             device: "cpu".into(),
             threads: 1,
+            windowed: None,
         }
     }
 
@@ -2027,6 +2033,8 @@ mod tests {
             attenuation_epoch: 1,
             session_overridden: 2,
             input_silent_ms: 3_500,
+            device: None,
+            device_note: None,
         }));
         r.sup.tick(1_000, Some(p.clone()), true);
         let s = r.sup.status();

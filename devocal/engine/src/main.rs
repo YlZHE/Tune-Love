@@ -12,6 +12,8 @@ mod holder;
 #[allow(dead_code)]
 mod load;
 mod notify;
+#[allow(dead_code)]
+mod ort_window;
 mod pipe;
 #[allow(dead_code)]
 mod processor;

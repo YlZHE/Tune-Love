@@ -71,6 +71,9 @@ struct Shared {
     done: AtomicU64,
     stop: AtomicBool,
     duty_bits: AtomicU32,
+    /// The duty mean covers a full 10 s of runs (judged only then: a few slow first runs
+    /// right after load are not an overload; three timeouts in a row still are).
+    duty_full: AtomicBool,
 }
 
 pub struct WindowedSeparator {
@@ -137,6 +140,7 @@ impl WindowedSeparator {
             done: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             duty_bits: AtomicU32::new(0),
+            duty_full: AtomicBool::new(false),
         });
         let (jobs, job_rx) = RingBuffer::new(JOB_SLOTS);
         let (windows, window_rx) = RingBuffer::new(JOB_SLOTS * w * 2);
@@ -192,7 +196,8 @@ impl WindowedSeparator {
         self.timeouts
     }
 
-    /// Mean inference time / hop over the last 10 s of windows.
+    /// Mean inference time / hop over the last 10 s of windows (over the runs so far before
+    /// that).
     pub fn duty_10s(&self) -> f32 {
         f32::from_bits(self.shared.duty_bits.load(Ordering::Relaxed))
     }
@@ -305,9 +310,11 @@ impl Separator for WindowedSeparator {
         WINDOWED_HOP
     }
 
-    /// 3 consecutive timeouts since the last `reset` (latched), or `duty_10s() > 0.3`.
+    /// 3 consecutive timeouts since the last `reset` (latched), or `duty_10s() > 0.3` once
+    /// the mean covers a full 10 s of runs.
     fn overloaded(&self) -> bool {
-        self.tripped || self.duty_10s() > DUTY_LIMIT
+        self.tripped
+            || (self.shared.duty_full.load(Ordering::Relaxed) && self.duty_10s() > DUTY_LIMIT)
     }
 
     fn process(&mut self, input: &[f32], out_accompaniment: &mut [f32]) -> Result<(), String> {
@@ -436,6 +443,9 @@ impl Worker {
                 self.shared
                     .duty_bits
                     .store((mean as f32).to_bits(), Ordering::Relaxed);
+                if duty.len() >= duty_len {
+                    self.shared.duty_full.store(true, Ordering::Relaxed);
+                }
 
                 let pairs = win[part.clone()].iter().zip(&vocals[part.clone()]);
                 for (a, (x, v)) in acc.iter_mut().zip(pairs) {
@@ -861,6 +871,22 @@ mod tests {
         run_jobs(&mut sep, 2 * n);
         assert_eq!(sep.duty_10s(), 0.0);
         assert!(!sep.overloaded());
+    }
+
+    #[test]
+    fn slow_first_runs_do_not_overload() {
+        // Two slow runs right after load (a GPU waking up), then fast ones: the duty is judged
+        // only over a full 10 s, and two timeouts in a row are not three.
+        let n = (10 * 44_100u64).div_ceil(H as u64);
+        let mut sep = make(|k| if k < 2 { 0.9 } else { 0.0 });
+        let input = [0.0f32; WINDOWED_HOP * 2];
+        let mut out = [0.0f32; WINDOWED_HOP * 2];
+        while sep.submitted < n + 5 {
+            sep.process(&input, &mut out).unwrap();
+            wait_idle(&sep);
+            assert!(!sep.overloaded(), "overloaded after {} runs", sep.submitted);
+        }
+        assert_eq!(sep.timeouts(), 2);
     }
 
     #[test]

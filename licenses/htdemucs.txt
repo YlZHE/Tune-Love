@@ -1,0 +1,41 @@
+HTDemucs ft vocals (Demucs, Meta Platforms)
+===========================================
+
+Code:     https://github.com/facebookresearch/demucs (MIT)
+Weights:  the htdemucs_ft vocals model, in the ONNX export published by StemSplitio on Hugging Face
+          (model card states MIT). The exact repository address and file hash are pinned in the
+          application's model manifest.
+
+Changes made by Tune Love: the ONNX file has been cut to a 1 second fixed-length window and its graph
+has been rewritten (the iSTFT ConvTranspose nodes are replaced by an equivalent MatMul plus Pad/Sum,
+and the GLU Split nodes by Slice, so that it runs correctly on DirectML). The weight values are not
+changed. The converted file is produced by scripts/models/convert.py and published by the Tune Love
+project on its GitHub Releases; it is not stored in the source repository.
+
+Training data: MUSDB18-HQ ("educational purposes only") plus 800 additional songs whose origin is not
+disclosed. The weights are therefore for non-commercial use only. This application is free and
+non-commercial, and the model is an optional download that the user must confirm.
+
+Demucs LICENSE (copied from the demucs 4.0.1 package):
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

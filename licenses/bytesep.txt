@@ -1,0 +1,37 @@
+bytesep MobileNet-Subbandtime vocals model (ByteDance music_source_separation)
+==============================================================================
+
+Code:     https://github.com/bytedance/music_source_separation (Apache-2.0, repository archived 2026-02-03)
+Weights:  Kong, Q., Cao, Y., Liu, H., Choi, K., Wang, Y. "Music Source Separation PyTorch Checkpoints",
+          Zenodo, https://doi.org/10.5281/zenodo.5804160  (checkpoint mobilenet_subbtandtime_vocals_7.2dB_500k_steps_v2.pth)
+          Licence: Creative Commons Attribution 4.0 International (CC BY 4.0),
+          https://creativecommons.org/licenses/by/4.0/
+PQMF:     the same authors, Zenodo, https://doi.org/10.5281/zenodo.5513378 (filters f_4_64.mat, h_4_64.mat), CC BY 4.0
+Paper:    Kong et al., "Decoupling Magnitude and Phase Estimation with Deep ResUNet for Music Source
+          Separation", ISMIR 2021.
+
+Changes made by Tune Love (CC BY 4.0 requires saying so): the model has been converted by Tune Love
+from PyTorch to ONNX (1 second fixed-length window) and its graph has been rewritten (the iSTFT
+overlap-add ConvTranspose is replaced by an equivalent MatMul plus Pad/Sum, so that it runs on
+DirectML). The weight values are not changed; on CPU the converted model reproduces the original
+output (scripts/models/convert.py checks SDR >= 100 dB). The converted file is published by the Tune
+Love project on its GitHub Releases; it is not stored in the source repository.
+
+Training data: MUSDB18, "provided for educational purposes only" (Zenodo 1117372). This application is
+free and non-commercial; users must judge their own use.
+
+Upstream LICENSE of the code (copied from the bytesep 0.1.1 package):
+--------------------------------------------------------------------------------
+Copyright 2021 ByteDance
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.

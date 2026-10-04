@@ -67,6 +67,18 @@ pub fn model_path_from(
         .and_then(|files| files.into_iter().next())
 }
 
+/// A model the manifest lists and a device the engine knows; anything else is refused here
+/// instead of being stored or forwarded.
+fn validate_selection(sel: &Selection) -> Result<(), String> {
+    if model::manifest::bundled().model(&sel.model_id).is_none() {
+        return Err(format!("unknown_model:{}", sel.model_id));
+    }
+    if !matches!(sel.device.as_str(), "auto" | "cpu" | "gpu") {
+        return Err(format!("unknown_device:{}", sel.device));
+    }
+    Ok(())
+}
+
 /// The selection an `enable` applies: each field the request leaves out keeps its previous
 /// value, so a frontend that does not send them keeps working.
 fn merge_selection(
@@ -224,8 +236,10 @@ impl DevocalState {
         let data_dir = lock(&self.shared.data_dir).clone();
         let selection = if action == "enable" {
             let mut last = lock(&self.shared.selection);
-            *last = merge_selection(&last, model_id, device);
-            last.clone()
+            let next = merge_selection(&last, model_id, device);
+            validate_selection(&next)?; // a bad request must not become the standing selection
+            *last = next.clone();
+            next
         } else {
             Selection::default() // unused by the other actions
         };
@@ -246,6 +260,16 @@ impl DevocalState {
         let status = sup.status();
         *lock(&self.shared.status) = status.clone();
         Ok(status)
+    }
+
+    /// Enable after a model download finished, as the user asked when starting it. Only while
+    /// StemgenRT is the selected model (the default, which the main window offers to download);
+    /// any other selection is left alone and nothing is enabled. `Ok(None)` when skipped.
+    pub fn auto_enable(&self) -> Result<Option<DevocalStatus>, String> {
+        if lock(&self.shared.selection).model_id != STEMGENRT_ID {
+            return Ok(None);
+        }
+        self.command("enable", None, None).map(Some)
     }
 
     /// A model install finished (any install, whether or not it auto-enables): clears an
@@ -340,13 +364,11 @@ fn build_supervisor(
         }
     });
     let pending = Box::new(move || restore_path.as_deref().is_some_and(Path::exists));
-    let stemgenrt = data_dir;
+    let models_dir = data_dir;
     Supervisor::new(spawn, run_restore, gate)
         .with_restore_pending(pending)
-        .with_stemgenrt_path(Box::new(move || {
-            stemgenrt
-                .as_deref()
-                .and_then(|dir| model_path(dir, STEMGENRT_ID))
+        .with_model_paths(Box::new(move |id| {
+            models_dir.as_deref().and_then(|dir| model_path(dir, id))
         }))
 }
 
@@ -677,6 +699,68 @@ pub(crate) mod tests {
         state.model_installed(); // no supervisor: nothing to clear
         assert_eq!(state.status(), DevocalStatus::off());
         state.shutdown(); // no thread: returns at once
+    }
+
+    #[test]
+    fn enable_rejects_an_unknown_model_or_device_before_changing_the_selection() {
+        let state = DevocalState::new(Arc::new(AttenuationGate::new()));
+        let good = Selection {
+            model_id: "bytesep-mobilenet-1s".into(),
+            device: "gpu".into(),
+        };
+        *lock(&state.shared.selection) = good.clone();
+        for (model, device) in [
+            (Some("no-such-model"), None),
+            (Some("../evil"), None),
+            (None, Some("tpu")),
+            (Some("htdemucs-ft-vocals-1s"), Some("")),
+        ] {
+            let err = state
+                .command("enable", model.map(String::from), device.map(String::from))
+                .unwrap_err();
+            assert!(
+                err.starts_with("unknown_model:") || err.starts_with("unknown_device:"),
+                "{err}"
+            );
+            assert_eq!(*lock(&state.shared.selection), good, "{model:?} {device:?}");
+        }
+        // Valid values pass validation (here they only fail on the missing supervisor) and are kept.
+        let err = state.command(
+            "enable",
+            Some("htdemucs-ft-vocals-1s".into()),
+            Some("cpu".into()),
+        );
+        assert_eq!(err.unwrap_err(), "devocal is not started yet");
+        assert_eq!(
+            lock(&state.shared.selection).model_id,
+            "htdemucs-ft-vocals-1s"
+        );
+        // Other actions do not look at the fields.
+        assert!(state
+            .command("disable", Some("no-such-model".into()), None)
+            .is_err());
+        assert_eq!(
+            lock(&state.shared.selection).model_id,
+            "htdemucs-ft-vocals-1s"
+        );
+    }
+
+    #[test]
+    fn auto_enable_only_when_stemgenrt_is_selected() {
+        let state = DevocalState::new(Arc::new(AttenuationGate::new()));
+        // The default selection is StemgenRT: it goes ahead (and only fails: no supervisor).
+        assert_eq!(
+            state.auto_enable().unwrap_err(),
+            "devocal is not started yet"
+        );
+        let other = Selection {
+            model_id: "bytesep-mobilenet-1s".into(),
+            device: "gpu".into(),
+        };
+        *lock(&state.shared.selection) = other.clone();
+        // Another model is selected: skipped, and the selection is left alone.
+        assert_eq!(state.auto_enable(), Ok(None));
+        assert_eq!(*lock(&state.shared.selection), other);
     }
 
     #[test]

@@ -332,8 +332,8 @@ pub struct Supervisor<L: EngineLink> {
     /// StemgenRT, loaded because a GPU-only model fell behind on the GPU. Kept until the
     /// selection changes: the engine's GPU ban does not survive an engine restart.
     fallback: Option<SentModel>,
-    /// Where StemgenRT is (verified install, or the env override).
-    stemgenrt_path: Box<dyn Fn() -> Option<PathBuf> + Send>,
+    /// Where an installed model is, by id (verified install, or the StemgenRT env override).
+    model_paths: Box<dyn Fn(&str) -> Option<PathBuf> + Send>,
     /// One `ModelLoadFailed` retry left for the current user action (ruling 5).
     model_retry: bool,
     /// Send `set_mode(true)` once the (new) engine has its handshake.
@@ -392,7 +392,7 @@ impl<L: EngineLink> Supervisor<L> {
             model: None,
             selection: Selection::default(),
             fallback: None,
-            stemgenrt_path: Box::new(|| None),
+            model_paths: Box::new(|_| None),
             model_retry: false,
             user_on_pending: false,
             restarting: false,
@@ -428,10 +428,11 @@ impl<L: EngineLink> Supervisor<L> {
         self
     }
 
-    /// Where to find StemgenRT for the switch after a GPU-only model fell behind. Without it
-    /// that switch reports `model_not_found:stemgenrt-hop128` and leaves the engine as it is.
-    pub fn with_stemgenrt_path(mut self, path: Box<dyn Fn() -> Option<PathBuf> + Send>) -> Self {
-        self.stemgenrt_path = path;
+    /// Where to find a model by id, when the supervisor needs one on its own: StemgenRT for the
+    /// switch after a GPU-only model fell behind, and the selected model for an engine spawned
+    /// after it was installed. Without it those cases leave the engine as it is.
+    pub fn with_model_paths(mut self, paths: Box<dyn Fn(&str) -> Option<PathBuf> + Send>) -> Self {
+        self.model_paths = paths;
         self
     }
 
@@ -910,6 +911,11 @@ impl<L: EngineLink> Supervisor<L> {
                 if !self.send(&Command::Hello { version: PROTOCOL }) {
                     return;
                 }
+                // The file may have been installed since `enable` found none (or never been
+                // looked for after a selection change): look it up for the selected model.
+                if self.model.is_none() {
+                    self.model = (self.model_paths)(&self.selection.model_id);
+                }
                 if self.model.is_some() {
                     self.send_set_model();
                 }
@@ -1117,6 +1123,8 @@ impl<L: EngineLink> Supervisor<L> {
             e.sent_model = Some(wanted);
             e.overload_handled = false;
             e.model_failed = false;
+            // Those belong to the model that was running: not for the new one's status.
+            e.metrics = None;
         }
         true
     }
@@ -1140,7 +1148,9 @@ impl<L: EngineLink> Supervisor<L> {
         if has_cpu {
             return;
         }
-        let Some(path) = (self.stemgenrt_path)() else {
+        let Some(path) = (self.model_paths)(STEMGENRT_ID) else {
+            // Like any missing model: `model_installed()` clears it.
+            self.unavailable = true;
             self.error = Some(format!("model_not_found:{STEMGENRT_ID}"));
             return;
         };
@@ -1239,7 +1249,11 @@ mod tests {
             gate.clone(),
         )
         .with_restore_pending(Box::new(move || restore_pending))
-        .with_stemgenrt_path(Box::new(|| Some(model())))
+        .with_model_paths(Box::new(|id| match id {
+            "bytesep-mobilenet-1s" => Some(bytesep_path()),
+            "htdemucs-ft-vocals-1s" => Some(htdemucs_path()),
+            _ => Some(model()),
+        }))
         .with_shutdown_wait(Duration::from_millis(50));
         Rig {
             sup,
@@ -2612,5 +2626,66 @@ mod tests {
         r.sup.tick(300, Some(p), true);
         let s = r.sup.status();
         assert_eq!((s.device, s.device_note), (Some("gpu"), None));
+    }
+
+    #[test]
+    fn set_model_drops_the_old_models_metrics_from_the_status() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().push(device_metrics(
+            Device::Cpu,
+            Some(DeviceNote::GpuUnavailable),
+        ));
+        r.sup.tick(200, Some(p), true);
+        assert_eq!(r.sup.status().device, Some("cpu"));
+        r.sup.enable(Some(bytesep_path()), bytesep());
+        let s = r.sup.status();
+        assert_eq!(s.model_id.as_deref(), Some("bytesep-mobilenet-1s"));
+        assert_eq!((s.device, s.device_note, s.latency_ms), (None, None, None));
+    }
+
+    #[test]
+    fn missing_stemgenrt_after_an_overload_is_unavailable_until_it_is_installed() {
+        let mut r = rig();
+        r.sup = std::mem::replace(&mut r.sup, rig().sup).with_model_paths(Box::new(|id| {
+            (id != "stemgenrt-hop128").then(htdemucs_path)
+        }));
+        let p = player(7);
+        r.sup.enable(Some(htdemucs_path()), htdemucs());
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().push(state(Phase::Attaching, None));
+        r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+        r.sup.tick(100, Some(p), true);
+        r.last().clear_sent();
+        r.last()
+            .push(device_metrics(Device::Gpu, Some(DeviceNote::GpuOverloaded)));
+        r.sup.tick(200, Some(player(7)), true);
+        assert_eq!(r.last().sent(), vec![], "nothing to switch to");
+        let s = r.sup.status();
+        assert_eq!(s.phase, "unavailable");
+        assert_eq!(s.error.as_deref(), Some("model_not_found:stemgenrt-hop128"));
+        // The install clears it like any other missing model.
+        r.sup.model_installed();
+        let s = r.sup.status();
+        assert_eq!(s.error, None);
+        assert_ne!(s.phase, "unavailable");
+    }
+
+    #[test]
+    fn a_new_engine_gets_the_selected_model_once_it_is_installed() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        // The user picks a model that is not installed yet: unavailable, the engine runs on.
+        r.sup.enable(None, bytesep());
+        assert_eq!(r.phase(), "unavailable");
+        // The engine goes away, the model gets installed, and a new engine is started.
+        r.last().exit();
+        r.sup.tick(1_000, Some(p.clone()), true);
+        r.sup.model_installed();
+        r.sup.tick(1_100, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 2);
+        assert_eq!(r.engine(1).sent()[1], bytesep_set_model("gpu"));
     }
 }

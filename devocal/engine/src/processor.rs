@@ -229,15 +229,18 @@ impl Processor {
     }
 
     /// Input discontinuity (seek, glitch): clears the model state and the passthrough delay.
-    /// The stage is kept; a warm-up in progress starts over so the fresh model state still
-    /// gets the full 200 ms before it becomes audible.
+    /// The stage is kept, except that a warm-up or fade-in in progress (re)starts the warm-up,
+    /// so the fresh model state still gets the full warm-up before it becomes audible.
     pub fn on_discontinuity(&mut self) {
         if let Some(sep) = self.separator.as_mut() {
             sep.reset();
         }
         self.delay.reset();
-        if self.stage == Stage::WarmingUp {
+        // A fade-in in progress goes back to warm-up too: the reset window model is silent
+        // again and the fade would complete into silence.
+        if matches!(self.stage, Stage::WarmingUp | Stage::FadingIn) {
             self.warm_left = self.warm_frames;
+            self.stage = Stage::WarmingUp;
         }
     }
 
@@ -609,6 +612,23 @@ mod tests {
         }
         assert_eq!(rig.block().stage, Stage::FadingIn);
         // The first fade-in block already carries model output, not its initial silence.
+        rig.block();
+        assert!(rig.out.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn discontinuity_during_fade_in_rearms_the_warm_up() {
+        let mut rig = Rig::new(Processor::new(Some(Box::<SplitSep>::default())), zero);
+        rig.p.request_devocal(true);
+        rig.run_until(Stage::FadingIn);
+        rig.block();
+        // The model is reset: a window model is silent again, so the fade must not go on.
+        rig.p.on_discontinuity();
+        assert_eq!(rig.p.stage(), Stage::WarmingUp);
+        for _ in 0..78 {
+            assert_eq!(rig.block().stage, Stage::WarmingUp);
+        }
+        assert_eq!(rig.block().stage, Stage::FadingIn);
         rig.block();
         assert!(rig.out.iter().any(|&s| s != 0.0));
     }

@@ -28,6 +28,7 @@ async function prepare(page: Page, view: string, opts: { selection?: Record<stri
         if (command === "get_devocal_status") return structuredClone(state.devocal);
         if (command === "devocal_command") {
           state.devocalRequests.push(args.request);
+          await new Promise(resolve => setTimeout(resolve, state.commandDelayMs ?? 0));
           if (args.request.action === "enable") state.devocal = { ...state.devocal, phase: "devocal", held: true, latencyMs: 45.4, error: null };
           return structuredClone(state.devocal);
         }
@@ -203,4 +204,28 @@ test("a model or device change while devocal is off sends nothing", async ({ pag
   await expect(radio(page, "GPU")).toBeChecked();
   await page.waitForTimeout(500);
   expect(await requests(page)).toEqual([]);
+});
+
+test("device changes made while an enable is in flight coalesce into one trailing enable with the latest selection", async ({ page }) => {
+  await prepare(page, SETTINGS, { devocal: ON });
+  await page.evaluate(() => { (window as any).commandDelayMs = 400; });
+  await radio(page, "GPU").click();
+  await radio(page, "CPU").click();
+  await radio(page, "自动").click();
+  await expect.poll(async () => (await requests(page)).length).toBe(2);
+  await page.waitForTimeout(1000);
+  expect(await requests(page)).toEqual([
+    { action: "enable", modelId: STEM, device: "gpu" },
+    { action: "enable", modelId: STEM, device: "auto" },
+  ]);
+});
+
+test("focus from the hint lands once; picking another model does not move it to that row's download button", async ({ page }) => {
+  await prepare(page, "/?view=settings&section=devocal-model", { selection: { modelId: BYTE, device: "auto" } });
+  const byte = page.getByRole("group", { name: "bytesep MobileNet（高质量）" });
+  await expect(byte.getByRole("button", { name: /^下载模型/ })).toBeFocused();
+  await radio(page, "StemgenRT（默认，低延迟）").click();
+  await expect(radio(page, "StemgenRT（默认，低延迟）")).toBeChecked();
+  await page.waitForTimeout(300);
+  await expect(page.getByRole("group", { name: "StemgenRT（低延迟）" }).getByRole("button", { name: /^下载模型/ })).not.toBeFocused();
 });

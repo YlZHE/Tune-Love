@@ -29,6 +29,10 @@ export function ModelSection({ autoEnablePending, onAutoEnableConsumed, focusSeq
 }) {
   const { statuses, send } = useModelDownload();
   const selection = useDevocalModelPreference();
+  // The row a focus request is for is fixed when the request arrives (the selected row then);
+  // choosing another model later must not pull focus to that row's button.
+  const focusTarget = useRef<{ seq: number; id: string } | null>(null);
+  if ((focusTarget.current?.seq ?? 0) !== focusSeq) focusTarget.current = focusSeq ? { seq: focusSeq, id: selection.modelId } : null;
   const [pending, setPending] = useState<ModelInfo | null>(null);
   const [saveError, setSaveError] = useState("");
   const save = (modelId: string) => {
@@ -44,7 +48,7 @@ export function ModelSection({ autoEnablePending, onAutoEnableConsumed, focusSeq
     {MODEL_MANIFEST.models.map(model => {
       const target = model.id === selection.modelId;
       return <ModelRow key={model.id} model={model} status={statuses?.find(s => s.id === model.id) ?? null} send={send} selected={target}
-        autoEnable={target && model.id === STEMGENRT_ID && autoEnablePending} onAutoEnableConsumed={onAutoEnableConsumed} focusSeq={target ? focusSeq : 0} />;
+        autoEnable={target && model.id === STEMGENRT_ID && autoEnablePending} onAutoEnableConsumed={onAutoEnableConsumed} focusSeq={focusTarget.current?.id === model.id ? focusSeq : 0} />;
     })}
     {saveError && <p role="alert" className="color-error">{saveError}</p>}
     <QualityTierDialog model={pending} latencyMs={pending ? qualityLatencyMs(pending, selection.device) : 0}

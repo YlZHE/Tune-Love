@@ -3,7 +3,7 @@
     convert.py bytesep   --src bytesep_mobilenet_vocals_1s.onnx --out <dir>
     convert.py htdemucs  --src htdemucs_ft_vocals_1s.onnx       --out <dir>
 
-Provenance of the --src files (made by scripts in artifacts/separation-bench/src, not stored in git):
+Provenance of the --src files (made by export_bytesep.py / export_short.py next to this file):
   bytesep:  Zenodo 5804160 checkpoint .pth (MD5 197abd4c514fcc92bd22fb1fe77d5f3a) + Zenodo 5513378
             PQMF .mat files -> export_bytesep.py (torch.onnx.export, opset 17, 1 s window) -> 1 s ONNX
             -> convert.py.

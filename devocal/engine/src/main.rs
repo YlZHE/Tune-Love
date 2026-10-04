@@ -20,6 +20,8 @@ mod separator;
 mod state;
 #[allow(dead_code)]
 mod stemgen;
+#[allow(dead_code)]
+mod windowed;
 
 fn main() {
     let args = match engine::parse_args(std::env::args().skip(1)) {

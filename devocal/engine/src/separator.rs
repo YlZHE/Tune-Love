@@ -9,6 +9,11 @@ pub trait Separator: Send {
     fn sample_rate(&self) -> u32;
     fn hop(&self) -> usize;
     fn latency_frames(&self) -> usize;
+    /// Latency of the pass-through (devocal off) path paired with this separator. Defaults to
+    /// `latency_frames()`; window separators keep pass-through at one block.
+    fn passthrough_latency_frames(&self) -> usize {
+        self.latency_frames()
+    }
     /// `input` and `out_accompaniment` must both be `hop() * 2` samples long. Errors (bad
     /// length, inference failure) are reported as `Err`, never as a panic; the contents of
     /// `out_accompaniment` are unspecified after an error.

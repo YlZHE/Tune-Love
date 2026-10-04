@@ -30,7 +30,8 @@ use crate::separator::Separator;
 /// model later does not change the timing.
 pub const NO_MODEL_HOP: usize = 128;
 pub const NO_MODEL_LATENCY_FRAMES: usize = 128;
-/// The model runs (in parallel with the passthrough) this long before the fade-in.
+/// The model runs (in parallel with the passthrough) this long before the fade-in (longer
+/// if its latency is longer).
 pub const WARM_UP_MS: f32 = 200.0;
 /// Equal-power crossfade between passthrough and accompaniment.
 pub const FADE_MS: f32 = 20.0;
@@ -143,7 +144,12 @@ impl Processor {
         self.delay = DelayLine::new(passthrough_frames);
         self.stage = Stage::Passthrough;
         self.fallback = None;
-        self.warm_frames = frames_for_ms(WARM_UP_MS).div_ceil(self.hop) * self.hop;
+        // At least the model's latency: until then a window model's output is still its
+        // initial silence and must not be faded in.
+        self.warm_frames = frames_for_ms(WARM_UP_MS)
+            .max(latency_frames)
+            .div_ceil(self.hop)
+            * self.hop;
         self.warm_left = 0;
         self.fade = Crossfade::new(self.fade.frames());
         let samples = self.hop * 2;
@@ -482,6 +488,10 @@ mod tests {
         )
     }
 
+    fn zero(_n: usize) -> f32 {
+        0.0
+    }
+
     fn neg_half(_n: usize) -> f32 {
         -0.5
     }
@@ -558,8 +568,12 @@ mod tests {
         }
     }
 
-    /// Window-model stand-in: latency 10000, passthrough 128; accompaniment is constant.
-    struct SplitSep;
+    /// Window-model stand-in: latency 10000, passthrough 128. The accompaniment is silent
+    /// for the first 10000 frames after a reset, then constant.
+    #[derive(Default)]
+    struct SplitSep {
+        fed: usize,
+    }
 
     impl Separator for SplitSep {
         fn sample_rate(&self) -> u32 {
@@ -576,15 +590,32 @@ mod tests {
         }
         fn process(&mut self, input: &[f32], out: &mut [f32]) -> Result<(), String> {
             check_block(HOP, input, out)?;
-            out.fill(ACC);
+            out.fill(if self.fed >= 10_000 { ACC } else { 0.0 });
+            self.fed += HOP;
             Ok(())
         }
-        fn reset(&mut self) {}
+        fn reset(&mut self) {
+            self.fed = 0;
+        }
+    }
+
+    #[test]
+    fn warm_up_covers_the_model_latency() {
+        let mut rig = Rig::new(Processor::new(Some(Box::<SplitSep>::default())), zero);
+        rig.p.request_devocal(true);
+        // 10000 frames are fed after 78.125 blocks; the stage must outlast them (79 blocks).
+        for _ in 0..78 {
+            assert_eq!(rig.block().stage, Stage::WarmingUp);
+        }
+        assert_eq!(rig.block().stage, Stage::FadingIn);
+        // The first fade-in block already carries model output, not its initial silence.
+        rig.block();
+        assert!(rig.out.iter().any(|&s| s != 0.0));
     }
 
     #[test]
     fn passthrough_uses_its_own_latency() {
-        let mut rig = Rig::new(Processor::new(Some(Box::new(SplitSep))), ramp);
+        let mut rig = Rig::new(Processor::new(Some(Box::<SplitSep>::default())), ramp);
         assert_eq!(rig.p.latency_frames(), 10_000);
         assert_eq!(rig.p.passthrough_latency_frames(), HOP);
         rig.block();
@@ -608,7 +639,7 @@ mod tests {
 
     #[test]
     fn devocal_after_fade_uses_model_latency() {
-        let mut rig = Rig::new(Processor::new(Some(Box::new(SplitSep))), ramp);
+        let mut rig = Rig::new(Processor::new(Some(Box::<SplitSep>::default())), ramp);
         rig.p.request_devocal(true);
         rig.run_until(Stage::Devocal);
         rig.block();
@@ -624,7 +655,7 @@ mod tests {
 
     #[test]
     fn published_latency_follows_stage() {
-        let mut rig = Rig::new(Processor::new(Some(Box::new(SplitSep))), ramp);
+        let mut rig = Rig::new(Processor::new(Some(Box::<SplitSep>::default())), ramp);
         let model = 10_000;
         assert_eq!(rig.p.stage(), Stage::Passthrough);
         assert_eq!(rig.p.output_latency_frames(), HOP);

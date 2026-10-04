@@ -3,14 +3,16 @@
 //! hop to a dedicated inference thread, then stitches the returned accompaniment at a fixed
 //! latency of H + L + ceil(0.3 H).
 //!
-//! Stitching (plan Ruling 1; reference `scripts/models/stitch_fixture.py`): segment k covers
-//! input `[kH, kH+H)` and comes from window positions `[W-L-H-XF, W-L)`, i.e. input
-//! `[kH-XF, kH+H)`; accompaniment = window - vocals there. Its first XF frames crossfade
-//! linearly with the previous segment's tail. A segment whose result is missing or took
-//! longer than 0.3 H is replaced by the dry input (same fade) and counted as a timeout.
+//! Stitching (plan Ruling 1, crossfade placed after kH per Task 3 ruling 3; reference
+//! `scripts/models/stitch_fixture.py`): segment k comes from window positions
+//! `[W-L-H, W-L+XF)`, i.e. input `[kH, kH+H+XF)`; accompaniment = window - vocals there.
+//! Over `[kH, kH+XF)` it crossfades linearly from segment k-1's extra tail (silence before
+//! segment 0); `[kH+XF, kH+H)` is segment k alone; its last XF frames are the tail for k+1.
+//! A segment whose result is missing or took longer than ceil(0.3 H) is replaced by the dry
+//! input (same fades) and counted as a timeout.
 //!
-//! The crossfade sits before kH, so a result is needed `ceil(0.3 H) - XF` frames (less up to
-//! one block) after its window is complete, not the full 0.3 H.
+//! Nothing before kH depends on window k, so its result has the full ceil(0.3 H) after the
+//! window completes.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -114,7 +116,7 @@ fn frames_to_ns(frames: usize) -> f64 {
 
 impl WindowedSeparator {
     /// Spawns the inference worker. Panics on geometry that cannot work: the window must hold
-    /// hop + lookahead + crossfade, and the 0.3 H budget must exceed the crossfade.
+    /// hop + lookahead, and both hop and lookahead must cover the crossfade.
     pub fn new(model: Box<dyn WindowModel>, p: WindowedParams) -> Self {
         let t0 = Instant::now();
         Self::with_clock(model, p, Box::new(move || t0.elapsed().as_nanos() as u64))
@@ -123,13 +125,10 @@ impl WindowedSeparator {
     fn with_clock(model: Box<dyn WindowModel>, p: WindowedParams, clock: Clock) -> Self {
         let (w, h, l) = (p.window_frames, p.hop_frames, p.lookahead_frames);
         let budget = (3 * h).div_ceil(10);
+        assert!(w >= h + l, "window {w} < hop {h} + lookahead {l}");
         assert!(
-            w >= h + l + XF,
-            "window {w} < hop {h} + lookahead {l} + {XF}"
-        );
-        assert!(
-            budget > XF,
-            "0.3 x hop ({budget}) must exceed the {XF}-frame crossfade"
+            h >= XF && l >= XF,
+            "hop {h} and lookahead {l} must cover the {XF}-frame crossfade"
         );
         let latency = h + l + budget;
         let seg_len = (h + XF) * 2;
@@ -198,7 +197,7 @@ impl WindowedSeparator {
         f32::from_bits(self.shared.duty_bits.load(Ordering::Relaxed))
     }
 
-    /// 3 consecutive timeouts so far (latched, kept across `reset`), or `duty_10s() > 0.3`.
+    /// 3 consecutive timeouts since the last `reset` (latched), or `duty_10s() > 0.3`.
     pub fn overloaded(&self) -> bool {
         self.tripped || self.duty_10s() > DUTY_LIMIT
     }
@@ -264,25 +263,22 @@ impl WindowedSeparator {
             // Older segment, previous generation, or over the time limit.
             self.discard_outcome();
         }
-        let first = (k as usize * self.h) as i64 - XF as i64;
+        let first = k as usize * self.h;
         if fresh {
             self.consecutive = 0;
         } else {
             for i in 0..self.h + XF {
                 for c in 0..2 {
-                    self.seg[i * 2 + c] = self.hist_at(first + i as i64, c);
+                    self.seg[i * 2 + c] = self.hist_at((first + i) as i64, c);
                 }
             }
             self.timeouts += 1;
             self.consecutive += 1;
             self.tripped |= self.consecutive >= OVERLOAD_TIMEOUTS;
         }
+        // `stage` over [kH, kH+XF) still holds segment k-1's tail (zeros before segment 0).
         for i in 0..self.h + XF {
-            let a = first + i as i64;
-            if a < 0 {
-                continue;
-            }
-            let at = (a as usize % self.stage_frames) * 2;
+            let at = ((first + i) % self.stage_frames) * 2;
             for c in 0..2 {
                 let v = self.seg[i * 2 + c];
                 let s = &mut self.stage[at + c];
@@ -337,11 +333,11 @@ impl Separator for WindowedSeparator {
         }
 
         // Output frame t plays input frame t - latency. Resolve every segment touching this
-        // block first (segment k reaches back to kH - XF).
+        // block first (input frame a needs segment floor(a / H), and the ones before it).
         let first = self.pos as i64 - (WINDOWED_HOP + self.latency) as i64;
         let end = first + WINDOWED_HOP as i64;
         if end > 0 {
-            let need = (end as u64 - 1 + XF as u64) / self.h as u64;
+            let need = (end as u64 - 1) / self.h as u64;
             while self.next_seg <= need {
                 self.resolve(self.next_seg);
                 self.next_seg += 1;
@@ -365,7 +361,8 @@ impl Separator for WindowedSeparator {
     }
 
     /// Restarts the stream. Queued and in-flight windows belong to the old generation and are
-    /// dropped (by the worker, or here when their results come back).
+    /// dropped (by the worker, or here when their results come back). The 3-timeouts overload
+    /// latch is cleared; the duty mean is a property of the device and keeps rolling.
     fn reset(&mut self) {
         self.generation += 1;
         self.shared
@@ -380,6 +377,7 @@ impl Separator for WindowedSeparator {
         self.next_job = 0;
         self.next_seg = 0;
         self.consecutive = 0;
+        self.tripped = false;
     }
 }
 
@@ -415,7 +413,7 @@ impl Worker {
         let mut win = vec![0.0f32; w * 2];
         let mut vocals = vec![0.0f32; w * 2];
         let mut acc = vec![0.0f32; (h + XF) * 2];
-        let part = (w - l - h - XF) * 2..(w - l) * 2;
+        let part = (w - l - h) * 2..(w - l + XF) * 2;
         let hop_ns = frames_to_ns(h);
         let duty_len = (DUTY_WINDOW_S * SAMPLE_RATE as usize).div_ceil(h);
         let mut duty: VecDeque<f64> = VecDeque::with_capacity(duty_len + 1);
@@ -471,32 +469,35 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /// Test geometry: H is not a multiple of the 128-frame block, and the inference budget
-    /// left after the crossfade (ceil(0.3 H) - XF = 155 frames) exceeds one block, so a paced
+    /// Test geometry: H is not a multiple of the 128-frame block, L covers the crossfade tail,
+    /// and the inference budget (ceil(0.3 H) = 375 frames) exceeds one block, so a paced
     /// stream never needs a window in the same call that submits it.
     const P: WindowedParams = WindowedParams {
         window_frames: 2000,
         hop_frames: 1250,
-        lookahead_frames: 200,
+        lookahead_frames: 300,
     };
     const H: usize = 1250;
-    const D: usize = 1250 + 200 + 375;
+    const L: usize = 300;
+    const BUDGET: usize = 375;
+    const D: usize = H + L + BUDGET;
     const H_NS: u64 = 1250 * 1_000_000_000 / 44_100;
 
     /// Fake model: vocals = 0.5 x window. Each run "takes" `sleep(call index)` x H on the
-    /// injected clock; the first run can be held on a gate.
+    /// injected clock; one run (by call index) can be held on a gate.
     struct Fake {
         clock: Arc<AtomicU64>,
         sleep: Box<dyn Fn(usize) -> f64 + Send>,
         calls: usize,
-        /// (set on entering the held run, release)
-        gate: Option<(Arc<AtomicBool>, Receiver<()>)>,
+        /// (call index to hold, set on entering it, release)
+        gate: Option<(usize, Arc<AtomicBool>, Receiver<()>)>,
         dropped: Option<Arc<AtomicBool>>,
     }
 
     impl WindowModel for Fake {
         fn run(&mut self, input: &[f32], vocals: &mut [f32]) -> Result<(), String> {
-            if let Some((entered, release)) = self.gate.take() {
+            if self.gate.as_ref().is_some_and(|g| g.0 == self.calls) {
+                let (_, entered, release) = self.gate.take().unwrap();
                 entered.store(true, Ordering::SeqCst);
                 release.recv_timeout(Duration::from_secs(5)).unwrap();
             }
@@ -607,16 +608,16 @@ mod tests {
         assert_eq!(sep.passthrough_latency_frames(), 128);
         assert_eq!(sep.hop(), 128);
         assert_eq!(sep.sample_rate(), 44_100);
-        // One impulse mid-segment, one inside a crossfade ([2H - XF, 2H)).
+        // One impulse mid-segment, one inside a crossfade ([2H, 2H + XF)).
         let frames = 40 * 128;
         let mut input = vec![0.0f32; frames * 2];
-        for p in [2400, 3000] {
+        for p in [2600, 3000] {
             input[p * 2] = 1.0;
             input[p * 2 + 1] = -1.0;
         }
         let out = run_paced(&mut sep, &input);
         for t in 0..frames {
-            let want = if t == 2400 + D || t == 3000 + D {
+            let want = if t == 2600 + D || t == 3000 + D {
                 0.5
             } else {
                 0.0
@@ -698,21 +699,25 @@ mod tests {
     #[test]
     fn timeout_outputs_dry_aligned_audio() {
         let mut sep = make(|k| if k == 2 { 0.5 } else { 0.0 });
-        let frames = 44 * 128;
+        let frames = 48 * 128;
         let input = noise(7, frames);
         let out = run_paced(&mut sep, &input);
         assert_eq!(sep.timeouts(), 1);
         assert!(!sep.overloaded());
-        // Accompaniment per input frame a: 0.5 x except segment 2 ([2H - XF, 3H)), which is
-        // the dry input, faded in over [2H - XF, 2H) and out over [3H - XF, 3H).
+        // Accompaniment per input frame a: 0.5 x (faded in from silence over [0, XF)) except
+        // segment 2 ([2H, 3H + XF)), which is the dry input, faded in over [2H, 2H + XF) and
+        // out (as the tail under segment 3) over [3H, 3H + XF).
+        assert!(frames - D >= 3 * H + XF);
         for a in 0..frames - D {
-            let gain = if (2 * H - XF..2 * H).contains(&a) {
-                let r = ramp(a - (2 * H - XF));
+            let gain = if a < XF {
+                0.5 * ramp(a)
+            } else if (2 * H..2 * H + XF).contains(&a) {
+                let r = ramp(a - 2 * H);
                 0.5 * (1.0 - r) + r
-            } else if (2 * H..3 * H - XF).contains(&a) {
+            } else if (2 * H + XF..3 * H).contains(&a) {
                 1.0
-            } else if (3 * H - XF..3 * H).contains(&a) {
-                let r = ramp(a - (3 * H - XF));
+            } else if (3 * H..3 * H + XF).contains(&a) {
+                let r = ramp(a - 3 * H);
                 (1.0 - r) + 0.5 * r
             } else {
                 0.5
@@ -755,6 +760,73 @@ mod tests {
         }
         assert_eq!(sep.timeouts(), 3);
         assert!(sep.overloaded());
+        // A reset starts a fresh generation: the latch clears (duty here is ~0.21).
+        sep.reset();
+        assert!(sep.duty_10s() < 0.3);
+        assert!(!sep.overloaded());
+    }
+
+    #[test]
+    fn full_budget_is_usable() {
+        // Window 2 completes at input frame e; its result is first needed by the call that
+        // emits input frame 2H. Hold the result until after the call before that one.
+        let e = 3 * H + L;
+        let submit_call = e.div_ceil(WINDOWED_HOP) - 1;
+        let need_call = (2 * H + D + 1).div_ceil(WINDOWED_HOP) - 1;
+        let last_ok = need_call - 1;
+        let arrival = (last_ok + 1) * WINDOWED_HOP - e;
+        assert!(
+            arrival >= BUDGET - WINDOWED_HOP,
+            "arrival {arrival} frames after the window covers ceil(0.3 H) - 1 block"
+        );
+        let (mut model, clock) = fake(|k| {
+            if k == 2 {
+                (BUDGET - WINDOWED_HOP) as f64 / H as f64
+            } else {
+                0.0
+            }
+        });
+        let (release, gate) = channel();
+        model.gate = Some((2, Arc::new(AtomicBool::new(false)), gate));
+        let mut sep = WindowedSeparator::with_clock(Box::new(model), P, clock);
+        let frames = 46 * 128;
+        let input = noise(13, frames);
+        let mut out = vec![0.0f32; frames * 2];
+        let n = WINDOWED_HOP * 2;
+        for (c, (block, o)) in input
+            .chunks_exact(n)
+            .zip(out.chunks_exact_mut(n))
+            .enumerate()
+        {
+            sep.process(block, o).unwrap();
+            if c == last_ok {
+                assert_eq!(sep.timeouts(), 0);
+                release.send(()).unwrap();
+            }
+            if c < submit_call || c >= last_ok {
+                wait_idle(&sep);
+            }
+        }
+        assert_eq!(sep.timeouts(), 0, "a result within the budget is used");
+        for a in 2 * H..3 * H {
+            for c in 0..2 {
+                let want = 0.5 * input[a * 2 + c];
+                assert!((out[(a + D) * 2 + c] - want).abs() <= 1e-6, "frame {a}");
+            }
+        }
+
+        // Measured inference time: exactly ceil(0.3 H) is on time, one frame more is not.
+        for (frames_taken, timeouts) in [(BUDGET, 0), (BUDGET + 1, 1)] {
+            let mut sep = make(move |k| {
+                if k == 2 {
+                    frames_taken as f64 / H as f64
+                } else {
+                    0.0
+                }
+            });
+            run_paced(&mut sep, &input);
+            assert_eq!(sep.timeouts(), timeouts, "{frames_taken} frames");
+        }
     }
 
     /// Feeds silent blocks until `jobs` windows have been submitted and finished.
@@ -796,7 +868,7 @@ mod tests {
         let (mut model, clock) = fake(|_| 0.0);
         let (release, gate) = channel();
         let entered = Arc::new(AtomicBool::new(false));
-        model.gate = Some((entered.clone(), gate));
+        model.gate = Some((0, entered.clone(), gate));
         let mut sep = WindowedSeparator::with_clock(Box::new(model), P, clock);
         // Window 0 is submitted and held inside the model.
         let loud = vec![1.0f32; WINDOWED_HOP * 2];

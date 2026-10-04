@@ -1267,6 +1267,7 @@ impl<S: SessionVolumes, A: AudioPort> EngineCore<S, A> {
             device_note: self.device.and_then(|(_, n)| n),
             window_timeouts: s.window_timeouts,
             window_duty: s.window_duty,
+            model_id: self.model.as_ref().map(|m| m.id.clone()),
         }));
     }
 }
@@ -2422,6 +2423,28 @@ mod tests {
         );
         r.send(set_windowed("bytesep", "gpu", true));
         assert!(!r.loads.borrow().last.as_ref().unwrap().gpu_banned);
+    }
+
+    /// The metrics name the model actually loaded: a failed switch keeps the old one.
+    #[test]
+    fn metrics_name_the_loaded_model() {
+        let mut r = attached_with("model-id", set_windowed("bytesep", "gpu", true));
+        assert_eq!(
+            last_metrics(&r.run(1_100)).model_id.as_deref(),
+            Some("bytesep")
+        );
+        let ev = r.send(Command::SetModel {
+            id: "other".into(),
+            path: PathBuf::from("other-bad.onnx"),
+            device: "gpu".into(),
+            threads: 1,
+            windowed: Some(windowed_spec(true)),
+        });
+        assert_eq!(errors(&ev), vec![ErrorCode::ModelLoadFailed]);
+        assert_eq!(
+            last_metrics(&r.run(1_100)).model_id.as_deref(),
+            Some("bytesep")
+        );
     }
 
     #[test]

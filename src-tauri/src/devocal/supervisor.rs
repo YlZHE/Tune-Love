@@ -153,8 +153,9 @@ pub struct DevocalStatus {
     /// sees `attaching`.
     pub waiting_for_player: bool,
     pub error: Option<String>,
-    /// The model the engine is told to run: the selected one, or StemgenRT after a GPU-only
-    /// model fell behind (the selection itself is unchanged then). `None` before the first status.
+    /// The model actually running: the engine's report while active (a failed switch keeps the
+    /// old model), else the one last sent, else the one to send (the selection, or StemgenRT
+    /// after a GPU-only model fell behind). `None` before the first status.
     pub model_id: Option<String>,
     /// cpu | gpu: what the loaded model runs on (from the engine's Metrics while active).
     pub device: Option<&'static str>,
@@ -455,13 +456,14 @@ impl<L: EngineLink> Supervisor<L> {
         self.attach_failures = 0;
         self.attach_gave_up = false;
         let Some(model) = model else {
-            self.unavailable = true;
             self.error = Some(format!("model_not_found:{}", self.selection.model_id));
+            // A running engine is left as it is: it keeps its model and phase, so the toggle
+            // still reads (and turns) it on or off; only the error names the missing model.
             // With no engine running, a wish left from an earlier enable must not survive this
             // failed one: otherwise a later install (which clears `unavailable`) would spawn an
-            // engine, take over the player and turn devocal on with nobody asking. A running
-            // engine is left as it is; it already holds the player.
+            // engine, take over the player and turn devocal on with nobody asking.
             if self.engine.is_none() {
+                self.unavailable = true;
                 self.want_hold = false;
                 self.want_devocal = false;
                 self.user_on_pending = false;
@@ -500,14 +502,14 @@ impl<L: EngineLink> Supervisor<L> {
         }
     }
 
-    /// A model was installed (downloaded or imported): an `unavailable` caused only by the missing
-    /// model no longer applies. Does not enable devocal; any other condition is left as it is.
+    /// A model was installed (downloaded or imported): a missing-model error (and the
+    /// `unavailable` it caused) no longer applies. Does not enable devocal; any other condition
+    /// is left as it is.
     pub fn model_installed(&mut self) {
-        if self.unavailable
-            && self
-                .error
-                .as_deref()
-                .is_some_and(|e| e.starts_with("model_not_found:"))
+        if self
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("model_not_found:"))
         {
             self.unavailable = false;
             self.error = None;
@@ -622,7 +624,12 @@ impl<L: EngineLink> Supervisor<L> {
                 && active_metrics.is_some_and(|m| m.input_silent_ms >= INPUT_SILENT_MS),
             waiting_for_player,
             error: self.error.clone(),
-            model_id: Some(self.wanted_id().to_string()),
+            // The model the engine reports loaded (a failed switch keeps the old one), else the
+            // one it was last sent, else the one it will be sent.
+            model_id: active_metrics
+                .and_then(|m| m.model_id.clone())
+                .or_else(|| e.and_then(|e| e.sent_model.as_ref()).map(|s| s.id.clone()))
+                .or_else(|| Some(self.wanted_id().to_string())),
             device: active_metrics.and_then(|m| m.device).map(|d| match d {
                 Device::Cpu => "cpu",
                 Device::Gpu => "gpu",
@@ -1329,6 +1336,7 @@ mod tests {
             device_note: None,
             window_timeouts: None,
             window_duty: None,
+            model_id: None,
         })
     }
 
@@ -2224,6 +2232,7 @@ mod tests {
             device_note: None,
             window_timeouts: None,
             window_duty: None,
+            model_id: None,
         }));
         r.sup.tick(1_000, Some(p.clone()), true);
         let s = r.sup.status();
@@ -2632,6 +2641,68 @@ mod tests {
         assert_eq!((s.device, s.device_note), (Some("gpu"), None));
     }
 
+    /// Metrics from an engine running `id` on `device`.
+    fn loaded_metrics(id: &str, device: Device) -> Event {
+        let Event::Metrics(mut m) = device_metrics(device, None) else {
+            unreachable!()
+        };
+        m.model_id = Some(id.into());
+        Event::Metrics(m)
+    }
+
+    /// I3: a switch that fails for good leaves the old model running; the status names it.
+    #[test]
+    fn a_failed_switch_reports_the_model_still_running() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last()
+            .push(loaded_metrics("stemgenrt-hop128", Device::Cpu));
+        r.sup.tick(200, Some(p.clone()), true);
+        r.sup.enable(Some(bytesep_path()), bytesep());
+        // The retry fails too.
+        r.last().push(error(ErrorCode::ModelLoadFailed));
+        r.sup.tick(300, Some(p.clone()), true);
+        r.last().push(error(ErrorCode::ModelLoadFailed));
+        r.last()
+            .push(loaded_metrics("stemgenrt-hop128", Device::Cpu));
+        r.sup.tick(400, Some(p), true);
+        let s = r.sup.status();
+        assert_eq!(s.phase, "devocal");
+        assert_eq!(s.model_id.as_deref(), Some("stemgenrt-hop128"));
+        assert_eq!(s.device, Some("cpu"));
+        assert_eq!(s.error.as_deref(), Some("model_load_failed: x"));
+    }
+
+    /// I2: `enable` for a model that is not installed while the engine runs another one keeps
+    /// that model, its phase and a working toggle; only the error names the missing model.
+    #[test]
+    fn enabling_a_missing_model_while_another_runs_keeps_it_and_the_toggle() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last()
+            .push(loaded_metrics("stemgenrt-hop128", Device::Cpu));
+        r.sup.tick(200, Some(p.clone()), true);
+        r.last().clear_sent();
+        r.sup.enable(None, bytesep());
+        r.sup.tick(300, Some(p.clone()), true);
+        assert_eq!(r.last().sent(), vec![]);
+        let s = r.sup.status();
+        assert_eq!(s.phase, "devocal");
+        assert_eq!(s.model_id.as_deref(), Some("stemgenrt-hop128"));
+        assert_eq!(
+            s.error.as_deref(),
+            Some("model_not_found:bytesep-mobilenet-1s")
+        );
+        // The main toggle still turns it off.
+        r.sup.disable();
+        assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: false }]);
+        // Installing the model clears the hint.
+        r.sup.model_installed();
+        assert_eq!(r.sup.status().error, None);
+    }
+
     #[test]
     fn set_model_drops_the_old_models_metrics_from_the_status() {
         let mut r = rig();
@@ -2681,9 +2752,14 @@ mod tests {
         let mut r = rig();
         let p = player(7);
         r.hold(0, &p);
-        // The user picks a model that is not installed yet: unavailable, the engine runs on.
+        // The user picks a model that is not installed yet: the engine runs on with its model
+        // (and its phase), the error names the missing one.
         r.sup.enable(None, bytesep());
-        assert_eq!(r.phase(), "unavailable");
+        assert_eq!(r.phase(), "devocal");
+        assert_eq!(
+            r.sup.status().error.as_deref(),
+            Some("model_not_found:bytesep-mobilenet-1s")
+        );
         // The engine goes away, the model gets installed, and a new engine is started.
         r.last().exit();
         r.sup.tick(1_000, Some(p.clone()), true);

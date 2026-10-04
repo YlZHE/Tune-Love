@@ -179,15 +179,17 @@ test("status line: nothing while the engine is not running; HTDemucs on CPU repo
 
 const requests = (page: Page) => page.evaluate(() => (window as any).devocalRequests as Record<string, unknown>[]);
 const ON = { phase: "devocal", held: true, modelId: STEM, device: "cpu" };
+// Devocal is on, so the running model is installed.
+const ON_MODELS = [installed(STEM), installed(BYTE), missing(HT)];
 
 test("a device change while devocal is on re-sends enable with the new device", async ({ page }) => {
-  await prepare(page, SETTINGS, { devocal: ON });
+  await prepare(page, SETTINGS, { devocal: ON, models: ON_MODELS });
   await radio(page, "GPU").click();
   await expect.poll(() => requests(page)).toEqual([{ action: "enable", modelId: STEM, device: "gpu" }]);
 });
 
 test("a quality model change while devocal is on counts only after the dialog is confirmed", async ({ page }) => {
-  await prepare(page, SETTINGS, { devocal: ON });
+  await prepare(page, SETTINGS, { devocal: ON, models: ON_MODELS });
   await radio(page, "bytesep（高质量）").click();
   await dialog(page).getByRole("button", { name: "取消", exact: true }).click();
   await expect(dialog(page)).toHaveCount(0);
@@ -207,7 +209,7 @@ test("a model or device change while devocal is off sends nothing", async ({ pag
 });
 
 test("device changes made while an enable is in flight coalesce into one trailing enable with the latest selection", async ({ page }) => {
-  await prepare(page, SETTINGS, { devocal: ON });
+  await prepare(page, SETTINGS, { devocal: ON, models: ON_MODELS });
   await page.evaluate(() => { (window as any).commandDelayMs = 400; });
   await radio(page, "GPU").click();
   await radio(page, "CPU").click();
@@ -228,4 +230,41 @@ test("focus from the hint lands once; picking another model does not move it to 
   await expect(radio(page, "StemgenRT（默认，低延迟）")).toBeChecked();
   await page.waitForTimeout(300);
   await expect(page.getByRole("group", { name: "StemgenRT（低延迟）" }).getByRole("button", { name: /^下载模型/ })).not.toBeFocused();
+});
+
+// I3: with GPU chosen explicitly, a failed switch leaves the old model running on the CPU; the
+// line must not read like a silent CPU fallback.
+const gpuLineCases: [string, Record<string, string>, Record<string, unknown>, string][] = [
+  ["explicit GPU load failed", { modelId: BYTE, device: "gpu" },
+    { phase: "devocal", held: true, modelId: STEM, device: "cpu", error: "model_load_failed: DirectML unavailable" }, "GPU 不可用，未切换模型"],
+  ["explicit GPU, GPU-only model", { modelId: HT, device: "gpu" },
+    { phase: "devocal", held: true, modelId: STEM, device: "cpu", error: "gpu_required: no usable GPU" }, "所选模型需要 GPU，当前不可用"],
+];
+for (const [name, selection, devocal, text] of gpuLineCases)
+  test(`status line: ${name}`, async ({ page }) => {
+    await prepare(page, SETTINGS, { selection, devocal });
+    await expect(page.locator(".devocal-device-status")).toHaveText(text);
+  });
+
+test("picking an undownloaded model while devocal is on sends nothing until it is installed, then applies it", async ({ page }) => {
+  await prepare(page, SETTINGS, { devocal: ON, models: [installed(STEM), missing(BYTE), missing(HT)] });
+  await radio(page, "bytesep（高质量）").click();
+  await dialog(page).getByRole("button", { name: "切换", exact: true }).click();
+  await expect(radio(page, "bytesep（高质量）")).toBeChecked();
+  // A device change meanwhile is saved but not sent either.
+  await radio(page, "CPU").click();
+  await expect(radio(page, "CPU")).toBeChecked();
+  await page.waitForTimeout(500);
+  expect(await requests(page)).toEqual([]);
+  await page.evaluate(models => { (window as any).models = models; }, [installed(STEM), installed(BYTE), missing(HT)]);
+  await expect.poll(() => requests(page)).toEqual([{ action: "enable", modelId: BYTE, device: "cpu" }]);
+  await page.waitForTimeout(500);
+  expect(await requests(page)).toHaveLength(1);
+});
+
+test("opening settings with the selected model installed while devocal is on sends nothing", async ({ page }) => {
+  await prepare(page, SETTINGS, { devocal: ON, models: [installed(STEM), missing(BYTE), missing(HT)] });
+  await expect(page.getByRole("group", { name: "StemgenRT（低延迟）" }).getByText("模型已就绪", { exact: true })).toBeVisible();
+  await page.waitForTimeout(500);
+  expect(await requests(page)).toEqual([]);
 });

@@ -138,6 +138,10 @@ pub struct Metrics {
     /// Window models: mean inference time / hop over the last 10 s of windows.
     #[serde(default)]
     pub window_duty: Option<f32>,
+    /// The id of the loaded model (a failed switch leaves the previous one); `None` while no
+    /// model is loaded.
+    #[serde(default)]
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,6 +289,7 @@ mod tests {
             device_note: Some(DeviceNote::GpuUnavailable),
             window_timeouts: Some(4),
             window_duty: Some(0.25),
+            model_id: Some("bytesep-mobilenet-1s".into()),
         });
         let line = encode(&ev).unwrap();
         assert!(line.contains("\"event\":\"metrics\""));
@@ -293,6 +298,7 @@ mod tests {
         assert!(line.contains("\"device\":\"gpu\""));
         assert!(line.contains("\"deviceNote\":\"gpu_unavailable\""));
         assert!(line.contains("\"windowTimeouts\":4,\"windowDuty\":0.25"));
+        assert!(line.contains("\"modelId\":\"bytesep-mobilenet-1s\""));
         assert_eq!(decode_event(&line).unwrap(), ev);
     }
 
@@ -327,6 +333,7 @@ mod tests {
             device_note: None,
             window_timeouts: None,
             window_duty: None,
+            model_id: None,
         });
         let line = encode(&ev).unwrap();
         match decode_event(&line).unwrap() {
@@ -377,6 +384,7 @@ mod tests {
             Event::Metrics(m) => {
                 assert_eq!((m.device, m.device_note), (None, None));
                 assert_eq!((m.window_timeouts, m.window_duty), (None, None));
+                assert_eq!(m.model_id, None);
             }
             other => panic!("unexpected {other:?}"),
         }

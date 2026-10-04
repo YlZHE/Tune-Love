@@ -1,4 +1,5 @@
 import { STEMGENRT_ID } from "./modelDownload";
+import type { DevocalDevice } from "./devocalModelPreferences";
 
 export type DevocalPhase = "off" | "attaching" | "passthrough" | "devocal" | "fallback" | "releasing" | "restarting" | "failed" | "unavailable";
 
@@ -89,7 +90,8 @@ export function devocalNotice(s: DevocalStatus): DevocalNotice | null {
   if (s.phase === "failed" && s.error?.startsWith("attach_failed")) return warning("无法接管这个播放器");
   if (s.phase === "failed") return warning("去人声引擎多次异常，已保持原声");
   if (s.phase === "unavailable" && s.error?.startsWith("engine_unavailable")) return warning("去人声引擎无法启动");
-  if (s.phase === "unavailable") return { text: "未找到去人声模型，请在设置中下载", kind: "warning", action: "open-model-settings" };
+  // A missing model is also reported while the engine holds the player (it keeps what it runs).
+  if (s.phase === "unavailable" || s.error?.startsWith("model_not_found:")) return { text: "未找到去人声模型，请在设置中下载", kind: "warning", action: "open-model-settings" };
   if (gpuRequired(s.error)) return warning(GPU_REQUIRED_TEXT);
   if (modelFailed(s.error)) return warning("去人声模型加载失败，已保持原声");
   if (s.phase === "passthrough" && s.held) return neutral("原声直通");
@@ -103,14 +105,17 @@ export const devocalLabel = (s: DevocalStatus): string | null => {
 };
 export const devocalLabelKind = (s: DevocalStatus): DevocalLabelKind | null => devocalNotice(s)?.kind ?? null;
 
-// The compute-device line in settings. `selectedModelId` is the user's choice; the status
+// The compute-device line in settings. `selectedModelId`/`selectedDevice` are the user's choice; the status
 // carries the model that is actually running. Null (engine not running) shows nothing.
-export function deviceLine(s: DevocalStatus, selectedModelId: string): string | null {
+export function deviceLine(s: DevocalStatus, selectedModelId: string, selectedDevice: DevocalDevice): string | null {
   if (gpuRequired(s.error)) return GPU_REQUIRED_TEXT;
+  // An explicit GPU choice that cannot load (DirectML unusable, self-check failed): the engine
+  // keeps the model it had, never a silent CPU fallback, so the line must not read as one.
+  if (selectedDevice === "gpu" && s.error?.startsWith("model_load_failed")) return "GPU 不可用，未切换模型";
   if (s.deviceNote === "gpu_overloaded")
     return s.modelId === STEMGENRT_ID && selectedModelId !== STEMGENRT_ID ? "GPU 负载过高，已改用 StemgenRT" : "GPU 负载过高，已改用 CPU";
   if (s.device === "gpu") return "正在使用：GPU";
   if (s.device === "cpu") return s.deviceNote ? "GPU 不可用，已改用 CPU" : "正在使用：CPU";
-  // An explicit GPU choice that cannot load reports the load failure, not a CPU fallback.
+  // Any other model that cannot load.
   return modelFailed(s.error) ? "去人声模型加载失败，已保持原声" : null;
 }

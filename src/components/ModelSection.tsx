@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Button, Progress, RadioGroup } from "@radix-ui/themes";
 import { qualityLatencyMs, setDevocalModelPreference, useDevocalModelPreference } from "../devocalModelPreferences";
-import { useModelDownload, type ModelAction } from "../useModelDownload";
+import type { ModelAction, useModelDownload } from "../useModelDownload";
 import {
   MODEL_MANIFEST, STEMGENRT_ID, approxSize, formatMiB, hasModelConsent, isValidMirrorPrefix, modelErrorText, modelTotalBytes,
   progressPercent, progressText, readMirrorPrefix, rememberModelConsent, sourceErrorHint, type ModelInfo, type ModelStatus,
@@ -23,11 +23,12 @@ const CHOICE_LABELS: Record<string, string> = {
 // on after installing, but only for StemgenRT (the backend ignores it for the other models); the
 // request is used up once the row reaches installed, or dropped when the user cancels a download.
 // A non-zero `focusSeq` change focuses the row's first usable button. Picking a quality model
-// asks first; the choice is saved only after 切换.
-export function ModelSection({ autoEnablePending, onAutoEnableConsumed, focusSeq, onSelectionChanged }: {
+// asks first; the choice is saved only after 切换. `onSelectionChanged` (apply while de-vocal is on;
+// it skips a model that is not installed) also runs when the selected row reaches installed.
+export function ModelSection({ statuses, send, autoEnablePending, onAutoEnableConsumed, focusSeq, onSelectionChanged }: {
+  statuses: ModelStatus[] | null; send: Send;
   autoEnablePending: boolean; onAutoEnableConsumed(): void; focusSeq: number; onSelectionChanged(): void;
 }) {
-  const { statuses, send } = useModelDownload();
   const selection = useDevocalModelPreference();
   // The row a focus request is for is fixed when the request arrives (the selected row then);
   // choosing another model later must not pull focus to that row's button.
@@ -47,7 +48,7 @@ export function ModelSection({ autoEnablePending, onAutoEnableConsumed, focusSeq
   return <RadioGroup.Root className="model-section" value={selection.modelId} onValueChange={choose} aria-label="去人声模型">
     {MODEL_MANIFEST.models.map(model => {
       const target = model.id === selection.modelId;
-      return <ModelRow key={model.id} model={model} status={statuses?.find(s => s.id === model.id) ?? null} send={send} selected={target}
+      return <ModelRow key={model.id} model={model} status={statuses?.find(s => s.id === model.id) ?? null} send={send} selected={target} onInstalled={onSelectionChanged}
         autoEnable={target && model.id === STEMGENRT_ID && autoEnablePending} onAutoEnableConsumed={onAutoEnableConsumed} focusSeq={focusTarget.current?.id === model.id ? focusSeq : 0} />;
     })}
     {saveError && <p role="alert" className="color-error">{saveError}</p>}
@@ -56,8 +57,8 @@ export function ModelSection({ autoEnablePending, onAutoEnableConsumed, focusSeq
   </RadioGroup.Root>;
 }
 
-function ModelRow({ model, status, send, selected, autoEnable, onAutoEnableConsumed, focusSeq }: {
-  model: ModelInfo; status: ModelStatus | null; send: Send; selected: boolean;
+function ModelRow({ model, status, send, selected, onInstalled, autoEnable, onAutoEnableConsumed, focusSeq }: {
+  model: ModelInfo; status: ModelStatus | null; send: Send; selected: boolean; onInstalled(): void;
   autoEnable: boolean; onAutoEnableConsumed(): void; focusSeq: number;
 }) {
   // A rejected command is shown only while the row is still in the phase it was raised in:
@@ -72,6 +73,15 @@ function ModelRow({ model, status, send, selected, autoEnable, onAutoEnableConsu
   // A pending auto-enable is used up once the model is installed. Until then it rides on every
   // download, resume, retry or import; only the user's own cancel of a download drops it early.
   useEffect(() => { if (autoEnable && phase === "installed") onAutoEnableConsumed(); }, [autoEnable, phase, onAutoEnableConsumed]);
+
+  // The selected model was picked before it was installed: apply it once it gets there (a row first
+  // seen installed, e.g. on opening settings, is not a change).
+  const lastPhase = useRef(phase);
+  useEffect(() => {
+    const was = lastPhase.current;
+    lastPhase.current = phase;
+    if (selected && phase === "installed" && was !== "installed" && was !== "unknown") onInstalled();
+  }, [selected, phase, onInstalled]);
 
   // One command at a time per row, so a fast double-click cannot come back as already_running.
   const run = (action: ModelAction, options?: { mirrorPrefix?: string }) => {

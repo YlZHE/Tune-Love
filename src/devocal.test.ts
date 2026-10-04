@@ -77,6 +77,11 @@ describe("devocalLabel", () => {
       .toEqual({ text: "去人声引擎无法启动", kind: "warning" });
     expect(devocalNotice(status({ phase: "unavailable", error: "engine_unavailable" }))).not.toHaveProperty("action");
     expect(devocalNotice(status({ phase: "failed", error: "engine_crashed" }))).not.toHaveProperty("action");
+    // A missing model asked for while the engine holds the player in passthrough (I2).
+    expect(devocalNotice(status({ phase: "passthrough", held: true, error: "model_not_found:bytesep-mobilenet-1s" })))
+      .toEqual({ text: "未找到去人声模型，请在设置中下载", kind: "warning", action: "open-model-settings" });
+    // Devocal keeps running the previous model meanwhile: that is what it says.
+    expect(devocalLabel(status({ phase: "devocal", held: true, error: "model_not_found:bytesep-mobilenet-1s" }))).toBe("去人声中");
   });
   it("shows passthrough only while the player is held", () => {
     expect(devocalLabel(status({ phase: "passthrough", held: true }))).toBe("原声直通");
@@ -171,32 +176,40 @@ describe("device fields", () => {
 describe("deviceLine", () => {
   const live = (patch: Partial<DevocalStatus>) => status({ phase: "devocal", held: true, ...patch });
   it("names the device in use", () => {
-    expect(deviceLine(live({ device: "gpu" }), "bytesep-mobilenet-1s")).toBe("正在使用：GPU");
-    expect(deviceLine(live({ device: "cpu" }), "bytesep-mobilenet-1s")).toBe("正在使用：CPU");
+    expect(deviceLine(live({ device: "gpu" }), "bytesep-mobilenet-1s", "auto")).toBe("正在使用：GPU");
+    expect(deviceLine(live({ device: "cpu" }), "bytesep-mobilenet-1s", "auto")).toBe("正在使用：CPU");
   });
   it("says so when auto fell back to the CPU", () => {
-    expect(deviceLine(live({ device: "cpu", deviceNote: "gpu_unavailable" }), "bytesep-mobilenet-1s")).toBe("GPU 不可用，已改用 CPU");
-    expect(deviceLine(live({ device: "cpu", deviceNote: "gpu_check_failed" }), "bytesep-mobilenet-1s")).toBe("GPU 不可用，已改用 CPU");
+    expect(deviceLine(live({ device: "cpu", deviceNote: "gpu_unavailable" }), "bytesep-mobilenet-1s", "auto")).toBe("GPU 不可用，已改用 CPU");
+    expect(deviceLine(live({ device: "cpu", deviceNote: "gpu_check_failed" }), "bytesep-mobilenet-1s", "auto")).toBe("GPU 不可用，已改用 CPU");
   });
   it("says a GPU-only model cannot run", () => {
-    expect(deviceLine(status({ phase: "passthrough", held: true, error: "gpu_required: no gpu" }), "htdemucs-ft-vocals-1s"))
+    expect(deviceLine(status({ phase: "passthrough", held: true, error: "gpu_required: no gpu" }), "htdemucs-ft-vocals-1s", "auto"))
       .toBe("所选模型需要 GPU，当前不可用");
     expect(devocalLabel(status({ phase: "passthrough", held: true, error: "gpu_required: no gpu" }))).toBe("所选模型需要 GPU，当前不可用");
     expect(devocalLabelKind(status({ phase: "passthrough", held: true, error: "gpu_required: no gpu" }))).toBe("warning");
   });
   it("tells an overload switch to StemgenRT from one to the CPU", () => {
-    expect(deviceLine(live({ device: "cpu", modelId: "stemgenrt-hop128", deviceNote: "gpu_overloaded" }), "htdemucs-ft-vocals-1s"))
+    expect(deviceLine(live({ device: "cpu", modelId: "stemgenrt-hop128", deviceNote: "gpu_overloaded" }), "htdemucs-ft-vocals-1s", "auto"))
       .toBe("GPU 负载过高，已改用 StemgenRT");
-    expect(deviceLine(live({ device: "cpu", modelId: "bytesep-mobilenet-1s", deviceNote: "gpu_overloaded" }), "bytesep-mobilenet-1s"))
+    expect(deviceLine(live({ device: "cpu", modelId: "bytesep-mobilenet-1s", deviceNote: "gpu_overloaded" }), "bytesep-mobilenet-1s", "auto"))
       .toBe("GPU 负载过高，已改用 CPU");
-    expect(deviceLine(live({ device: "cpu", modelId: "stemgenrt-hop128", deviceNote: "gpu_overloaded" }), "stemgenrt-hop128"))
+    expect(deviceLine(live({ device: "cpu", modelId: "stemgenrt-hop128", deviceNote: "gpu_overloaded" }), "stemgenrt-hop128", "auto"))
       .toBe("GPU 负载过高，已改用 CPU");
   });
   it("shows the model-load failure of an explicit GPU choice", () => {
-    expect(deviceLine(status({ phase: "passthrough", held: true, error: "model_load_failed: dml" }), "bytesep-mobilenet-1s"))
+    expect(deviceLine(status({ phase: "passthrough", held: true, error: "model_load_failed: dml" }), "bytesep-mobilenet-1s", "auto"))
       .toBe("去人声模型加载失败，已保持原声");
   });
+  it("says an explicit GPU choice that cannot load leaves the model as it was (I3)", () => {
+    const failed = { held: true, error: "model_load_failed: DirectML unavailable" };
+    expect(deviceLine(live({ ...failed, device: "cpu", modelId: "stemgenrt-hop128" }), "bytesep-mobilenet-1s", "gpu")).toBe("GPU 不可用，未切换模型");
+    expect(deviceLine(status({ phase: "passthrough", ...failed }), "bytesep-mobilenet-1s", "gpu")).toBe("GPU 不可用，未切换模型");
+    expect(deviceLine(live({ error: "gpu_required: no gpu", device: "cpu" }), "htdemucs-ft-vocals-1s", "gpu")).toBe("所选模型需要 GPU，当前不可用");
+    // Not an explicit GPU choice: an ordinary load failure.
+    expect(deviceLine(status({ phase: "passthrough", ...failed }), "bytesep-mobilenet-1s", "auto")).toBe("去人声模型加载失败，已保持原声");
+  });
   it("shows nothing before the engine reports", () => {
-    expect(deviceLine(OFF_STATUS, "stemgenrt-hop128")).toBeNull();
+    expect(deviceLine(OFF_STATUS, "stemgenrt-hop128", "auto")).toBeNull();
   });
 });

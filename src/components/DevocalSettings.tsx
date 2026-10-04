@@ -4,7 +4,8 @@ import { UserSound } from "@phosphor-icons/react";
 import { isValidMirrorPrefix, readMirrorPrefix, saveMirrorPrefix } from "../modelDownload";
 import { useDevocal } from "../useDevocal";
 import { deviceLine, type DevocalStatus } from "../devocal";
-import { setDevocalModelPreference, useDevocalModelPreference, type DevocalDevice } from "../devocalModelPreferences";
+import { readDevocalModelPreference, setDevocalModelPreference, useDevocalModelPreference, type DevocalDevice } from "../devocalModelPreferences";
+import { useModelDownload } from "../useModelDownload";
 import type { SettingsSectionRequest } from "../settingsSection";
 import { ModelSection } from "./ModelSection";
 import "./DevocalSettings.css";
@@ -46,7 +47,7 @@ function DeviceSection({ status, onError, onChanged }: { status: DevocalStatus; 
       <RadioGroup.Item value="cpu">CPU</RadioGroup.Item>
       <RadioGroup.Item value="gpu">GPU</RadioGroup.Item>
     </RadioGroup.Root>
-    <p className="model-row-note devocal-device-status" aria-live="polite">{deviceLine(status, selection.modelId)}</p>
+    <p className="model-row-note devocal-device-status" aria-live="polite">{deviceLine(status, selection.modelId, selection.device)}</p>
   </div>;
 }
 
@@ -62,7 +63,13 @@ export function DevocalSettings({ request = null }: { request?: SettingsSectionR
   const [autoEnablePending, setAutoEnablePending] = useState(false);
   const [focusSeq, setFocusSeq] = useState(0);
   const consumeAutoEnable = useCallback(() => setAutoEnablePending(false), []);
-  const applyChange = () => { apply().catch(() => setError("未能切换去人声模型或设备，请重试")); };
+  const { statuses, send } = useModelDownload();
+  // A selection whose model is not installed is not sent (the backend has nothing to load); the
+  // model row applies it once the model is installed.
+  const applyChange = () => {
+    if (statuses?.find(s => s.id === readDevocalModelPreference().modelId)?.phase !== "installed") return;
+    apply().catch(() => setError("未能切换去人声模型或设备，请重试"));
+  };
   const seq = request?.seq ?? 0;
   const fromHint = request?.section === "devocal-model";
   useEffect(() => {
@@ -78,7 +85,7 @@ export function DevocalSettings({ request = null }: { request?: SettingsSectionR
       <div><h2 id="devocal-settings-title">去人声</h2>
         <p>开启去人声后，本应用会接管当前播放器的声音输出。音量合成器里播放器那一栏接近 0 是正常的，声音由本应用发出；要调音量请调本应用。点‘释放播放器’可立即交还。</p></div>
     </div>
-    <ModelSection onSelectionChanged={applyChange} autoEnablePending={autoEnablePending} onAutoEnableConsumed={consumeAutoEnable} focusSeq={focusSeq} />
+    <ModelSection statuses={statuses} send={send} onSelectionChanged={applyChange} autoEnablePending={autoEnablePending} onAutoEnableConsumed={consumeAutoEnable} focusSeq={focusSeq} />
     <DeviceSection status={status} onError={setError} onChanged={applyChange} />
     <div className="devocal-settings-actions">
       <Button variant="soft" color="gray" disabled={!status.held}

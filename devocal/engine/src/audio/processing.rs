@@ -8,7 +8,8 @@
 //!
 //! Positions: `in_pos` counts frames taken from ring A (processed or discarded), `out_pos`
 //! frames pushed to ring B. Input frame `x` of a block leaves the processor `latency` frames
-//! later, at output frame `x + (out_pos - in_pos) + latency`.
+//! later, at output frame `x + (out_pos - in_pos) + latency`; `latency` is the audible path's
+//! (`Processor::output_latency_frames`: the model's, or the dry path's at P or held at M).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -145,7 +146,6 @@ fn block_us(hop: usize) -> f64 {
 
 struct State {
     hop: usize,
-    latency: usize,
     in_block: Vec<f32>,
     out_block: Vec<f32>,
     in_pos: u64,
@@ -171,7 +171,6 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
     let hop = ctx.processor.hop();
     let mut st = State {
         hop,
-        latency: ctx.processor.latency_frames(),
         in_block: vec![0.0; hop * 2],
         out_block: vec![0.0; hop * 2],
         in_pos: 0,
@@ -187,6 +186,8 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
     st.underrun_base = ctx.stats.underruns.load(Ordering::Acquire);
     publish_config(&ctx, &st);
     publish_state(&ctx);
+    #[cfg(debug_assertions)]
+    let mut dump = super::dump::Dump::from_env(ctx.shared.run_id);
 
     'outer: while !ctx.shared.stop.load(Ordering::Acquire) {
         while let Ok(cmd) = ctx.control.pop() {
@@ -234,8 +235,8 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
                         break;
                     }
                     let _ = ctx.in_markers.pop();
-                    let out =
-                        at as i128 + st.out_pos as i128 - st.in_pos as i128 + st.latency as i128;
+                    let out = at as i128 + st.out_pos as i128 - st.in_pos as i128
+                        + ctx.processor.output_latency_frames() as i128;
                     let out = out.max(st.out_pos as i128) as u64;
                     let _ = ctx.out_markers.push(out);
                 }
@@ -274,14 +275,15 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
         let underrun = (underruns > st.underrun_base)
             .then(|| unpack_starvation(ctx.shared.underrun_snapshot.load(Ordering::Acquire)));
         let overloaded = report.ran_model && st.load.overloaded();
+        let window = window_overloaded(&ctx, &st, report.ran_model);
         if should_force_fallback(
             underrun,
             st.user_on,
             report.ran_model,
-            overloaded,
+            overloaded || window,
             ctx.processor.stage(),
         ) {
-            force_overload(&mut ctx, &mut st, overloaded, t1);
+            force_overload(&mut ctx, &mut st, overloaded, window, t1);
         }
         st.underrun_base = underruns;
         publish_state(&ctx);
@@ -293,8 +295,28 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
         ctx.stats
             .load_ratio_milli
             .store((ratio * 1000.0).round() as u32, Ordering::Relaxed);
+        publish_window_stats(&ctx);
 
-        if ctx.output.slots() >= st.hop * 2 {
+        let fits = ctx.output.slots() >= st.hop * 2;
+        #[cfg(debug_assertions)]
+        if let Some(d) = dump.as_mut() {
+            d.block(
+                &st.in_block,
+                report.ran_model.then(|| ctx.processor.accompaniment()),
+                &st.out_block,
+                super::dump::BlockMeta {
+                    in_pos: st.in_pos - st.hop as u64,
+                    out_pos: fits.then_some(st.out_pos),
+                    stage: report.stage,
+                    ran_model: report.ran_model,
+                    sep_latency: ctx.processor.latency_frames() as u32,
+                    out_latency: ctx.processor.output_latency_frames() as u32,
+                    model_resets: ctx.processor.model_resets(),
+                    t_us: t0,
+                },
+            );
+        }
+        if fits {
             let _ = ctx.output.push_entire_slice(&st.out_block);
             // Cleared only once the block is in ring B: for a moment it counts twice (never
             // zero times) in the latency estimate (ruling 23).
@@ -332,31 +354,75 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
 /// the frames before it, and the output fades in after the cleared delay.
 fn begin_gap(ctx: &mut ProcessingCtx, st: &mut State) {
     let _ = ctx.out_markers.push(st.out_pos);
-    st.fade_in.start(st.latency);
+    st.fade_in.start(ctx.processor.output_latency_frames());
 }
 
-/// Forces `Fallback(Overload)` (load or underrun), records it for the engine log and
-/// schedules the ruling 24 retry. A fallback already under way is not recorded again.
-fn force_overload(ctx: &mut ProcessingCtx, st: &mut State, overloaded: bool, now: u64) {
+/// The installed model's dry segments and duty for the metrics and the diag line (two relaxed
+/// stores, no allocation).
+fn publish_window_stats(ctx: &ProcessingCtx) {
+    let (plus1, duty) = ctx
+        .processor
+        .window_stats()
+        .map_or((0, 0.0), |(t, d)| (t + 1, d));
+    ctx.stats
+        .window_timeouts_plus1
+        .store(plus1, Ordering::Relaxed);
+    ctx.stats
+        .window_duty_bits
+        .store(duty.to_bits(), Ordering::Relaxed);
+}
+
+/// Spec 6: the window model's own timeouts / duty (an atomic read, no lock), for a block that
+/// ran the model. Not while a swap is pending: the engine already holds the new model's spec,
+/// and the old model fading out is about to be dropped.
+fn window_overloaded(ctx: &ProcessingCtx, st: &State, ran_model: bool) -> bool {
+    ran_model && st.pending.is_none() && ctx.processor.model_overloaded()
+}
+
+/// Forces `Fallback(Overload)` (load, underrun or `window`: the window model's own overload),
+/// records it for the engine log and schedules the ruling 24 retry. A window overload is
+/// flagged for the engine (spec 6) and never retried: retrying would put the model that
+/// just fell behind back on (on the GPU, against "not back to the GPU this session"). A
+/// fallback already under way is not recorded again.
+fn force_overload(
+    ctx: &mut ProcessingCtx,
+    st: &mut State,
+    overloaded: bool,
+    window: bool,
+    now: u64,
+) {
     let fresh = ctx.processor.fallback_reason().is_none();
     let stage = ctx.processor.stage();
     ctx.processor.force_fallback(FallbackReason::Overload);
-    if overloaded {
+    if overloaded || window {
         st.load.reset();
+    }
+    if window {
+        st.retry.user_off();
+        ctx.shared
+            .fallback_log
+            .window_overload
+            .store(true, Ordering::Release);
     }
     if !fresh {
         return;
     }
     let log = &ctx.shared.fallback_log;
-    log.trigger
-        .store(if overloaded { 2 } else { 1 }, Ordering::Relaxed);
+    let trigger = if window {
+        3
+    } else if overloaded {
+        2
+    } else {
+        1
+    };
+    log.trigger.store(trigger, Ordering::Relaxed);
     log.forced_at_us.store(now, Ordering::Relaxed);
     log.load_milli
         .store((st.load.ratio() * 1000.0).round() as u32, Ordering::Relaxed);
     log.stage.store(stage_code(stage), Ordering::Relaxed);
     log.retry_armed
-        .store(st.retry.forced(now), Ordering::Relaxed);
-    if !overloaded {
+        .store(!window && st.retry.forced(now), Ordering::Relaxed);
+    if trigger == 1 {
         log.keep_forced_detail();
     }
     log.forced.fetch_add(1, Ordering::Release);
@@ -441,7 +507,6 @@ fn try_swap(ctx: &mut ProcessingCtx, st: &mut State) -> bool {
         retire(old);
     }
     st.hop = ctx.processor.hop();
-    st.latency = ctx.processor.latency_frames();
     // Re-chunk at the new hop: nothing partial is held (blocks are read whole from ring A).
     st.in_block = vec![0.0; st.hop * 2];
     st.out_block = vec![0.0; st.hop * 2];
@@ -465,6 +530,11 @@ fn publish_state(ctx: &ProcessingCtx) {
         reason_code(ctx.processor.fallback_reason()),
         Ordering::Release,
     );
+    // The audible path's delay changes with the stage (passthrough vs model).
+    ctx.shared.proc_latency_frames.store(
+        ctx.processor.output_latency_frames() as u32,
+        Ordering::Relaxed,
+    );
 }
 
 /// Drops a replaced model on a short-lived thread: tearing down an inference session can
@@ -478,9 +548,6 @@ fn retire(old: Box<dyn Separator>) {
 }
 
 fn publish_config(ctx: &ProcessingCtx, st: &State) {
-    ctx.shared
-        .proc_latency_frames
-        .store(st.latency as u32, Ordering::Relaxed);
     ctx.shared.proc_hop.store(st.hop as u32, Ordering::Relaxed);
 }
 
@@ -661,7 +728,6 @@ mod tests {
         let hop = processor.hop();
         let st = State {
             hop,
-            latency: processor.latency_frames(),
             in_block: vec![0.0; hop * 2],
             out_block: vec![0.0; hop * 2],
             in_pos: 0,
@@ -698,14 +764,14 @@ mod tests {
         assert_eq!(ctx.processor.stage(), Stage::WarmingUp);
         assert!(ctx.shared.preroll_request.swap(false, Ordering::AcqRel));
         let t = 10_000_000;
-        force_overload(&mut ctx, &mut st, false, t);
+        force_overload(&mut ctx, &mut st, false, false, t);
         assert_eq!(ctx.processor.stage(), Stage::Fallback);
         let log = &ctx.shared.fallback_log;
         assert_eq!(log.forced.load(Ordering::Acquire), 1);
         assert_eq!(log.trigger.load(Ordering::Relaxed), 1, "underrun");
         assert!(log.retry_armed.load(Ordering::Relaxed));
         // Forcing again while already falling back records nothing new.
-        force_overload(&mut ctx, &mut st, false, t + 1);
+        force_overload(&mut ctx, &mut st, false, false, t + 1);
         assert_eq!(ctx.shared.fallback_log.forced.load(Ordering::Acquire), 1);
 
         assert!(!retry_overload(
@@ -728,7 +794,7 @@ mod tests {
 
         // The retry falls back again: no further retry.
         let t2 = t + 2 * OVERLOAD_RETRY_DELAY_US;
-        force_overload(&mut ctx, &mut st, true, t2);
+        force_overload(&mut ctx, &mut st, true, false, t2);
         let log = &ctx.shared.fallback_log;
         assert_eq!(log.forced.load(Ordering::Acquire), 2);
         assert_eq!(log.trigger.load(Ordering::Relaxed), 2, "load");
@@ -745,12 +811,107 @@ mod tests {
         apply_command(&mut ctx, &mut st, ProcCommand::SetDevocal(true));
         assert_eq!(ctx.processor.stage(), Stage::WarmingUp);
         let t3 = t2 + 20 * OVERLOAD_RETRY_DELAY_US;
-        force_overload(&mut ctx, &mut st, false, t3);
+        force_overload(&mut ctx, &mut st, false, false, t3);
         assert!(retry_overload(
             &mut ctx,
             &mut st,
             t3 + OVERLOAD_RETRY_DELAY_US
         ));
+    }
+
+    /// Overload reported by a test model.
+    struct Overloaded;
+    impl Separator for Overloaded {
+        fn sample_rate(&self) -> u32 {
+            44_100
+        }
+        fn hop(&self) -> usize {
+            HOP
+        }
+        fn latency_frames(&self) -> usize {
+            HOP
+        }
+        fn process(&mut self, _input: &[f32], out: &mut [f32]) -> Result<(), String> {
+            out.fill(0.0);
+            Ok(())
+        }
+        fn reset(&mut self) {}
+        fn overloaded(&self) -> bool {
+            true
+        }
+        fn window_stats(&self) -> Option<(u64, f32)> {
+            Some((5, 0.4))
+        }
+    }
+
+    /// Spec 8 / Task 9: the window model's dry segments and duty reach the engine's metrics
+    /// and the diag line; a streaming model reports none.
+    #[test]
+    fn window_stats_are_published() {
+        use crate::separator::DelayOnly;
+        let (ctx, _st) = ctx_for(Processor::new(Some(Box::new(Overloaded))));
+        publish_window_stats(&ctx);
+        assert_eq!(ctx.stats.window_stats(), (Some(5), Some(0.4)));
+        let (ctx, _st) = ctx_for(Processor::new(Some(Box::new(DelayOnly::new(HOP)))));
+        publish_window_stats(&ctx);
+        assert_eq!(ctx.stats.window_stats(), (None, None));
+        let (ctx, _st) = ctx_for(Processor::new(None));
+        publish_window_stats(&ctx);
+        assert_eq!(ctx.stats.window_stats(), (None, None));
+    }
+
+    /// Fix round 1: while a swap is pending the engine already reports the new model, so the
+    /// fading-out old model's overload is not flagged (it is about to be dropped).
+    #[test]
+    fn no_window_overload_while_a_swap_is_pending() {
+        use crate::separator::DelayOnly;
+        let (ctx, mut st) = ctx_for(Processor::new(Some(Box::new(Overloaded))));
+        assert!(window_overloaded(&ctx, &st, true));
+        assert!(!window_overloaded(&ctx, &st, false));
+        st.pending = Some(Box::new(DelayOnly::new(HOP)));
+        assert!(!window_overloaded(&ctx, &st, true));
+    }
+
+    /// Spec 6: a window model's own overload forces `Fallback(Overload)`, is flagged for the
+    /// engine (which decides by device) and is never retried here (a retry would put the
+    /// model that just fell behind back on, e.g. on the GPU).
+    #[test]
+    fn a_window_model_overload_is_flagged_for_the_engine_and_not_retried() {
+        use crate::separator::DelayOnly;
+        let (mut ctx, mut st) = ctx_for(Processor::new(Some(Box::new(DelayOnly::new(HOP)))));
+        apply_command(&mut ctx, &mut st, ProcCommand::SetDevocal(true));
+        let t = 10_000_000;
+        force_overload(&mut ctx, &mut st, false, true, t);
+        assert_eq!(ctx.processor.stage(), Stage::Fallback);
+        assert_eq!(
+            ctx.processor.fallback_reason(),
+            Some(FallbackReason::Overload)
+        );
+        let log = &ctx.shared.fallback_log;
+        assert!(log.window_overload.load(Ordering::Acquire));
+        assert_eq!(log.trigger.load(Ordering::Relaxed), 3);
+        assert!(!log.retry_armed.load(Ordering::Relaxed));
+        assert!(!st.retry.pending());
+        assert!(!retry_overload(
+            &mut ctx,
+            &mut st,
+            t + 10 * OVERLOAD_RETRY_DELAY_US
+        ));
+        assert_eq!(ctx.processor.stage(), Stage::Fallback);
+
+        // An ordinary overload already scheduled a retry: a window overload during its
+        // fade-out still cancels it.
+        let (mut ctx, mut st) = ctx_for(Processor::new(Some(Box::new(DelayOnly::new(HOP)))));
+        apply_command(&mut ctx, &mut st, ProcCommand::SetDevocal(true));
+        force_overload(&mut ctx, &mut st, true, false, t);
+        assert!(st.retry.pending());
+        force_overload(&mut ctx, &mut st, false, true, t + 1);
+        assert!(!st.retry.pending());
+        assert!(ctx
+            .shared
+            .fallback_log
+            .window_overload
+            .load(Ordering::Acquire));
     }
 
     /// Runs the processing thread without devices (rings only) and stops it.
@@ -996,7 +1157,7 @@ mod tests {
             shortfall: 58,
             ..StarvationDetail::default()
         });
-        force_overload(&mut ctx, &mut st, false, t);
+        force_overload(&mut ctx, &mut st, false, false, t);
         assert_eq!(ctx.shared.fallback_log.forced_detail().shortfall, 58);
         assert_eq!(ctx.processor.stage(), Stage::Fallback);
         st.pending = Some(Box::new(DelayOnly::new(HOP)));

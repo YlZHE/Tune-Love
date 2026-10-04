@@ -30,6 +30,8 @@
 
 pub mod capture;
 mod confirm;
+#[cfg(debug_assertions)]
+mod dump;
 pub mod endpoint;
 mod processing;
 pub mod render;
@@ -108,6 +110,10 @@ pub struct AudioStats {
     /// Processor stage after the latest block or applied command ([`stage_code`] mapping:
     /// 0 Passthrough, 1 WarmingUp, 2 FadingIn, 3 Devocal, 4 FadingOut, 5 Fallback).
     pub stage: AtomicU8,
+    /// The installed window model's dry segments since load, plus one (0: no window model).
+    pub window_timeouts_plus1: AtomicU64,
+    /// The installed window model's 10 s duty, as `f32` bits.
+    pub window_duty_bits: AtomicU32,
     /// Processor fallback reason ([`reason_code`]: 0 none, 1 Overload, 2 ModelError).
     pub fallback_reason: AtomicU8,
     /// Extra render headroom in frames (on top of one period + one hop; at most
@@ -122,6 +128,21 @@ pub struct AudioStats {
     pub render_failed: AtomicBool,
     /// Diagnostic counters, logged once a second when `DEVOCAL_DIAG` is set.
     pub diag: DiagCounters,
+}
+
+impl AudioStats {
+    /// (dry segments since load, 10 s duty) of the installed window model; `None` without one.
+    pub fn window_stats(&self) -> (Option<u64>, Option<f32>) {
+        match self.window_timeouts_plus1.load(Ordering::Relaxed) {
+            0 => (None, None),
+            n => (
+                Some(n - 1),
+                Some(f32::from_bits(
+                    self.window_duty_bits.load(Ordering::Relaxed),
+                )),
+            ),
+        }
+    }
 }
 
 /// Monotonic counters for the `DEVOCAL_DIAG` log (relaxed increments only).
@@ -282,8 +303,12 @@ impl StarvationDetail {
 pub(crate) struct FallbackLog {
     detail: [AtomicU64; DETAIL_FIELDS],
     forced_detail: [AtomicU64; DETAIL_FIELDS],
-    /// The fallback's trigger: 1 underrun, 2 load.
+    /// The fallback's trigger: 1 underrun, 2 load, 3 the window model itself (timeouts or
+    /// duty, `Separator::overloaded`).
     pub trigger: AtomicU8,
+    /// A window model reported overload; the engine takes it ([`AudioHandle::take_window_overload`])
+    /// and decides by device (spec 6: CPU reload or GPU banned).
+    pub window_overload: AtomicBool,
     pub forced_at_us: AtomicU64,
     pub load_milli: AtomicU32,
     /// The processor's stage just before it was forced ([`stage_code`]).
@@ -332,7 +357,11 @@ pub(crate) fn fallback_line(run: u32, log: &FallbackLog, now_us: u64) -> String 
         "devocal audio: run={run} forced fallback (overload) {} ms ago: trigger={} load={:.3} \
          stage={} retry={}",
         now_us.saturating_sub(at) / 1000,
-        if trigger == 2 { "load" } else { "underrun" },
+        match trigger {
+            2 => "load",
+            3 => "window",
+            _ => "underrun",
+        },
         log.load_milli.load(Ordering::Relaxed) as f64 / 1000.0,
         log.stage.load(Ordering::Relaxed),
         if log.retry_armed.load(Ordering::Relaxed) {
@@ -341,7 +370,8 @@ pub(crate) fn fallback_line(run: u32, log: &FallbackLog, now_us: u64) -> String 
             "none"
         },
     );
-    if trigger != 2 {
+    // The underrun detail belongs to underrun triggers only.
+    if trigger == 1 {
         let d = log.forced_detail();
         l.push_str(&format!(
             " | starved {} ms before: verdict={} wake={} padding={} ring_b={} shortfall={} \
@@ -531,8 +561,14 @@ pub(crate) fn diag_loop_with(
             for (i, f) in fields.iter_mut().enumerate() {
                 *f = (names[i], now[i].wrapping_sub(last[i]));
             }
+            // Window models: cumulative dry segments and the 10 s duty ("-" otherwise).
+            let (win_to, win_duty) = match stats.window_stats() {
+                (Some(t), Some(d)) => (t.to_string(), format!("{d:.3}")),
+                _ => ("-".to_string(), "-".to_string()),
+            };
             let tail = format!(
-                "stage={} in_ring={} headroom={} cap_gain={:.1} out_gain={:.3} lat_ms={:.1}{extra}",
+                "stage={} in_ring={} headroom={} cap_gain={:.1} out_gain={:.3} lat_ms={:.1} \
+                 win_timeouts={win_to} win_duty={win_duty}{extra}",
                 stats.stage.load(Ordering::Relaxed),
                 shared.in_ring_frames.load(Ordering::Relaxed),
                 stats.headroom_frames.load(Ordering::Relaxed),
@@ -936,7 +972,7 @@ impl AudioHandle {
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),
             proc_in_flight_frames: AtomicU32::new(0),
-            proc_latency_frames: AtomicU32::new(processor.latency_frames() as u32),
+            proc_latency_frames: AtomicU32::new(processor.output_latency_frames() as u32),
             proc_hop: AtomicU32::new(processor.hop() as u32),
             output_failed: AtomicBool::new(false),
             preroll_request: AtomicBool::new(false),
@@ -1101,6 +1137,14 @@ impl AudioHandle {
             ));
         }
         None
+    }
+
+    /// Returns and clears the window model's overload report (spec 6).
+    pub fn take_window_overload(&self) -> bool {
+        self.shared
+            .fallback_log
+            .window_overload
+            .swap(false, Ordering::AcqRel)
     }
 
     /// Returns and clears the safety guard's request to run `Holder::follow()` now.
@@ -1560,6 +1604,10 @@ mod tests {
                     3 => {
                         d.note_check_margin(-16);
                         d.note_check_margin(7);
+                        stats.window_timeouts_plus1.store(4, Ordering::Relaxed);
+                        stats
+                            .window_duty_bits
+                            .store(0.25f32.to_bits(), Ordering::Relaxed);
                     }
                     5 => shared.stop.store(true, Ordering::Release),
                     _ => {}
@@ -1590,6 +1638,16 @@ mod tests {
             lines[3].ends_with(" chk_margin_min=- dl_late_max_us=0 partial"),
             "{}",
             lines[3]
+        );
+        assert!(
+            lines[1].contains(" win_timeouts=- win_duty=- "),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains(" win_timeouts=3 win_duty=0.250 "),
+            "{}",
+            lines[2]
         );
         // Existing columns keep their order, the new ones follow `lat_ms`.
         let l = &lines[1];

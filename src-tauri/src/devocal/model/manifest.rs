@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const STEMGENRT_ID: &str = "stemgenrt-hop128";
 
@@ -26,9 +26,11 @@ pub struct ModelSpec {
     pub name: String,
     pub tier: Tier,
     pub files: Vec<FileSpec>,
+    pub kind: ModelKind,
     pub sample_rate: u32,
-    pub latency_ms: f64,
-    pub runtime: Runtime,
+    /// Index of the vocals stem in the model output. Streaming models ignore it (0).
+    pub vocals_index: u32,
+    pub devices: Devices,
     pub license: LicenseInfo,
     pub source: String,
 }
@@ -50,11 +52,34 @@ pub enum Tier {
     Quality,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Runtime {
-    Cpu,
-    Cuda,
+pub enum ModelKind {
+    /// Frame-by-frame model with its own state (StemgenRT): no window, hop or lookahead.
+    Streaming,
+    /// Fixed-length window model run on overlapping hops by the windowed separator.
+    Windowed,
+}
+
+/// Per-device run parameters; a missing device means the model does not run there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Devices {
+    #[serde(default)]
+    pub cpu: Option<DeviceParams>,
+    #[serde(default)]
+    pub gpu: Option<DeviceParams>,
+}
+
+/// Windowed models: `latency_ms = hop + lookahead + 0.3 * hop`. Streaming models use 0 for the window fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceParams {
+    pub window_ms: u32,
+    pub hop_ms: u32,
+    pub lookahead_ms: u32,
+    pub threads: u16,
+    pub latency_ms: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +88,12 @@ pub struct LicenseInfo {
     pub code: String,
     pub weights: String,
     pub training_data: Vec<String>,
+    /// The weights were converted and modified by this project (shown in the consent box).
+    #[serde(default)]
+    pub converted: bool,
+    /// Extra credits shown with the conversion note (authors, tools); empty if none.
+    #[serde(default)]
+    pub credit: String,
 }
 
 impl Manifest {
@@ -98,6 +129,7 @@ impl Manifest {
             if !ids.insert(id.as_str()) {
                 return Err(format!("duplicate model id {id:?}"));
             }
+            validate_devices(model)?;
             if model.files.is_empty() {
                 return Err(format!("model {id} has no files"));
             }
@@ -111,6 +143,49 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+fn validate_devices(model: &ModelSpec) -> Result<(), String> {
+    let id = &model.id;
+    // The vocals stem is one of the four stems (drums, bass, other, vocals); streaming models ignore it.
+    if model.vocals_index >= 4 || (model.kind == ModelKind::Streaming && model.vocals_index != 0) {
+        return Err(format!("model {id}: invalid vocals index {}", model.vocals_index));
+    }
+    let devices = [("cpu", &model.devices.cpu), ("gpu", &model.devices.gpu)];
+    if devices.iter().all(|(_, d)| d.is_none()) {
+        return Err(format!("model {id} has no usable device"));
+    }
+    // The engine gets one window and one lookahead per model (only the hop differs by device).
+    if let (ModelKind::Windowed, Some(cpu), Some(gpu)) = (model.kind, &model.devices.cpu, &model.devices.gpu) {
+        if (cpu.window_ms, cpu.lookahead_ms) != (gpu.window_ms, gpu.lookahead_ms) {
+            return Err(format!("model {id}: cpu and gpu must use the same window and lookahead"));
+        }
+    }
+    for (name, d) in devices {
+        let Some(d) = d else { continue };
+        if d.threads == 0 {
+            return Err(format!("model {id}: {name} threads must be at least 1"));
+        }
+        if !(d.latency_ms.is_finite() && d.latency_ms >= 0.0) {
+            return Err(format!("model {id}: {name} latency is not a valid number"));
+        }
+        match model.kind {
+            ModelKind::Streaming if (d.window_ms, d.hop_ms, d.lookahead_ms) != (0, 0, 0) => {
+                return Err(format!("model {id}: streaming {name} must not set window, hop or lookahead"));
+            }
+            ModelKind::Windowed => {
+                if d.window_ms == 0 || d.hop_ms == 0 || d.hop_ms > d.window_ms {
+                    return Err(format!("model {id}: {name} needs 0 < hop <= window"));
+                }
+                let want = d.hop_ms as f64 * 1.3 + d.lookahead_ms as f64;
+                if (d.latency_ms - want).abs() > 1e-6 {
+                    return Err(format!("model {id}: {name} latency {} must be hop + lookahead + 0.3*hop = {want}", d.latency_ms));
+                }
+            }
+            ModelKind::Streaming => {}
+        }
+    }
+    Ok(())
 }
 
 fn validate_file(model: &str, f: &FileSpec) -> Result<(), String> {
@@ -238,9 +313,141 @@ mod tests {
         assert!(f.origin.starts_with("https://github.com/sweetspotsoundsystem/stemgen-rt/raw/61df8f4aa1555ef110308d01ea92b54ace770979/"));
         assert_eq!(m.mirrors, ["https://ghfast.top/", "https://ghproxy.net/", "https://ghproxy.vip/"]);
         assert_eq!(s.tier, Tier::Realtime);
-        assert_eq!(s.runtime, Runtime::Cpu);
+        assert_eq!(s.kind, ModelKind::Streaming);
         assert_eq!(s.sample_rate, 44100);
         assert_eq!(s.license.weights, "pending");
+        assert!(!s.license.converted);
+    }
+
+    fn cpu(m: &Manifest, id: &str) -> DeviceParams {
+        m.model(id).unwrap().devices.cpu.clone().unwrap()
+    }
+
+    #[test]
+    fn bundled_manifest_has_three_models() {
+        let m = bundled();
+        let ids: Vec<&str> = m.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, [STEMGENRT_ID, "bytesep-mobilenet-1s", "htdemucs-ft-vocals-1s"]);
+
+        let s = m.model(STEMGENRT_ID).unwrap();
+        assert!(s.devices.gpu.is_none());
+        // Streaming models ignore the window parameters and `vocals_index`.
+        assert_eq!(
+            cpu(m, STEMGENRT_ID),
+            DeviceParams { window_ms: 0, hop_ms: 0, lookahead_ms: 0, threads: 1, latency_ms: 5.8 }
+        );
+        assert_eq!(s.vocals_index, 0);
+
+        let b = m.model("bytesep-mobilenet-1s").unwrap();
+        assert_eq!((b.kind, b.tier, b.sample_rate, b.vocals_index), (ModelKind::Windowed, Tier::Quality, 44100, 0));
+        assert_eq!(b.files.len(), 1);
+        let f = &b.files[0];
+        assert_eq!((f.file.as_str(), f.bytes, f.mirrorable), ("bytesep-mobilenet-1s.onnx", 9_600_617, true));
+        assert_eq!(f.sha256, "d70b6ba65e9627b6bc0f3e02efb6d678030d44af74b9de1ed0c7bc60a80d4885");
+        assert_eq!(f.origin, "https://github.com/YlZHE/Tune-Love/releases/download/models-v1/bytesep-mobilenet-1s.onnx");
+        assert_eq!(b.source, "https://zenodo.org/records/5804160");
+        assert_eq!((b.license.code.as_str(), b.license.weights.as_str()), ("Apache-2.0", "CC BY 4.0"));
+        assert_eq!(b.license.training_data, ["MUSDB18（仅教育用途）"]);
+        assert!(b.license.converted);
+        assert_eq!(
+            b.devices.gpu,
+            Some(DeviceParams { window_ms: 1000, hop_ms: 100, lookahead_ms: 100, threads: 1, latency_ms: 230.0 })
+        );
+        assert_eq!(
+            b.devices.cpu,
+            Some(DeviceParams { window_ms: 1000, hop_ms: 200, lookahead_ms: 100, threads: 2, latency_ms: 360.0 })
+        );
+
+        let h = m.model("htdemucs-ft-vocals-1s").unwrap();
+        assert_eq!((h.kind, h.tier, h.sample_rate, h.vocals_index), (ModelKind::Windowed, Tier::Quality, 44100, 3));
+        let f = &h.files[0];
+        assert_eq!((f.file.as_str(), f.bytes, f.mirrorable), ("htdemucs-ft-vocals-1s.onnx", 304_759_764, true));
+        assert_eq!(f.sha256, "fb173f3fdffd43d298c5ab26a9945a6c17845b9b81cce99df5ebcc8022dd5ab4");
+        assert_eq!(f.origin, "https://github.com/YlZHE/Tune-Love/releases/download/models-v1/htdemucs-ft-vocals-1s.onnx");
+        assert_eq!(h.source, "https://github.com/facebookresearch/demucs");
+        assert_eq!(h.license.code, "MIT");
+        assert!(h.license.converted);
+        assert_eq!(h.license.weights, "MIT（Demucs 官方发布；训练数据来源不明，仅限非商业使用）");
+        assert!(h.license.credit.contains("StemSplit demucs-onnx"));
+        assert!(b.license.credit.contains("Kong 等人") && b.license.credit.contains("zenodo.org/records/5513378"));
+        assert!(h.license.training_data.iter().any(|t| t.contains("来源不明") && t.contains("仅限非商业使用")));
+        assert!(h.devices.cpu.is_none(), "HTDemucs runs on GPU only");
+        assert_eq!(
+            h.devices.gpu,
+            Some(DeviceParams { window_ms: 1000, hop_ms: 100, lookahead_ms: 100, threads: 1, latency_ms: 230.0 })
+        );
+    }
+
+    #[test]
+    fn windowed_latency_matches_rule() {
+        // latency = hop + lookahead + 0.3 * hop
+        let mut windowed = 0;
+        for model in &bundled().models {
+            for d in [&model.devices.cpu, &model.devices.gpu].into_iter().flatten() {
+                if model.kind == ModelKind::Windowed {
+                    windowed += 1;
+                    let want = d.hop_ms as f64 + d.lookahead_ms as f64 + 0.3 * d.hop_ms as f64;
+                    assert!((d.latency_ms - want).abs() < 1e-6, "{}: {} vs {want}", model.id, d.latency_ms);
+                }
+            }
+        }
+        assert_eq!(windowed, 3);
+        assert_eq!(cpu(bundled(), "bytesep-mobilenet-1s").latency_ms, 360.0);
+    }
+
+    #[test]
+    fn rejects_windowed_without_device() {
+        let mut v = good_value();
+        v["models"][1]["devices"] = serde_json::json!({ "cpu": null, "gpu": null });
+        assert!(Manifest::parse(&v.to_string()).is_err());
+        let mut v = good_value();
+        v["models"][1]["devices"] = serde_json::json!({});
+        assert!(Manifest::parse(&v.to_string()).is_err());
+        let mut v = good_value();
+        v["models"][1].as_object_mut().unwrap().remove("devices");
+        assert!(Manifest::parse(&v.to_string()).is_err());
+    }
+
+    #[test]
+    fn rejects_cpu_threads_zero() {
+        let mut v = good_value();
+        v["models"][0]["devices"]["cpu"]["threads"] = 0.into();
+        assert!(Manifest::parse(&v.to_string()).is_err());
+        let mut v = good_value();
+        v["models"][1]["devices"]["cpu"]["threads"] = 0.into();
+        assert!(Manifest::parse(&v.to_string()).is_err());
+    }
+
+    #[test]
+    fn rejects_inconsistent_device_params() {
+        type Edit = Box<dyn Fn(&mut serde_json::Value)>;
+        let cases: Vec<(&str, Edit)> = vec![
+            ("latency off the rule", Box::new(|v| v["models"][1]["devices"]["gpu"]["latencyMs"] = 200.0.into())),
+            ("zero hop", Box::new(|v| v["models"][1]["devices"]["gpu"]["hopMs"] = 0.into())),
+            ("zero window", Box::new(|v| v["models"][1]["devices"]["gpu"]["windowMs"] = 0.into())),
+            ("streaming with a window", Box::new(|v| v["models"][0]["devices"]["cpu"]["windowMs"] = 1000.into())),
+            // The WindowedSpec has one window and one lookahead for both devices.
+            ("devices disagree on the window", Box::new(|v| v["models"][1]["devices"]["cpu"]["windowMs"] = 2000.into())),
+            ("devices disagree on the lookahead", Box::new(|v| {
+                let cpu = &mut v["models"][1]["devices"]["cpu"];
+                cpu["lookaheadMs"] = 50.into();
+                cpu["latencyMs"] = 310.0.into(); // still on the latency rule
+            })),
+            ("vocals index 4", Box::new(|v| v["models"][2]["vocalsIndex"] = 4.into())),
+            ("streaming vocals index 1", Box::new(|v| v["models"][0]["vocalsIndex"] = 1.into())),
+            ("bad kind", Box::new(|v| v["models"][0]["kind"] = "batch".into())),
+            ("old runtime-only entry", Box::new(|v| {
+                let m = v["models"][0].as_object_mut().unwrap();
+                m.remove("kind");
+                m.remove("devices");
+                m.insert("runtime".into(), "cpu".into());
+            })),
+        ];
+        for (name, edit) in cases {
+            let mut v = good_value();
+            edit(&mut v);
+            assert!(Manifest::parse(&v.to_string()).is_err(), "should reject: {name}");
+        }
     }
 
     #[test]

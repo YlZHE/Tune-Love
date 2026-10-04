@@ -13,10 +13,13 @@
 //!   (restart) while the user still wants devocal; never on state sync. The engine ignores a
 //!   repeated "on" (obligation 1), so a user `enable` while the engine reports `Fallback` is
 //!   sent as `set_mode(false)` then `set_mode(true)`: that is the user's retry.
-//! - `set_model` is sent to a new engine, when the model path changes, once per user
+//! - `set_model` (the selected model, device and manifest window geometry) is sent to a new
+//!   engine, when the model, its file or the device changes, once per user
 //!   action after `Error{ModelLoadFailed}` (followed by `set_mode(true)` if still wanted), and
 //!   on the next user `enable` after the engine gave up on the model (a second
-//!   `ModelLoadFailed`, or `NoModel`).
+//!   `ModelLoadFailed`, `NoModel` or `GpuRequired`). When a GPU-only model falls behind
+//!   (`device_note: gpu_overloaded`) the app sends StemgenRT and keeps that, across engine
+//!   restarts, until the selection changes.
 //! - `Error{Protocol}` means a version mismatch only during the hello exchange (from the
 //!   spawn until the first State or Metrics); the engine is then shut down (killed after
 //!   2 s) and not restarted.
@@ -43,20 +46,58 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use devocal_core::protocol::{
-    encode, Command, ErrorCode, Event, FallbackReason, Metrics, Mode, Phase, PROTOCOL,
+    encode, Command, Device, DeviceNote, ErrorCode, Event, FallbackReason, Metrics, Mode, Phase,
+    WindowedSpec, PROTOCOL,
 };
 use devocal_core::restore::RestoreOutcome;
 use serde::Serialize;
 
 use super::gate::AttenuationGate;
 use super::link::EngineLink;
+use super::model::manifest::{bundled, ModelKind, ModelSpec, STEMGENRT_ID};
 
-/// `set_model.id` for StemgenRT hop 128.
-pub const MODEL_ID: &str = "stemgenrt-hop128";
-/// The engine only accepts `"cpu"` in the first version.
-pub const MODEL_DEVICE: &str = "cpu";
-/// ONNX Runtime intra-op threads (the plan's default: never saturate the CPU).
-pub const MODEL_THREADS: u16 = 1;
+/// What the user picked in the settings: a manifest model id and `auto` | `cpu` | `gpu`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    pub model_id: String,
+    pub device: String,
+}
+
+impl Default for Selection {
+    fn default() -> Self {
+        Self {
+            model_id: STEMGENRT_ID.into(),
+            device: "auto".into(),
+        }
+    }
+}
+
+/// The `set_model` the engine has been sent: which model, from where, on which device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SentModel {
+    id: String,
+    path: PathBuf,
+    device: String,
+}
+
+/// The window geometry the engine needs for a windowed model; `None` for a streaming one.
+/// Window and lookahead are the same for both devices (the manifest validation checks it).
+fn windowed_spec(model: &ModelSpec) -> Option<WindowedSpec> {
+    if model.kind != ModelKind::Windowed {
+        return None;
+    }
+    let (cpu, gpu) = (model.devices.cpu.as_ref(), model.devices.gpu.as_ref());
+    let any = gpu.or(cpu)?;
+    Some(WindowedSpec {
+        window_ms: any.window_ms,
+        lookahead_ms: any.lookahead_ms,
+        gpu_hop_ms: gpu.map(|d| d.hop_ms),
+        cpu_hop_ms: cpu.map(|d| d.hop_ms),
+        cpu_threads: cpu.map_or(0, |d| d.threads),
+        vocals_index: model.vocals_index,
+    })
+}
+
 /// Restore retry interval while nothing is held (obligation 9).
 pub const RESTORE_RETRY_MS: u64 = 2_000;
 /// Restore retry interval while nothing is held and the restore file has entries awaiting the
@@ -112,6 +153,14 @@ pub struct DevocalStatus {
     /// sees `attaching`.
     pub waiting_for_player: bool,
     pub error: Option<String>,
+    /// The model actually running: the engine's report while active (a failed switch keeps the
+    /// old model), else the one last sent, else the one to send (the selection, or StemgenRT
+    /// after a GPU-only model fell behind). `None` before the first status.
+    pub model_id: Option<String>,
+    /// cpu | gpu: what the loaded model runs on (from the engine's Metrics while active).
+    pub device: Option<&'static str>,
+    /// gpu_unavailable | gpu_check_failed | gpu_overloaded: why it is not on the GPU.
+    pub device_note: Option<&'static str>,
 }
 
 impl DevocalStatus {
@@ -126,6 +175,9 @@ impl DevocalStatus {
             input_silent: false,
             waiting_for_player: false,
             error: None,
+            model_id: None,
+            device: None,
+            device_note: None,
         }
     }
 }
@@ -201,7 +253,9 @@ struct Linked<L> {
     release_sent: bool,
     /// When the app sent that `release` (deadline [`RELEASE_DEADLINE_MS`]).
     release_sent_at: Option<u64>,
-    sent_model: Option<PathBuf>,
+    sent_model: Option<SentModel>,
+    /// The GPU-overload fallback was already looked at for this engine (once is enough).
+    overload_handled: bool,
     /// The engine has no usable model: it gave up loading `sent_model` (a `ModelLoadFailed`
     /// with no retry left) or answered `NoModel`. The next user `enable` sends `set_model`.
     model_failed: bool,
@@ -225,6 +279,7 @@ impl<L> Linked<L> {
             release_sent: false,
             release_sent_at: None,
             sent_model: None,
+            overload_handled: false,
             model_failed: false,
             metrics: None,
             overridden_seen: None,
@@ -273,6 +328,13 @@ pub struct Supervisor<L: EngineLink> {
     want_hold: bool,
     want_devocal: bool,
     model: Option<PathBuf>,
+    /// The model and device the user picked; `model` is that model's file.
+    selection: Selection,
+    /// StemgenRT, loaded because a GPU-only model fell behind on the GPU. Kept until the
+    /// selection changes: the engine's GPU ban does not survive an engine restart.
+    fallback: Option<SentModel>,
+    /// Where an installed model is, by id (verified install, or the StemgenRT env override).
+    model_paths: Box<dyn Fn(&str) -> Option<PathBuf> + Send>,
     /// One `ModelLoadFailed` retry left for the current user action (ruling 5).
     model_retry: bool,
     /// Send `set_mode(true)` once the (new) engine has its handshake.
@@ -329,6 +391,9 @@ impl<L: EngineLink> Supervisor<L> {
             want_hold: false,
             want_devocal: false,
             model: None,
+            selection: Selection::default(),
+            fallback: None,
+            model_paths: Box::new(|_| None),
             model_retry: false,
             user_on_pending: false,
             restarting: false,
@@ -364,11 +429,25 @@ impl<L: EngineLink> Supervisor<L> {
         self
     }
 
-    /// User action: hold the player and turn devocal on. `None` (no model) only reports
-    /// `unavailable`.
-    pub fn enable(&mut self, model: Option<PathBuf>) {
+    /// Where to find a model by id, when the supervisor needs one on its own: StemgenRT for the
+    /// switch after a GPU-only model fell behind, and the selected model for an engine spawned
+    /// after it was installed. Without it those cases leave the engine as it is.
+    pub fn with_model_paths(mut self, paths: Box<dyn Fn(&str) -> Option<PathBuf> + Send>) -> Self {
+        self.model_paths = paths;
+        self
+    }
+
+    /// User action: hold the player and turn devocal on with the selected model (`model` is its
+    /// file). `None` (no such model installed) only reports `unavailable`.
+    pub fn enable(&mut self, model: Option<PathBuf>, selection: Selection) {
         if self.shut_down {
             return;
+        }
+        if selection != self.selection {
+            // A new choice ends the GPU-overload fallback, and an old file is not this model's.
+            self.selection = selection;
+            self.fallback = None;
+            self.model = None;
         }
         self.error = None;
         self.failed = false;
@@ -377,13 +456,14 @@ impl<L: EngineLink> Supervisor<L> {
         self.attach_failures = 0;
         self.attach_gave_up = false;
         let Some(model) = model else {
-            self.unavailable = true;
-            self.error = Some("model_not_found".into());
+            self.error = Some(format!("model_not_found:{}", self.selection.model_id));
+            // A running engine is left as it is: it keeps its model and phase, so the toggle
+            // still reads (and turns) it on or off; only the error names the missing model.
             // With no engine running, a wish left from an earlier enable must not survive this
             // failed one: otherwise a later install (which clears `unavailable`) would spawn an
-            // engine, take over the player and turn devocal on with nobody asking. A running
-            // engine is left as it is; it already holds the player.
+            // engine, take over the player and turn devocal on with nobody asking.
             if self.engine.is_none() {
+                self.unavailable = true;
                 self.want_hold = false;
                 self.want_devocal = false;
                 self.user_on_pending = false;
@@ -396,16 +476,12 @@ impl<L: EngineLink> Supervisor<L> {
         self.want_devocal = true;
         self.model_retry = true;
         self.model = Some(model);
+        let wanted = self.wanted();
         let live = self
             .engine
             .as_ref()
             .filter(|e| e.mismatch_at.is_none())
-            .map(|e| {
-                (
-                    e.sent_model != self.model || e.model_failed,
-                    e.in_fallback(),
-                )
-            });
+            .map(|e| (e.sent_model != wanted || e.model_failed, e.in_fallback()));
         match live {
             Some((reload, fallback)) => {
                 self.user_on_pending = false;
@@ -426,10 +502,15 @@ impl<L: EngineLink> Supervisor<L> {
         }
     }
 
-    /// A model was installed (downloaded or imported): an `unavailable` caused only by the missing
-    /// model no longer applies. Does not enable devocal; any other condition is left as it is.
+    /// A model was installed (downloaded or imported): a missing-model error (and the
+    /// `unavailable` it caused) no longer applies. Does not enable devocal; any other condition
+    /// is left as it is.
     pub fn model_installed(&mut self) {
-        if self.unavailable && self.error.as_deref() == Some("model_not_found") {
+        if self
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("model_not_found:"))
+        {
             self.unavailable = false;
             self.error = None;
         }
@@ -543,6 +624,25 @@ impl<L: EngineLink> Supervisor<L> {
                 && active_metrics.is_some_and(|m| m.input_silent_ms >= INPUT_SILENT_MS),
             waiting_for_player,
             error: self.error.clone(),
+            // The model the engine reports loaded (a failed switch keeps the old one), else the
+            // one it was last sent, else the one it will be sent.
+            model_id: active_metrics
+                .and_then(|m| m.model_id.clone())
+                .or_else(|| e.and_then(|e| e.sent_model.as_ref()).map(|s| s.id.clone()))
+                .or_else(|| Some(self.wanted_id().to_string())),
+            device: active_metrics.and_then(|m| m.device).map(|d| match d {
+                Device::Cpu => "cpu",
+                Device::Gpu => "gpu",
+            }),
+            // After the switch to StemgenRT the engine no longer carries the note; keep the reason.
+            device_note: active_metrics
+                .and_then(|m| m.device_note)
+                .map(|n| match n {
+                    DeviceNote::GpuUnavailable => "gpu_unavailable",
+                    DeviceNote::GpuCheckFailed => "gpu_check_failed",
+                    DeviceNote::GpuOverloaded => "gpu_overloaded",
+                })
+                .or(self.fallback.as_ref().map(|_| "gpu_overloaded")),
         }
     }
 
@@ -676,10 +776,14 @@ impl<L: EngineLink> Supervisor<L> {
             epoch: m.attenuation_epoch,
         };
         let gain = (m.attenuation.is_finite() && m.attenuation > 0.0).then(|| 1.0 / m.attenuation);
+        let overloaded = m.device_note == Some(DeviceNote::GpuOverloaded);
         e.metrics = Some(m);
         match gain {
             Some(g) => self.apply_gate(key, Some(g)),
             None => self.apply_gate(GateKey::Drop, None),
+        }
+        if overloaded {
+            self.on_gpu_overloaded();
         }
     }
 
@@ -739,6 +843,15 @@ impl<L: EngineLink> Supervisor<L> {
                 }
             }
             ErrorCode::BadDevice => self.error = Some(format!("bad_device: {message}")),
+            // A GPU-only model on a machine or choice without a usable GPU: say so, keep the
+            // original sound, never swap models behind the user's back. No retry (it would fail
+            // the same way); the user's next enable sends the model again.
+            ErrorCode::GpuRequired => {
+                self.error = Some(format!("gpu_required: {message}"));
+                if let Some(e) = self.engine.as_mut() {
+                    e.model_failed = true;
+                }
+            }
         }
     }
 
@@ -804,6 +917,11 @@ impl<L: EngineLink> Supervisor<L> {
                 self.engine = Some(Linked::new(link, self.generation));
                 if !self.send(&Command::Hello { version: PROTOCOL }) {
                     return;
+                }
+                // The file may have been installed since `enable` found none (or never been
+                // looked for after a selection change): look it up for the selected model.
+                if self.model.is_none() {
+                    self.model = (self.model_paths)(&self.selection.model_id);
                 }
                 if self.model.is_some() {
                     self.send_set_model();
@@ -954,16 +1072,49 @@ impl<L: EngineLink> Supervisor<L> {
         }
     }
 
-    /// Sends `set_model` for `self.model`. An unencodable path makes devocal unavailable.
+    /// What the engine should be running: the GPU-overload fallback if there is one, else the
+    /// selected model on the selected device. `None` while there is no model file.
+    fn wanted(&self) -> Option<SentModel> {
+        self.fallback.clone().or_else(|| {
+            Some(SentModel {
+                id: self.selection.model_id.clone(),
+                path: self.model.clone()?,
+                device: self.selection.device.clone(),
+            })
+        })
+    }
+
+    fn wanted_id(&self) -> &str {
+        self.fallback
+            .as_ref()
+            .map_or(self.selection.model_id.as_str(), |f| f.id.as_str())
+    }
+
+    /// Sends `set_model` for [`Self::wanted`], with the geometry from the manifest. An
+    /// unencodable path or a model the manifest does not list makes devocal unavailable.
     fn send_set_model(&mut self) -> bool {
-        let Some(path) = self.model.clone() else {
+        let Some(wanted) = self.wanted() else {
             return false;
         };
+        let Some(spec) = bundled().model(&wanted.id) else {
+            self.unavailable = true;
+            self.want_devocal = false;
+            self.user_on_pending = false;
+            self.error = Some(format!("model_not_found:{}", wanted.id));
+            return false;
+        };
+        let devices = &spec.devices;
         let cmd = Command::SetModel {
-            id: MODEL_ID.into(),
-            path: path.clone(),
-            device: MODEL_DEVICE.into(),
-            threads: MODEL_THREADS,
+            id: wanted.id.clone(),
+            path: wanted.path.clone(),
+            device: wanted.device.clone(),
+            // Only StemgenRT reads this; a window model has `cpu_threads` in `windowed`.
+            threads: devices
+                .cpu
+                .as_ref()
+                .or(devices.gpu.as_ref())
+                .map_or(1, |d| d.threads),
+            windowed: windowed_spec(spec),
         };
         if let Err(e) = encode(&cmd) {
             self.unavailable = true;
@@ -976,10 +1127,46 @@ impl<L: EngineLink> Supervisor<L> {
             return false;
         }
         if let Some(e) = self.engine.as_mut() {
-            e.sent_model = Some(path);
+            e.sent_model = Some(wanted);
+            e.overload_handled = false;
             e.model_failed = false;
+            // Those belong to the model that was running: not for the new one's status.
+            e.metrics = None;
         }
         true
+    }
+
+    /// A GPU-only model fell behind on the GPU: the engine stays in `Fallback(Overload)` and
+    /// waits for the app. Load StemgenRT (the engine fades out and swaps; devocal stays on) and
+    /// keep it until the selection changes. A model with a CPU path is moved by the engine itself.
+    fn on_gpu_overloaded(&mut self) {
+        let Some(e) = self.engine.as_mut() else {
+            return;
+        };
+        if std::mem::replace(&mut e.overload_handled, true) {
+            return;
+        }
+        let Some(sent) = e.sent_model.as_ref() else {
+            return;
+        };
+        let has_cpu = bundled()
+            .model(&sent.id)
+            .is_none_or(|m| m.devices.cpu.is_some());
+        if has_cpu {
+            return;
+        }
+        let Some(path) = (self.model_paths)(STEMGENRT_ID) else {
+            // Like any missing model: `model_installed()` clears it.
+            self.unavailable = true;
+            self.error = Some(format!("model_not_found:{STEMGENRT_ID}"));
+            return;
+        };
+        self.fallback = Some(SentModel {
+            id: STEMGENRT_ID.into(),
+            path,
+            device: "cpu".into(),
+        });
+        self.send_set_model();
     }
 
     /// Sends `cmd`; an unencodable command never reaches the link. A link error means the
@@ -1017,7 +1204,9 @@ impl<L: EngineLink> Supervisor<L> {
 mod tests {
     use super::*;
     use crate::devocal::link::fake::{FakeEngine, FakeLink};
-    use devocal_core::protocol::{ErrorCode, FallbackReason, Metrics, Mode, Phase, PROTOCOL};
+    use devocal_core::protocol::{
+        Device, DeviceNote, ErrorCode, FallbackReason, Metrics, Mode, Phase, WindowedSpec, PROTOCOL,
+    };
     use std::sync::Mutex;
 
     struct Rig {
@@ -1067,6 +1256,11 @@ mod tests {
             gate.clone(),
         )
         .with_restore_pending(Box::new(move || restore_pending))
+        .with_model_paths(Box::new(|id| match id {
+            "bytesep-mobilenet-1s" => Some(bytesep_path()),
+            "htdemucs-ft-vocals-1s" => Some(htdemucs_path()),
+            _ => Some(model()),
+        }))
         .with_shutdown_wait(Duration::from_millis(50));
         Rig {
             sup,
@@ -1097,7 +1291,7 @@ mod tests {
         }
         /// enable + tick with `p` + Attaching + Active(Devocal), at time `t`.
         fn hold(&mut self, t: u64, p: &PlayerProcess) {
-            self.sup.enable(Some(model()));
+            self.sup.enable(Some(model()), Selection::default());
             self.sup.tick(t, Some(p.clone()), true);
             let e = self.last();
             e.push(state(Phase::Attaching, None));
@@ -1138,6 +1332,11 @@ mod tests {
             attenuation_epoch: epoch,
             session_overridden: 0,
             input_silent_ms: 0,
+            device: None,
+            device_note: None,
+            window_timeouts: None,
+            window_duty: None,
+            model_id: None,
         })
     }
 
@@ -1150,10 +1349,11 @@ mod tests {
 
     fn set_model() -> Command {
         Command::SetModel {
-            id: MODEL_ID.into(),
+            id: "stemgenrt-hop128".into(),
             path: model(),
-            device: "cpu".into(),
+            device: "auto".into(),
             threads: 1,
+            windowed: None,
         }
     }
 
@@ -1176,7 +1376,7 @@ mod tests {
     #[test]
     fn enable_sends_handshake_in_order() {
         let mut r = rig();
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, None, true);
         assert_eq!(r.spawns(), 0, "no target: no spawn");
         assert_eq!(r.phase(), "attaching");
@@ -1196,7 +1396,7 @@ mod tests {
         r.hold(0, &p);
         r.sup.disable();
         r.engine(0).clear_sent();
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(300, Some(p), true);
         assert_eq!(r.engine(0).sent(), vec![Command::SetMode { devocal: true }]);
         assert_eq!(r.spawns(), 1);
@@ -1222,7 +1422,7 @@ mod tests {
             assert_eq!(r.phase(), "fallback");
             r.last().clear_sent();
             // The engine ignores a repeated "on" (obligation 1): the retry is off-then-on.
-            r.sup.enable(Some(model()));
+            r.sup.enable(Some(model()), Selection::default());
             assert_eq!(
                 r.last().sent(),
                 vec![
@@ -1236,7 +1436,7 @@ mod tests {
             r.sup.tick(300, Some(p.clone()), true);
             assert_eq!(r.phase(), "devocal");
             r.last().clear_sent();
-            r.sup.enable(Some(model()));
+            r.sup.enable(Some(model()), Selection::default());
             assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: true }]);
         }
     }
@@ -1250,7 +1450,7 @@ mod tests {
         r.last().push(state(Phase::Active, Some(Mode::Passthrough)));
         r.sup.tick(200, Some(p), true);
         r.last().clear_sent();
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: true }]);
     }
 
@@ -1269,7 +1469,7 @@ mod tests {
         assert_eq!(s.phase, "passthrough");
         assert!(s.error.unwrap().starts_with("model_load_failed"));
         r.last().clear_sent();
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         assert_eq!(
             r.last().sent(),
             vec![set_model(), Command::SetMode { devocal: true }]
@@ -1278,7 +1478,7 @@ mod tests {
         // Loaded this time: a later enable does not reload.
         r.sup.disable();
         r.last().clear_sent();
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: true }]);
     }
 
@@ -1291,7 +1491,7 @@ mod tests {
         r.sup.tick(200, Some(p), true);
         assert!(r.sup.status().error.unwrap().starts_with("no_model"));
         r.last().clear_sent();
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         assert_eq!(
             r.last().sent(),
             vec![set_model(), Command::SetMode { devocal: true }]
@@ -1301,7 +1501,7 @@ mod tests {
     #[test]
     fn waiting_for_player_while_there_is_nothing_to_hold() {
         let mut r = rig();
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, None, false);
         let s = r.sup.status();
         assert_eq!(s.phase, "attaching", "phase unchanged for older readers");
@@ -1364,7 +1564,7 @@ mod tests {
     fn crash_restores_then_restarts_up_to_three_times_per_minute() {
         let mut r = rig();
         let p = player(7);
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, Some(p.clone()), true);
         assert_eq!(r.spawns(), 1);
         for (i, t) in [1_000u64, 2_000, 3_000].into_iter().enumerate() {
@@ -1387,7 +1587,7 @@ mod tests {
         assert_eq!(r.spawns(), 4, "failed stays failed without a user action");
 
         // 61 s: a user enable spawns again and the restart budget has recovered.
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(61_000, Some(p.clone()), true);
         assert_eq!(r.spawns(), 5);
         r.last().exit();
@@ -1432,7 +1632,7 @@ mod tests {
         let mut r = rig();
         let p = player(7);
         assert_eq!(r.gate.read(), (0, Some(1.0)));
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, Some(p.clone()), true);
         r.last().push(state(Phase::Attaching, None));
         r.sup.tick(100, Some(p.clone()), true);
@@ -1558,7 +1758,7 @@ mod tests {
     fn attach_failed_while_idle_counts_as_a_failed_attempt() {
         let mut r = rig();
         let p = player(7);
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, Some(p.clone()), true);
         r.last().push(error(ErrorCode::AttachFailed));
         r.sup.tick(100, Some(p.clone()), true);
@@ -1609,10 +1809,11 @@ mod tests {
             None,
             &dir,
             crate::devocal::model::manifest::bundled(),
+            STEMGENRT_ID,
         );
         assert_eq!(model, None);
         let mut r = rig();
-        r.sup.enable(model);
+        r.sup.enable(model, Selection::default());
         r.sup.tick(0, Some(player(7)), true);
         assert_eq!(r.spawns(), 0);
         assert_eq!(r.phase(), "unavailable");
@@ -1621,7 +1822,7 @@ mod tests {
     #[test]
     fn an_installed_model_clears_model_not_found_without_enabling() {
         let mut r = rig();
-        r.sup.enable(None);
+        r.sup.enable(None, Selection::default());
         assert_eq!(r.phase(), "unavailable");
         r.sup.model_installed();
         let s = r.sup.status();
@@ -1632,7 +1833,7 @@ mod tests {
         assert_eq!(r.spawns(), 0);
         assert_eq!(r.phase(), "off");
         // A later enable with the model goes ahead as usual.
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(100, Some(player(7)), true);
         assert_eq!(r.spawns(), 1);
     }
@@ -1643,7 +1844,7 @@ mod tests {
         // and the user's enable found no model.
         let mut r = rig();
         let p = player(7);
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, Some(p.clone()), true);
         for t in [1_000u64, 2_000, 3_000, 4_000] {
             r.last().exit();
@@ -1651,7 +1852,7 @@ mod tests {
         }
         assert_eq!(r.phase(), "failed");
         assert_eq!(r.spawns(), 4);
-        r.sup.enable(None);
+        r.sup.enable(None, Selection::default());
         assert_eq!(r.phase(), "unavailable");
         // An install without auto-enable: nothing starts or takes over the player.
         r.sup.model_installed();
@@ -1662,7 +1863,7 @@ mod tests {
         assert_eq!(s.phase, "off");
         assert!(!s.held);
         // The user's next enable works as usual.
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(70_200, Some(p.clone()), true);
         assert_eq!(r.spawns(), 5);
     }
@@ -1671,12 +1872,12 @@ mod tests {
     fn a_failed_enable_while_restarting_stops_the_restart() {
         let mut r = rig();
         let p = player(7);
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, Some(p.clone()), true);
         r.last().exit();
         r.sup.tick(1_000, None, true);
         assert_eq!(r.phase(), "restarting");
-        r.sup.enable(None);
+        r.sup.enable(None, Selection::default());
         r.sup.model_installed();
         r.sup.tick(1_100, Some(p.clone()), true);
         assert_eq!(r.spawns(), 1, "no restart after the failed enable");
@@ -1688,7 +1889,7 @@ mod tests {
         // Another unavailable reason stays.
         let mut r = rig();
         *r.spawn_error.lock().unwrap() = Some("devocal-engine.exe not found".into());
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, Some(player(7)), true);
         r.sup.model_installed();
         let s = r.sup.status();
@@ -1696,7 +1897,7 @@ mod tests {
         assert!(s.error.unwrap().contains("devocal-engine.exe not found"));
         // A running devocal is not touched.
         let mut r = rig();
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, Some(player(7)), true);
         let before = r.sup.status();
         r.sup.model_installed();
@@ -1708,7 +1909,7 @@ mod tests {
     fn missing_engine_reports_unavailable_without_retrying() {
         let mut r = rig();
         *r.spawn_error.lock().unwrap() = Some("devocal-engine.exe not found".into());
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, Some(player(7)), true);
         r.sup.tick(100, Some(player(7)), true);
         let s = r.sup.status();
@@ -1728,7 +1929,7 @@ mod tests {
         assert_eq!(r.restores(), 1);
         assert_eq!(r.gate.read().1, Some(1.0));
         // Ticks and commands after shutdown do nothing.
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(10_000, Some(p), true);
         assert_eq!(r.spawns(), 1);
     }
@@ -1755,7 +1956,7 @@ mod tests {
         r.sup.tick(2_000, None, false);
         assert_eq!(r.restores(), 2);
         let p = player(7);
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(3_000, Some(p.clone()), true);
         // The attach is in flight (no State yet): no restore.
         r.sup.tick(6_100, Some(p.clone()), true);
@@ -1938,7 +2139,7 @@ mod tests {
             .unwrap()
             .starts_with("model_load_failed"));
         // A new user action allows one more retry; disable ends that allowance.
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.disable();
         r.last().clear_sent();
         r.last().push(error(ErrorCode::ModelLoadFailed));
@@ -1952,7 +2153,7 @@ mod tests {
         let p = player(7);
         r.hold(0, &p);
         r.sup.disable();
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.last().clear_sent();
         r.last().push(error(ErrorCode::ModelLoadFailed));
         r.sup.tick(300, Some(p), true);
@@ -1966,7 +2167,7 @@ mod tests {
     fn protocol_error_during_hello_is_a_version_mismatch() {
         let mut r = rig();
         let p = player(7);
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, Some(p.clone()), true);
         r.last().clear_sent();
         r.last().push(error(ErrorCode::Protocol));
@@ -1990,7 +2191,7 @@ mod tests {
     fn version_mismatched_engine_that_does_not_exit_is_killed() {
         let mut r = rig();
         let p = player(7);
-        r.sup.enable(Some(model()));
+        r.sup.enable(Some(model()), Selection::default());
         r.sup.tick(0, Some(p.clone()), true);
         r.last().push(error(ErrorCode::Protocol));
         r.sup.tick(100, Some(p.clone()), true);
@@ -2027,6 +2228,11 @@ mod tests {
             attenuation_epoch: 1,
             session_overridden: 2,
             input_silent_ms: 3_500,
+            device: None,
+            device_note: None,
+            window_timeouts: None,
+            window_duty: None,
+            model_id: None,
         }));
         r.sup.tick(1_000, Some(p.clone()), true);
         let s = r.sup.status();
@@ -2144,5 +2350,422 @@ mod tests {
         assert!(b.allow(2));
         assert!(!b.allow(59_999));
         assert!(b.allow(60_000));
+    }
+
+    fn bytesep() -> Selection {
+        Selection {
+            model_id: "bytesep-mobilenet-1s".into(),
+            device: "gpu".into(),
+        }
+    }
+
+    fn htdemucs() -> Selection {
+        Selection {
+            model_id: "htdemucs-ft-vocals-1s".into(),
+            device: "auto".into(),
+        }
+    }
+
+    fn bytesep_path() -> PathBuf {
+        PathBuf::from(r"C:\models\bytesep-mobilenet-1s.onnx")
+    }
+
+    fn htdemucs_path() -> PathBuf {
+        PathBuf::from(r"C:\models\htdemucs-ft-vocals-1s.onnx")
+    }
+
+    fn set_model_for(
+        id: &str,
+        path: PathBuf,
+        device: &str,
+        threads: u16,
+        windowed: Option<WindowedSpec>,
+    ) -> Command {
+        Command::SetModel {
+            id: id.into(),
+            path,
+            device: device.into(),
+            threads,
+            windowed,
+        }
+    }
+
+    fn bytesep_set_model(device: &str) -> Command {
+        set_model_for(
+            "bytesep-mobilenet-1s",
+            bytesep_path(),
+            device,
+            2,
+            Some(WindowedSpec {
+                window_ms: 1000,
+                lookahead_ms: 100,
+                gpu_hop_ms: Some(100),
+                cpu_hop_ms: Some(200),
+                cpu_threads: 2,
+                vocals_index: 0,
+            }),
+        )
+    }
+
+    fn htdemucs_set_model() -> Command {
+        set_model_for(
+            "htdemucs-ft-vocals-1s",
+            htdemucs_path(),
+            "auto",
+            1,
+            Some(WindowedSpec {
+                window_ms: 1000,
+                lookahead_ms: 100,
+                gpu_hop_ms: Some(100),
+                cpu_hop_ms: None,
+                cpu_threads: 0,
+                vocals_index: 3,
+            }),
+        )
+    }
+
+    fn device_metrics(device: Device, note: Option<DeviceNote>) -> Event {
+        let Event::Metrics(mut m) = metrics(1e-4, 1) else {
+            unreachable!()
+        };
+        m.device = Some(device);
+        m.device_note = note;
+        Event::Metrics(m)
+    }
+
+    #[test]
+    fn enable_with_selection_sends_windowed_set_model() {
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(bytesep_path()), bytesep());
+        r.sup.tick(0, Some(p.clone()), true);
+        assert_eq!(
+            r.engine(0).sent(),
+            vec![
+                Command::Hello { version: PROTOCOL },
+                bytesep_set_model("gpu"),
+                attach(&p),
+                Command::SetMode { devocal: true },
+            ]
+        );
+        assert_eq!(
+            r.sup.status().model_id.as_deref(),
+            Some("bytesep-mobilenet-1s")
+        );
+
+        // A GPU-only model has no CPU hop and cpu_threads 0 (engine default).
+        let mut r = rig();
+        r.sup.enable(Some(htdemucs_path()), htdemucs());
+        r.sup.tick(0, Some(p), true);
+        assert_eq!(r.engine(0).sent()[1], htdemucs_set_model());
+    }
+
+    #[test]
+    fn enable_resends_set_model_only_when_the_selection_changes() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().clear_sent();
+        // Same selection: no SetModel, only the usual "on".
+        r.sup.enable(Some(model()), Selection::default());
+        assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: true }]);
+        r.last().clear_sent();
+        // Same model, another device: reload.
+        r.sup.enable(
+            Some(model()),
+            Selection {
+                model_id: "stemgenrt-hop128".into(),
+                device: "cpu".into(),
+            },
+        );
+        assert_eq!(
+            r.last().sent(),
+            vec![
+                set_model_for("stemgenrt-hop128", model(), "cpu", 1, None),
+                Command::SetMode { devocal: true }
+            ]
+        );
+        r.last().clear_sent();
+        // Another model.
+        r.sup.enable(Some(bytesep_path()), bytesep());
+        assert_eq!(
+            r.last().sent(),
+            vec![bytesep_set_model("gpu"), Command::SetMode { devocal: true }]
+        );
+    }
+
+    #[test]
+    fn restart_keeps_selection() {
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(bytesep_path()), bytesep());
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().exit();
+        r.sup.tick(1_000, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 2);
+        r.sup.tick(1_100, Some(p.clone()), true);
+        assert_eq!(
+            r.engine(1).sent(),
+            vec![
+                Command::Hello { version: PROTOCOL },
+                bytesep_set_model("gpu"),
+                attach(&p),
+                Command::SetMode { devocal: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn gpu_only_overload_switches_to_stemgenrt() {
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(htdemucs_path()), htdemucs());
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().push(state(Phase::Attaching, None));
+        r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+        r.sup.tick(100, Some(p.clone()), true);
+        r.last().clear_sent();
+        // Fell behind: the engine stays in Fallback(Overload) and says why.
+        r.last().push(Event::State {
+            phase: Phase::Active,
+            mode: Some(Mode::Fallback),
+            fallback_reason: Some(FallbackReason::Overload),
+            attached_pid: None,
+        });
+        r.last()
+            .push(device_metrics(Device::Gpu, Some(DeviceNote::GpuOverloaded)));
+        r.sup.tick(200, Some(p.clone()), true);
+        assert_eq!(
+            r.last().sent(),
+            vec![set_model_for("stemgenrt-hop128", model(), "cpu", 1, None)]
+        );
+        // Further metrics with the note do not resend.
+        r.last()
+            .push(device_metrics(Device::Gpu, Some(DeviceNote::GpuOverloaded)));
+        r.sup.tick(300, Some(p.clone()), true);
+        assert_eq!(r.last().sent().len(), 1);
+        // The selection is unchanged; the status says what runs and why.
+        let s = r.sup.status();
+        assert_eq!(s.model_id.as_deref(), Some("stemgenrt-hop128"));
+        assert_eq!(s.device_note, Some("gpu_overloaded"));
+        // An engine restart in the meantime loads StemgenRT as well.
+        r.last().exit();
+        r.sup.tick(1_000, Some(p.clone()), true);
+        r.sup.tick(1_100, Some(p.clone()), true);
+        assert_eq!(
+            r.engine(1).sent()[1],
+            set_model_for("stemgenrt-hop128", model(), "cpu", 1, None)
+        );
+        // The user picking again (a changed selection) ends the fallback.
+        r.sup.enable(Some(bytesep_path()), bytesep());
+        assert_eq!(
+            r.engine(1).sent().iter().rev().nth(1).cloned(),
+            Some(bytesep_set_model("gpu"))
+        );
+        assert_eq!(
+            r.sup.status().model_id.as_deref(),
+            Some("bytesep-mobilenet-1s")
+        );
+    }
+
+    #[test]
+    fn overload_of_a_model_with_a_cpu_path_is_left_to_the_engine() {
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(bytesep_path()), bytesep());
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().push(state(Phase::Attaching, None));
+        r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+        r.sup.tick(100, Some(p.clone()), true);
+        r.last().clear_sent();
+        r.last()
+            .push(device_metrics(Device::Cpu, Some(DeviceNote::GpuOverloaded)));
+        r.sup.tick(200, Some(p), true);
+        assert_eq!(r.last().sent(), vec![]);
+        let s = r.sup.status();
+        assert_eq!(
+            (s.device, s.device_note),
+            (Some("cpu"), Some("gpu_overloaded"))
+        );
+        assert_eq!(s.model_id.as_deref(), Some("bytesep-mobilenet-1s"));
+    }
+
+    #[test]
+    fn missing_selected_model_reports_its_id() {
+        let mut r = rig();
+        r.sup.enable(None, bytesep());
+        let s = r.sup.status();
+        assert_eq!(s.phase, "unavailable");
+        assert_eq!(
+            s.error.as_deref(),
+            Some("model_not_found:bytesep-mobilenet-1s")
+        );
+        // Installing a model clears it.
+        r.sup.model_installed();
+        assert_eq!(r.sup.status().error, None);
+    }
+
+    #[test]
+    fn gpu_required_does_not_swap_the_model_and_a_later_enable_retries() {
+        let mut r = rig();
+        let p = player(7);
+        r.sup.enable(Some(htdemucs_path()), htdemucs());
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().clear_sent();
+        r.last().push(error(ErrorCode::GpuRequired));
+        r.sup.tick(100, Some(p), true);
+        assert_eq!(r.last().sent(), vec![], "no silent model change, no retry");
+        assert_eq!(r.sup.status().error.as_deref(), Some("gpu_required: x"));
+        r.sup.enable(Some(htdemucs_path()), htdemucs());
+        assert_eq!(r.last().sent()[0], htdemucs_set_model());
+    }
+
+    #[test]
+    fn status_reports_device_and_note_while_active() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().push(device_metrics(
+            Device::Cpu,
+            Some(DeviceNote::GpuUnavailable),
+        ));
+        r.sup.tick(200, Some(p.clone()), true);
+        let s = r.sup.status();
+        assert_eq!(
+            (s.device, s.device_note),
+            (Some("cpu"), Some("gpu_unavailable"))
+        );
+        r.last().push(device_metrics(Device::Gpu, None));
+        r.sup.tick(300, Some(p), true);
+        let s = r.sup.status();
+        assert_eq!((s.device, s.device_note), (Some("gpu"), None));
+    }
+
+    /// Metrics from an engine running `id` on `device`.
+    fn loaded_metrics(id: &str, device: Device) -> Event {
+        let Event::Metrics(mut m) = device_metrics(device, None) else {
+            unreachable!()
+        };
+        m.model_id = Some(id.into());
+        Event::Metrics(m)
+    }
+
+    /// I3: a switch that fails for good leaves the old model running; the status names it.
+    #[test]
+    fn a_failed_switch_reports_the_model_still_running() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last()
+            .push(loaded_metrics("stemgenrt-hop128", Device::Cpu));
+        r.sup.tick(200, Some(p.clone()), true);
+        r.sup.enable(Some(bytesep_path()), bytesep());
+        // The retry fails too.
+        r.last().push(error(ErrorCode::ModelLoadFailed));
+        r.sup.tick(300, Some(p.clone()), true);
+        r.last().push(error(ErrorCode::ModelLoadFailed));
+        r.last()
+            .push(loaded_metrics("stemgenrt-hop128", Device::Cpu));
+        r.sup.tick(400, Some(p), true);
+        let s = r.sup.status();
+        assert_eq!(s.phase, "devocal");
+        assert_eq!(s.model_id.as_deref(), Some("stemgenrt-hop128"));
+        assert_eq!(s.device, Some("cpu"));
+        assert_eq!(s.error.as_deref(), Some("model_load_failed: x"));
+    }
+
+    /// I2: `enable` for a model that is not installed while the engine runs another one keeps
+    /// that model, its phase and a working toggle; only the error names the missing model.
+    #[test]
+    fn enabling_a_missing_model_while_another_runs_keeps_it_and_the_toggle() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last()
+            .push(loaded_metrics("stemgenrt-hop128", Device::Cpu));
+        r.sup.tick(200, Some(p.clone()), true);
+        r.last().clear_sent();
+        r.sup.enable(None, bytesep());
+        r.sup.tick(300, Some(p.clone()), true);
+        assert_eq!(r.last().sent(), vec![]);
+        let s = r.sup.status();
+        assert_eq!(s.phase, "devocal");
+        assert_eq!(s.model_id.as_deref(), Some("stemgenrt-hop128"));
+        assert_eq!(
+            s.error.as_deref(),
+            Some("model_not_found:bytesep-mobilenet-1s")
+        );
+        // The main toggle still turns it off.
+        r.sup.disable();
+        assert_eq!(r.last().sent(), vec![Command::SetMode { devocal: false }]);
+        // Installing the model clears the hint.
+        r.sup.model_installed();
+        assert_eq!(r.sup.status().error, None);
+    }
+
+    #[test]
+    fn set_model_drops_the_old_models_metrics_from_the_status() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        r.last().push(device_metrics(
+            Device::Cpu,
+            Some(DeviceNote::GpuUnavailable),
+        ));
+        r.sup.tick(200, Some(p), true);
+        assert_eq!(r.sup.status().device, Some("cpu"));
+        r.sup.enable(Some(bytesep_path()), bytesep());
+        let s = r.sup.status();
+        assert_eq!(s.model_id.as_deref(), Some("bytesep-mobilenet-1s"));
+        assert_eq!((s.device, s.device_note, s.latency_ms), (None, None, None));
+    }
+
+    #[test]
+    fn missing_stemgenrt_after_an_overload_is_unavailable_until_it_is_installed() {
+        let mut r = rig();
+        r.sup = std::mem::replace(&mut r.sup, rig().sup).with_model_paths(Box::new(|id| {
+            (id != "stemgenrt-hop128").then(htdemucs_path)
+        }));
+        let p = player(7);
+        r.sup.enable(Some(htdemucs_path()), htdemucs());
+        r.sup.tick(0, Some(p.clone()), true);
+        r.last().push(state(Phase::Attaching, None));
+        r.last().push(state(Phase::Active, Some(Mode::Devocal)));
+        r.sup.tick(100, Some(p), true);
+        r.last().clear_sent();
+        r.last()
+            .push(device_metrics(Device::Gpu, Some(DeviceNote::GpuOverloaded)));
+        r.sup.tick(200, Some(player(7)), true);
+        assert_eq!(r.last().sent(), vec![], "nothing to switch to");
+        let s = r.sup.status();
+        assert_eq!(s.phase, "unavailable");
+        assert_eq!(s.error.as_deref(), Some("model_not_found:stemgenrt-hop128"));
+        // The install clears it like any other missing model.
+        r.sup.model_installed();
+        let s = r.sup.status();
+        assert_eq!(s.error, None);
+        assert_ne!(s.phase, "unavailable");
+    }
+
+    #[test]
+    fn a_new_engine_gets_the_selected_model_once_it_is_installed() {
+        let mut r = rig();
+        let p = player(7);
+        r.hold(0, &p);
+        // The user picks a model that is not installed yet: the engine runs on with its model
+        // (and its phase), the error names the missing one.
+        r.sup.enable(None, bytesep());
+        assert_eq!(r.phase(), "devocal");
+        assert_eq!(
+            r.sup.status().error.as_deref(),
+            Some("model_not_found:bytesep-mobilenet-1s")
+        );
+        // The engine goes away, the model gets installed, and a new engine is started.
+        r.last().exit();
+        r.sup.tick(1_000, Some(p.clone()), true);
+        r.sup.model_installed();
+        r.sup.tick(1_100, Some(p.clone()), true);
+        assert_eq!(r.spawns(), 2);
+        assert_eq!(r.engine(1).sent()[1], bytesep_set_model("gpu"));
     }
 }

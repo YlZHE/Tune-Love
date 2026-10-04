@@ -147,7 +147,8 @@ pub(crate) mod tests {
                     "file": "model.onnx", "bytes": content.len(), "sha256": sha,
                     "origin": "https://example.com/model.onnx", "mirrorable": false
                 }],
-                "sampleRate": 44100, "latencyMs": 5.8, "runtime": "cpu",
+                "sampleRate": 44100, "kind": "streaming", "vocalsIndex": 0,
+                "devices": { "cpu": { "windowMs": 0, "hopMs": 0, "lookaheadMs": 0, "threads": 1, "latencyMs": 5.8 }, "gpu": null },
                 "license": { "code": "MIT", "weights": "pending", "trainingData": [] },
                 "source": "https://example.com"
             }]

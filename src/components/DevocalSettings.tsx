@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Button, TextField } from "@radix-ui/themes";
+import { Button, RadioGroup, TextField } from "@radix-ui/themes";
 import { UserSound } from "@phosphor-icons/react";
 import { isValidMirrorPrefix, readMirrorPrefix, saveMirrorPrefix } from "../modelDownload";
 import { useDevocal } from "../useDevocal";
+import { deviceLine, type DevocalStatus } from "../devocal";
+import { readDevocalModelPreference, setDevocalModelPreference, useDevocalModelPreference, type DevocalDevice } from "../devocalModelPreferences";
+import { useModelDownload } from "../useModelDownload";
 import type { SettingsSectionRequest } from "../settingsSection";
 import { ModelSection } from "./ModelSection";
 import "./DevocalSettings.css";
@@ -28,18 +31,45 @@ function MirrorPrefixField() {
   </details>;
 }
 
+// Compute device: a saved preference sent with the next enable. The line below shows what the
+// engine reported for the device actually in use (nothing while it is not running).
+function DeviceSection({ status, onError, onChanged }: { status: DevocalStatus; onError(text: string): void; onChanged(): void }) {
+  const selection = useDevocalModelPreference();
+  const choose = (device: string) => {
+    try { setDevocalModelPreference({ ...selection, device: device as DevocalDevice }); onError(""); onChanged(); }
+    catch { onError("未能保存计算设备选择，请重试"); }
+  };
+  return <div className="model-device">
+    <h3 id="devocal-device-title">计算设备</h3>
+    <RadioGroup.Root className="model-device-options" orientation="horizontal" aria-labelledby="devocal-device-title"
+      value={selection.device} onValueChange={choose}>
+      <RadioGroup.Item value="auto">自动</RadioGroup.Item>
+      <RadioGroup.Item value="cpu">CPU</RadioGroup.Item>
+      <RadioGroup.Item value="gpu">GPU</RadioGroup.Item>
+    </RadioGroup.Root>
+    <p className="model-row-note devocal-device-status" aria-live="polite">{deviceLine(status, selection.modelId, selection.device)}</p>
+  </div>;
+}
+
 // `request` says how settings were last opened. From the main window's missing-model hint
 // ("devocal-model") it scrolls here, focuses the model row and makes the row's downloads and
 // imports (retries and resumes included) turn de-vocal on once the model is installed; that holds
 // until the model is installed or the user cancels a download. A plain open of the already open
 // window (section null) drops it, without scrolling or focusing.
 export function DevocalSettings({ request = null }: { request?: SettingsSectionRequest | null }) {
-  const { status, release } = useDevocal();
+  const { status, release, apply } = useDevocal();
   const [error, setError] = useState("");
   const section = useRef<HTMLElement>(null);
   const [autoEnablePending, setAutoEnablePending] = useState(false);
   const [focusSeq, setFocusSeq] = useState(0);
   const consumeAutoEnable = useCallback(() => setAutoEnablePending(false), []);
+  const { statuses, send } = useModelDownload();
+  // A selection whose model is not installed is not sent (the backend has nothing to load); the
+  // model row applies it once the model is installed.
+  const applyChange = () => {
+    if (statuses?.find(s => s.id === readDevocalModelPreference().modelId)?.phase !== "installed") return;
+    apply().catch(() => setError("未能切换去人声模型或设备，请重试"));
+  };
   const seq = request?.seq ?? 0;
   const fromHint = request?.section === "devocal-model";
   useEffect(() => {
@@ -55,7 +85,8 @@ export function DevocalSettings({ request = null }: { request?: SettingsSectionR
       <div><h2 id="devocal-settings-title">去人声</h2>
         <p>开启去人声后，本应用会接管当前播放器的声音输出。音量合成器里播放器那一栏接近 0 是正常的，声音由本应用发出；要调音量请调本应用。点‘释放播放器’可立即交还。</p></div>
     </div>
-    <ModelSection autoEnablePending={autoEnablePending} onAutoEnableConsumed={consumeAutoEnable} focusSeq={focusSeq} />
+    <ModelSection statuses={statuses} send={send} onSelectionChanged={applyChange} autoEnablePending={autoEnablePending} onAutoEnableConsumed={consumeAutoEnable} focusSeq={focusSeq} />
+    <DeviceSection status={status} onError={setError} onChanged={applyChange} />
     <div className="devocal-settings-actions">
       <Button variant="soft" color="gray" disabled={!status.held}
         onClick={() => { setError(""); release().catch(() => setError("未能释放播放器，请重试")); }}>释放播放器</Button>

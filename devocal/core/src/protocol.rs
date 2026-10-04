@@ -28,11 +28,45 @@ pub enum Command {
     SetModel {
         id: String,
         path: PathBuf,
+        /// `auto`, `cpu` or `gpu` (the engine decides the actual device, spec 4.4).
         device: String,
         threads: u16,
+        /// Present for window models (bytesep, HTDemucs); absent for StemgenRT.
+        #[serde(default)]
+        windowed: Option<WindowedSpec>,
     },
     Release,
     Shutdown,
+}
+
+/// Window-model geometry from the app's manifest (milliseconds at 44.1 kHz). A `None` hop
+/// means the model has no path on that device (HTDemucs has no CPU hop).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowedSpec {
+    pub window_ms: u32,
+    pub lookahead_ms: u32,
+    pub gpu_hop_ms: Option<u32>,
+    pub cpu_hop_ms: Option<u32>,
+    pub cpu_threads: u16,
+    pub vocals_index: u32,
+}
+
+/// The device the loaded model actually runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Device {
+    Cpu,
+    Gpu,
+}
+
+/// Why the engine is not on the GPU although it would have preferred it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceNote {
+    GpuUnavailable,
+    GpuCheckFailed,
+    GpuOverloaded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +103,7 @@ pub enum ErrorCode {
     ModelLoadFailed,
     NoModel,
     BadDevice,
+    GpuRequired,
 }
 
 /// NaN/infinity would serialise as `null` and fail to decode; send 0.0 instead.
@@ -91,6 +126,22 @@ pub struct Metrics {
     pub attenuation_epoch: u64,
     pub session_overridden: u64,
     pub input_silent_ms: u64,
+    /// The device of the loaded model (`None` while no model is loaded).
+    #[serde(default)]
+    pub device: Option<Device>,
+    #[serde(default)]
+    pub device_note: Option<DeviceNote>,
+    /// Window models: segments played dry (late or failed inference) since the model was
+    /// loaded. `None` for a streaming model or no model.
+    #[serde(default)]
+    pub window_timeouts: Option<u64>,
+    /// Window models: mean inference time / hop over the last 10 s of windows.
+    #[serde(default)]
+    pub window_duty: Option<f32>,
+    /// The id of the loaded model (a failed switch leaves the previous one); `None` while no
+    /// model is loaded.
+    #[serde(default)]
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -234,11 +285,20 @@ mod tests {
             attenuation_epoch: 7,
             session_overridden: 2,
             input_silent_ms: 900,
+            device: Some(Device::Gpu),
+            device_note: Some(DeviceNote::GpuUnavailable),
+            window_timeouts: Some(4),
+            window_duty: Some(0.25),
+            model_id: Some("bytesep-mobilenet-1s".into()),
         });
         let line = encode(&ev).unwrap();
         assert!(line.contains("\"event\":\"metrics\""));
         assert!(line.contains("\"latencyMs\":12.5"));
         assert!(line.contains("\"inputSilentMs\":900"));
+        assert!(line.contains("\"device\":\"gpu\""));
+        assert!(line.contains("\"deviceNote\":\"gpu_unavailable\""));
+        assert!(line.contains("\"windowTimeouts\":4,\"windowDuty\":0.25"));
+        assert!(line.contains("\"modelId\":\"bytesep-mobilenet-1s\""));
         assert_eq!(decode_event(&line).unwrap(), ev);
     }
 
@@ -252,6 +312,7 @@ mod tests {
             path,
             device: "cpu".into(),
             threads: 1,
+            windowed: None,
         };
         assert!(matches!(encode(&cmd), Err(ProtocolError::Encode(_))));
     }
@@ -268,6 +329,11 @@ mod tests {
             attenuation_epoch: 2,
             session_overridden: 3,
             input_silent_ms: 4,
+            device: None,
+            device_note: None,
+            window_timeouts: None,
+            window_duty: None,
+            model_id: None,
         });
         let line = encode(&ev).unwrap();
         match decode_event(&line).unwrap() {
@@ -279,5 +345,59 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_model_with_windowed_spec_round_trips() {
+        let cmd = Command::SetModel {
+            id: "bytesep".into(),
+            path: PathBuf::from("m.onnx"),
+            device: "gpu".into(),
+            threads: 2,
+            windowed: Some(WindowedSpec {
+                window_ms: 1000,
+                lookahead_ms: 100,
+                gpu_hop_ms: Some(300),
+                cpu_hop_ms: None,
+                cpu_threads: 4,
+                vocals_index: 3,
+            }),
+        };
+        let line = encode(&cmd).unwrap();
+        assert!(line.contains("\"windowed\":{\"windowMs\":1000,\"lookaheadMs\":100"));
+        assert!(line.contains("\"gpuHopMs\":300,\"cpuHopMs\":null"));
+        assert_eq!(decode_command(&line).unwrap(), cmd);
+    }
+
+    #[test]
+    fn old_messages_without_the_new_fields_still_decode() {
+        let cmd = decode_command(
+            r#"{"protocol":1,"cmd":"set_model","id":"m","path":"m.onnx","device":"cpu","threads":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(cmd, Command::SetModel { windowed: None, .. }));
+        let ev = decode_event(
+            r#"{"protocol":1,"event":"metrics","mode":null,"latencyMs":1.0,"loadRatio":0.0,"underruns":0,"fallbackReason":null,"attenuation":0.0,"attenuationEpoch":0,"sessionOverridden":0,"inputSilentMs":0}"#,
+        )
+        .unwrap();
+        match ev {
+            Event::Metrics(m) => {
+                assert_eq!((m.device, m.device_note), (None, None));
+                assert_eq!((m.window_timeouts, m.window_duty), (None, None));
+                assert_eq!(m.model_id, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpu_required_error_round_trips() {
+        let ev = Event::Error {
+            code: ErrorCode::GpuRequired,
+            message: "x".into(),
+        };
+        let line = encode(&ev).unwrap();
+        assert!(line.contains("\"code\":\"gpu_required\""));
+        assert_eq!(decode_event(&line).unwrap(), ev);
     }
 }

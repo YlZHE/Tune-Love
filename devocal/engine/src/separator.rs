@@ -9,12 +9,27 @@ pub trait Separator: Send {
     fn sample_rate(&self) -> u32;
     fn hop(&self) -> usize;
     fn latency_frames(&self) -> usize;
+    /// Latency of the pass-through (devocal off) path paired with this separator. Defaults to
+    /// `latency_frames()`; window separators keep pass-through at one block.
+    fn passthrough_latency_frames(&self) -> usize {
+        self.latency_frames()
+    }
     /// `input` and `out_accompaniment` must both be `hop() * 2` samples long. Errors (bad
     /// length, inference failure) are reported as `Err`, never as a panic; the contents of
     /// `out_accompaniment` are unspecified after an error.
     fn process(&mut self, input: &[f32], out_accompaniment: &mut [f32]) -> Result<(), String>;
     /// Clears all streaming state, as if freshly loaded.
     fn reset(&mut self);
+    /// The model itself cannot keep up (window models: spec 4.1 timeouts / duty). Must be a
+    /// cheap, lock-free read: polled on the processing thread after every model block.
+    fn overloaded(&self) -> bool {
+        false
+    }
+    /// Window models: (segments played dry since load, 10 s duty). Cheap and lock-free like
+    /// `overloaded`; `None` for streaming models.
+    fn window_stats(&self) -> Option<(u64, f32)> {
+        None
+    }
 }
 
 /// Block size used by `DelayOnly`; matches StemgenRT.

@@ -139,7 +139,7 @@ fn new_fetcher<F>(build: impl FnOnce() -> Result<F, String>) -> Result<Arc<F>, M
 fn enable_devocal(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(e) = app.state::<super::DevocalState>().command("enable") {
+        if let Err(e) = app.state::<super::DevocalState>().auto_enable() {
             eprintln!("models: auto-enable de-vocal failed: {e}");
         }
     });
@@ -156,7 +156,7 @@ fn on_installed(app: &AppHandle, req: &ModelRequest) -> Box<dyn FnOnce() + Send>
             let devocal = app.state::<super::DevocalState>();
             devocal.model_installed();
             if enable {
-                if let Err(e) = devocal.command("enable") {
+                if let Err(e) = devocal.auto_enable() {
                     eprintln!("models: auto-enable de-vocal failed: {e}");
                 }
             }

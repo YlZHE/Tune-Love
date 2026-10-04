@@ -7,11 +7,14 @@ mod audio;
 #[allow(dead_code)]
 mod dsp;
 mod engine;
+mod gpu_check;
 #[allow(dead_code)]
 mod holder;
 #[allow(dead_code)]
 mod load;
 mod notify;
+#[allow(dead_code)]
+mod ort_window;
 mod pipe;
 #[allow(dead_code)]
 mod processor;
@@ -20,6 +23,8 @@ mod separator;
 mod state;
 #[allow(dead_code)]
 mod stemgen;
+#[allow(dead_code)]
+mod windowed;
 
 fn main() {
     let args = match engine::parse_args(std::env::args().skip(1)) {

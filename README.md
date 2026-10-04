@@ -58,3 +58,5 @@ npm run tauri dev
 ## 许可
 
 代码用 GPL-3.0，见 [LICENSE](LICENSE)。这个项目只做免费、非商业用途。用到的第三方东西各有各的许可，其中 Rare UI 和 React Bits 带有 Commons Clause 限制，具体看 `licenses/` 目录。
+
+可选的去人声模型 bytesep（字节跳动，Kong 等人，权重 CC BY 4.0，[Zenodo 5804160](https://doi.org/10.5281/zenodo.5804160)、[5513378](https://doi.org/10.5281/zenodo.5513378)）和 HTDemucs（Meta Demucs，MIT；训练数据来源不明，仅限非商业使用）已由本项目转换修改（转成 ONNX 并改写计算图，权重数值未改），许可全文见 `licenses/bytesep.txt`、`licenses/htdemucs.txt`。

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   MODEL_MANIFEST, STEMGENRT_ID, approxSize, consentKey, formatMiB, hasModelConsent, isValidMirrorPrefix,
-  modelErrorText, modelTotalBytes, parseModelStatuses, pinnedCommit, progressPercent, progressText,
+  modelErrorText, modelTotalBytes, parseManifest, parseModelStatuses, pinnedCommit, progressPercent, progressText,
   readMirrorPrefix, rememberModelConsent, saveMirrorPrefix, sourceErrorHint, sourceLabel, type ModelStatus,
 } from "./modelDownload";
 
@@ -28,6 +28,66 @@ describe("manifest", () => {
     expect(STEMGENRT_ID).toBe("stemgenrt-hop128");
     expect(MODEL_MANIFEST.models[0].id).toBe(STEMGENRT_ID);
     expect(modelTotalBytes(MODEL_MANIFEST.models[0])).toBe(37529132);
+  });
+
+  it("lists the three models with their devices", () => {
+    const byId = Object.fromEntries(MODEL_MANIFEST.models.map(m => [m.id, m]));
+    expect(Object.keys(byId)).toEqual([STEMGENRT_ID, "bytesep-mobilenet-1s", "htdemucs-ft-vocals-1s"]);
+    expect(byId[STEMGENRT_ID].kind).toBe("streaming");
+    expect(byId[STEMGENRT_ID].devices.cpu).toEqual({ windowMs: 0, hopMs: 0, lookaheadMs: 0, threads: 1, latencyMs: 5.8 });
+    expect(byId[STEMGENRT_ID].devices.gpu).toBeNull();
+    const b = byId["bytesep-mobilenet-1s"];
+    expect(b.kind).toBe("windowed");
+    expect(b.vocalsIndex).toBe(0);
+    expect(b.devices.gpu?.latencyMs).toBe(230);
+    expect(b.devices.cpu).toEqual({ windowMs: 1000, hopMs: 200, lookaheadMs: 100, threads: 2, latencyMs: 360 });
+    const h = byId["htdemucs-ft-vocals-1s"];
+    expect(h.vocalsIndex).toBe(3);
+    expect(h.devices.cpu).toBeNull();
+    expect(h.devices.gpu?.latencyMs).toBe(230);
+    expect(modelTotalBytes(h)).toBe(304759764);
+    expect(b.license.converted && h.license.converted).toBe(true);
+    expect(h.license.trainingData.join()).toContain("仅限非商业使用");
+    expect(h.license.weights).toBe("MIT（Demucs 官方发布；训练数据来源不明，仅限非商业使用）");
+    expect(b.license.credit).toContain("Kong 等人");
+    expect(b.license.credit).toContain("zenodo.org/records/5513378");
+    expect(h.license.credit).toContain("StemSplit demucs-onnx");
+  });
+});
+
+describe("parseManifest", () => {
+  const raw = () => JSON.parse(JSON.stringify(MODEL_MANIFEST));
+  it("reads the bundled manifest, devices included", () => {
+    const m = parseManifest(raw());
+    expect(m?.models).toHaveLength(3);
+    expect(m?.models[1].devices.cpu?.hopMs).toBe(200);
+  });
+  it("treats a missing device side as null", () => {
+    const v = raw();
+    delete v.models[0].devices.gpu;
+    expect(parseManifest(v)?.models[0].devices.gpu).toBeNull();
+  });
+  it("rejects an entry without devices, or with none usable", () => {
+    for (const edit of [
+      (v: any) => { delete v.models[1].devices; },
+      (v: any) => { v.models[1].devices = { cpu: null, gpu: null }; },
+      (v: any) => { v.models[0].devices.cpu.threads = 0; },
+      (v: any) => { v.models[1].devices.gpu.latencyMs = 100; },
+      (v: any) => { v.models[0].kind = "batch"; },
+      (v: any) => { delete v.models[0].kind; },
+      (v: any) => { v.models[2].vocalsIndex = 4; },
+      (v: any) => { v.models[2].vocalsIndex = -1; },
+      (v: any) => { v.models[2].vocalsIndex = 1.5; },
+      (v: any) => { v.models[2].vocalsIndex = "3"; },
+      (v: any) => { delete v.models[2].vocalsIndex; },
+      (v: any) => { v.models[0].vocalsIndex = 1; },
+    ]) {
+      const v = raw();
+      edit(v);
+      expect(parseManifest(v)).toBeNull();
+    }
+    expect(parseManifest(null)).toBeNull();
+    expect(parseManifest({ version: 1, mirrors: [], models: "x" })).toBeNull();
   });
 });
 

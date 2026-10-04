@@ -230,6 +230,35 @@ test("consent dialog lists source, commit, size, sha256, licence, training data,
   expect(await requests(page)).toEqual([]);
 });
 
+test("consent dialog for the quality models states the modification and the HTDemucs non-commercial limit", async ({ page }) => {
+  const missing = (id: string, totalBytes: number) => ({ ...MISSING, id, totalBytes });
+  await prepare(page, "/?view=settings", { consent: false, models: [
+    MISSING, missing("bytesep-mobilenet-1s", 9_600_617), missing("htdemucs-ft-vocals-1s", 304_759_764),
+  ] });
+  const dialog = page.getByRole("alertdialog");
+
+  await page.getByRole("group", { name: "bytesep MobileNet（高质量）" }).getByRole("button", { name: /^下载模型/ }).click();
+  await expect(dialog).toContainText("https://zenodo.org/records/5804160");
+  await expect(dialog).toContainText("Apache-2.0");
+  await expect(dialog).toContainText("CC BY 4.0");
+  await expect(dialog).toContainText("已由本项目转换修改");
+  await expect(dialog).toContainText("Kong 等人");
+  await expect(dialog).toContainText("https://zenodo.org/records/5513378");
+  await expect(dialog).toContainText("d70b6ba65e9627b6bc0f3e02efb6d678030d44af74b9de1ed0c7bc60a80d4885");
+  await expect(dialog).not.toContainText("仅限非商业使用");
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+
+  await page.getByRole("group", { name: "HTDemucs（高质量）" }).getByRole("button", { name: /^下载模型/ }).click();
+  await expect(dialog).toContainText("https://github.com/facebookresearch/demucs");
+  await expect(dialog).toContainText("模型权重采用 MIT（Demucs 官方发布；训练数据来源不明，仅限非商业使用）。");
+  await expect(dialog).toContainText("已由本项目转换修改");
+  await expect(dialog).toContainText("StemSplit demucs-onnx");
+  await expect(dialog).toContainText("训练数据来源不明，仅限非商业使用");
+  await expect(dialog).toContainText("fb173f3fdffd43d298c5ab26a9945a6c17845b9b81cce99df5ebcc8022dd5ab4");
+  expect(await requests(page)).toEqual([]);
+});
+
 test("accepting consent remembers it and sends the request", async ({ page }) => {
   const row = await prepare(page, "/?view=settings", { consent: false });
   await row.getByRole("button", { name: DOWNLOAD, exact: true }).click();
@@ -335,7 +364,7 @@ const emitEvent = (page: Page, event: string, payload: unknown) => page.evaluate
 const AUTO_ENABLE_NOTE = "下载完成后将自动开启去人声";
 
 test("main: the missing-model warning opens settings at the model row", async ({ page }) => {
-  await prepare(page, "/", { devocal: { phase: "unavailable", error: "model_not_found" } });
+  await prepare(page, "/", { devocal: { phase: "unavailable", error: "model_not_found:stemgenrt-hop128" } });
   const warning = page.locator(".devocal-warning[aria-live=polite]");
   const button = warning.getByRole("button", { name: "未找到去人声模型，请在设置中下载", exact: true });
   // Visible without hovering the window, and still the only announced text.

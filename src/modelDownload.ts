@@ -5,19 +5,60 @@ import manifestJson from "../src-tauri/models.json";
 // (download consent and the user's acceleration prefix).
 
 export interface ModelFile { file: string; bytes: number; sha256: string; origin: string; mirrorable: boolean }
+export type ModelKind = "streaming" | "windowed";
+// Mirrors DeviceParams in manifest.rs; windowed latency = hop + lookahead + 0.3 * hop.
+export interface DeviceParams { windowMs: number; hopMs: number; lookaheadMs: number; threads: number; latencyMs: number }
 export interface ModelInfo {
   id: string;
   name: string;
   tier: "realtime" | "quality";
+  kind: ModelKind;
   files: ModelFile[];
   sampleRate: number;
-  latencyMs: number;
-  runtime: "cpu" | "cuda";
-  license: { code: string; weights: string; trainingData: string[] };
+  // Streaming models ignore it (0).
+  vocalsIndex: number;
+  // A null side: the model does not run on that device.
+  devices: { cpu: DeviceParams | null; gpu: DeviceParams | null };
+  // converted: the weights were converted and modified by this project.
+  license: { code: string; weights: string; trainingData: string[]; converted?: boolean; credit?: string };
   source: string;
 }
+export interface Manifest { version: number; mirrors: string[]; models: ModelInfo[] }
 
-export const MODEL_MANIFEST = manifestJson as unknown as { version: number; mirrors: string[]; models: ModelInfo[] };
+const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+const isCount = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+
+// The same device rules as validate_devices in manifest.rs. Null when the side is absent or malformed.
+function parseDevice(v: unknown, kind: ModelKind): DeviceParams | null | undefined {
+  if (v === undefined || v === null) return null;
+  if (!isRecord(v)) return undefined;
+  const { windowMs, hopMs, lookaheadMs, threads, latencyMs } = v;
+  if (!isCount(windowMs) || !isCount(hopMs) || !isCount(lookaheadMs) || !isCount(threads) || threads < 1) return undefined;
+  if (typeof latencyMs !== "number" || !Number.isFinite(latencyMs) || latencyMs < 0) return undefined;
+  if (kind === "streaming" ? windowMs + hopMs + lookaheadMs !== 0
+    : windowMs === 0 || hopMs === 0 || hopMs > windowMs || Math.abs(latencyMs - (hopMs * 1.3 + lookaheadMs)) > 1e-6) return undefined;
+  return { windowMs, hopMs, lookaheadMs, threads, latencyMs };
+}
+
+// Reads the bundled JSON; null if any entry lacks a valid kind or devices (the Rust side
+// rejects the same manifests).
+export function parseManifest(value: unknown): Manifest | null {
+  if (!isRecord(value) || !Array.isArray(value.mirrors) || !Array.isArray(value.models)) return null;
+  const models: ModelInfo[] = [];
+  for (const m of value.models) {
+    if (!isRecord(m) || (m.kind !== "streaming" && m.kind !== "windowed") || !isRecord(m.devices)) return null;
+    const cpu = parseDevice(m.devices.cpu, m.kind);
+    const gpu = parseDevice(m.devices.gpu, m.kind);
+    // One of the four stems; streaming models ignore it (0). Same rule as validate_devices.
+    const maxIndex = m.kind === "streaming" ? 0 : 3;
+    if (!isCount(m.vocalsIndex) || m.vocalsIndex > maxIndex) return null;
+    if (cpu === undefined || gpu === undefined || (!cpu && !gpu)) return null;
+    models.push({ ...(m as unknown as ModelInfo), devices: { cpu, gpu } });
+  }
+  return { version: Number(value.version), mirrors: value.mirrors as string[], models };
+}
+
+export const MODEL_MANIFEST = parseManifest(manifestJson) ?? (() => { throw new Error("bundled models.json is invalid"); })();
 export const STEMGENRT_ID = "stemgenrt-hop128";
 
 export type ModelPhase = "missing" | "downloading" | "verifying" | "installed" | "failed";

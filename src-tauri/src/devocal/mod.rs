@@ -27,7 +27,8 @@ use serde::Deserialize;
 use crate::media::{AudioTarget, MediaState};
 use gate::AttenuationGate;
 use link::ProcessLink;
-use supervisor::{DevocalStatus, PlayerProcess, Supervisor};
+use model::manifest::STEMGENRT_ID;
+use supervisor::{DevocalStatus, PlayerProcess, Selection, Supervisor};
 
 /// Env override for the StemgenRT ONNX file.
 pub const MODEL_ENV: &str = "TUNE_LOVE_STEMGENRT_ONNX";
@@ -39,14 +40,15 @@ const RESOLVE_RETRY_MS: u64 = 2_000;
 /// How long app exit waits for the supervisor thread to shut the engine down.
 const SHUTDOWN_JOIN: Duration = Duration::from_secs(3);
 
-/// The model file: env `TUNE_LOVE_STEMGENRT_ONNX` (an existing file, used as is), then the
-/// verified `<data>/models/stemgenrt-hop128/<file>`. May hash the file (cached), so keep it off
-/// hot paths.
-pub fn model_path(data_dir: &Path) -> Option<PathBuf> {
+/// The file of model `id`: for StemgenRT only, env `TUNE_LOVE_STEMGENRT_ONNX` (an existing
+/// file, used as is); then the verified `<data>/models/<id>/<file>`. `None` if the manifest has
+/// no such model or it is not installed. May hash the file (cached), so keep it off hot paths.
+pub fn model_path(data_dir: &Path, id: &str) -> Option<PathBuf> {
     model_path_from(
         std::env::var_os(MODEL_ENV),
         data_dir,
         model::manifest::bundled(),
+        id,
     )
 }
 
@@ -55,17 +57,39 @@ pub fn model_path_from(
     env: Option<OsString>,
     data_dir: &Path,
     manifest: &model::manifest::Manifest,
+    id: &str,
 ) -> Option<PathBuf> {
     let from_env = env.filter(|v| !v.is_empty()).map(PathBuf::from);
-    if let Some(path) = from_env.filter(|p| p.is_file()) {
+    if let Some(path) = from_env.filter(|p| id == STEMGENRT_ID && p.is_file()) {
         return Some(path);
     }
-    model::verify::installed_files(
-        manifest,
-        &data_dir.join("models"),
-        model::manifest::STEMGENRT_ID,
-    )
-    .and_then(|files| files.into_iter().next())
+    model::verify::installed_files(manifest, &data_dir.join("models"), id)
+        .and_then(|files| files.into_iter().next())
+}
+
+/// A model the manifest lists and a device the engine knows; anything else is refused here
+/// instead of being stored or forwarded.
+fn validate_selection(sel: &Selection) -> Result<(), String> {
+    if model::manifest::bundled().model(&sel.model_id).is_none() {
+        return Err(format!("unknown_model:{}", sel.model_id));
+    }
+    if !matches!(sel.device.as_str(), "auto" | "cpu" | "gpu") {
+        return Err(format!("unknown_device:{}", sel.device));
+    }
+    Ok(())
+}
+
+/// The selection an `enable` applies: each field the request leaves out keeps its previous
+/// value, so a frontend that does not send them keeps working.
+fn merge_selection(
+    prev: &Selection,
+    model_id: Option<String>,
+    device: Option<String>,
+) -> Selection {
+    Selection {
+        model_id: model_id.unwrap_or_else(|| prev.model_id.clone()),
+        device: device.unwrap_or_else(|| prev.device.clone()),
+    }
 }
 
 pub fn restore_file(data_dir: &Path) -> PathBuf {
@@ -121,13 +145,20 @@ pub fn restore_at_startup(path: &Path) {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DevocalRequest {
     /// enable | disable | release
     pub action: String,
+    /// `enable` only: a manifest model id; absent keeps the last one.
+    pub model_id: Option<String>,
+    /// `enable` only: auto | cpu | gpu; absent keeps the last one.
+    pub device: Option<String>,
 }
 
 struct Shared {
     supervisor: Mutex<Option<Supervisor<ProcessLink>>>,
+    /// The last selection an `enable` carried (the base for a request that omits fields).
+    selection: Mutex<Selection>,
     status: Mutex<DevocalStatus>,
     data_dir: Mutex<Option<PathBuf>>,
     stop: Mutex<Option<Sender<()>>>,
@@ -152,6 +183,7 @@ impl DevocalState {
             gate,
             shared: Arc::new(Shared {
                 supervisor: Mutex::new(None),
+                selection: Mutex::new(Selection::default()),
                 status: Mutex::new(DevocalStatus::off()),
                 data_dir: Mutex::new(None),
                 stop: Mutex::new(None),
@@ -194,12 +226,29 @@ impl DevocalState {
         lock(&self.shared.status).clone()
     }
 
-    pub fn command(&self, action: &str) -> Result<DevocalStatus, String> {
+    /// `model_id` and `device` only matter for `enable`; a missing one keeps the last selection.
+    pub fn command(
+        &self,
+        action: &str,
+        model_id: Option<String>,
+        device: Option<String>,
+    ) -> Result<DevocalStatus, String> {
         let data_dir = lock(&self.shared.data_dir).clone();
+        let selection = if action == "enable" {
+            let mut last = lock(&self.shared.selection);
+            let next = merge_selection(&last, model_id, device);
+            validate_selection(&next)?; // a bad request must not become the standing selection
+            *last = next.clone();
+            next
+        } else {
+            Selection::default() // unused by the other actions
+        };
         // Worked out before taking the supervisor lock: the first check hashes the model file.
         let (model, mut slot) = if action == "enable" {
             resolve_then_lock(&self.shared.installs, &self.shared.supervisor, || {
-                data_dir.as_deref().and_then(model_path)
+                data_dir
+                    .as_deref()
+                    .and_then(|dir| model_path(dir, &selection.model_id))
             })
         } else {
             (None, lock(&self.shared.supervisor))
@@ -207,10 +256,20 @@ impl DevocalState {
         let Some(sup) = slot.as_mut() else {
             return Err("devocal is not started yet".into());
         };
-        apply(sup, action, model)?;
+        apply(sup, action, model, selection)?;
         let status = sup.status();
         *lock(&self.shared.status) = status.clone();
         Ok(status)
+    }
+
+    /// Enable after a model download finished, as the user asked when starting it. Only while
+    /// StemgenRT is the selected model (the default, which the main window offers to download);
+    /// any other selection is left alone and nothing is enabled. `Ok(None)` when skipped.
+    pub fn auto_enable(&self) -> Result<Option<DevocalStatus>, String> {
+        if lock(&self.shared.selection).model_id != STEMGENRT_ID {
+            return Ok(None);
+        }
+        self.command("enable", None, None).map(Some)
     }
 
     /// A model install finished (any install, whether or not it auto-enables): clears an
@@ -266,9 +325,10 @@ fn apply<L: link::EngineLink>(
     sup: &mut Supervisor<L>,
     action: &str,
     model: Option<PathBuf>,
+    selection: Selection,
 ) -> Result<(), String> {
     match action {
-        "enable" => sup.enable(model),
+        "enable" => sup.enable(model, selection),
         "disable" => sup.disable(),
         "release" => sup.release(),
         other => return Err(format!("unknown devocal action {other:?}")),
@@ -304,7 +364,12 @@ fn build_supervisor(
         }
     });
     let pending = Box::new(move || restore_path.as_deref().is_some_and(Path::exists));
-    Supervisor::new(spawn, run_restore, gate).with_restore_pending(pending)
+    let models_dir = data_dir;
+    Supervisor::new(spawn, run_restore, gate)
+        .with_restore_pending(pending)
+        .with_model_paths(Box::new(move |id| {
+            models_dir.as_deref().and_then(|dir| model_path(dir, id))
+        }))
 }
 
 fn worker(shared: &Shared, media: &MediaState, stop: &Receiver<()>, done: &Sender<()>) {
@@ -400,9 +465,11 @@ pub async fn devocal_command(
 ) -> Result<DevocalStatus, String> {
     // Off the main thread: the supervisor may be busy starting the engine.
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || state.command(&request.action))
-        .await
-        .map_err(|e| format!("devocal command failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        state.command(&request.action, request.model_id, request.device)
+    })
+    .await
+    .map_err(|e| format!("devocal command failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -432,11 +499,11 @@ pub(crate) mod tests {
         use crate::devocal::model::verify::tests::fake_manifest;
         let manifest = fake_manifest(b"good model bytes");
         let dir = temp_dir("model-path");
-        assert_eq!(model_path_from(None, &dir, &manifest), None);
+        assert_eq!(model_path_from(None, &dir, &manifest, STEMGENRT_ID), None);
         let env_file = dir.join("custom.onnx");
         // A set but missing env path falls through to the data dir.
         assert_eq!(
-            model_path_from(Some(env_file.clone().into()), &dir, &manifest),
+            model_path_from(Some(env_file.clone().into()), &dir, &manifest, STEMGENRT_ID),
             None
         );
         let data_file = dir
@@ -446,26 +513,86 @@ pub(crate) mod tests {
         std::fs::create_dir_all(data_file.parent().unwrap()).unwrap();
         // Wrong content does not verify.
         std::fs::write(&data_file, b"x").unwrap();
-        assert_eq!(model_path_from(None, &dir, &manifest), None);
+        assert_eq!(model_path_from(None, &dir, &manifest, STEMGENRT_ID), None);
         std::fs::write(&data_file, b"good model bytes").unwrap();
         assert_eq!(
-            model_path_from(None, &dir, &manifest),
+            model_path_from(None, &dir, &manifest, STEMGENRT_ID),
             Some(data_file.clone())
         );
         assert_eq!(
-            model_path_from(Some(env_file.clone().into()), &dir, &manifest),
+            model_path_from(Some(env_file.clone().into()), &dir, &manifest, STEMGENRT_ID),
             Some(data_file.clone())
         );
         // An existing env file wins and is not verified.
         std::fs::write(&env_file, b"x").unwrap();
         assert_eq!(
-            model_path_from(Some(env_file.clone().into()), &dir, &manifest),
+            model_path_from(Some(env_file.clone().into()), &dir, &manifest, STEMGENRT_ID),
             Some(env_file)
         );
         // An empty env value is ignored.
         assert_eq!(
-            model_path_from(Some(OsString::new()), &dir, &manifest),
+            model_path_from(Some(OsString::new()), &dir, &manifest, STEMGENRT_ID),
             Some(data_file)
+        );
+    }
+
+    #[test]
+    fn env_override_applies_to_stemgenrt_only() {
+        let manifest = model::manifest::bundled();
+        let dir = temp_dir("model-path-env");
+        let env_file = dir.join("custom.onnx");
+        std::fs::write(&env_file, b"x").unwrap();
+        assert_eq!(
+            model_path_from(Some(env_file.clone().into()), &dir, manifest, STEMGENRT_ID),
+            Some(env_file.clone())
+        );
+        assert_eq!(
+            model_path_from(
+                Some(env_file.clone().into()),
+                &dir,
+                manifest,
+                "bytesep-mobilenet-1s"
+            ),
+            None
+        );
+        assert_eq!(
+            model_path_from(Some(env_file.into()), &dir, manifest, "no-such-model"),
+            None
+        );
+    }
+
+    #[test]
+    fn request_without_model_id_keeps_previous_selection() {
+        let prev = Selection {
+            model_id: "bytesep-mobilenet-1s".into(),
+            device: "gpu".into(),
+        };
+        // An old frontend sends neither field.
+        assert_eq!(merge_selection(&prev, None, None), prev);
+        // Each field is taken on its own.
+        let only_device = merge_selection(&prev, None, Some("cpu".into()));
+        assert_eq!(
+            (only_device.model_id.as_str(), only_device.device.as_str()),
+            ("bytesep-mobilenet-1s", "cpu")
+        );
+        let only_model = merge_selection(&prev, Some("htdemucs-ft-vocals-1s".into()), None);
+        assert_eq!(
+            (only_model.model_id.as_str(), only_model.device.as_str()),
+            ("htdemucs-ft-vocals-1s", "gpu")
+        );
+        assert_eq!(Selection::default().model_id, STEMGENRT_ID);
+        assert_eq!(Selection::default().device, "auto");
+    }
+
+    #[test]
+    fn request_fields_are_camel_case_and_optional() {
+        let r: DevocalRequest = serde_json::from_str(r#"{"action":"enable"}"#).unwrap();
+        assert_eq!((r.model_id, r.device), (None, None));
+        let r: DevocalRequest =
+            serde_json::from_str(r#"{"action":"enable","modelId":"m","device":"gpu"}"#).unwrap();
+        assert_eq!(
+            (r.model_id.as_deref(), r.device.as_deref()),
+            (Some("m"), Some("gpu"))
         );
     }
 
@@ -541,12 +668,12 @@ pub(crate) mod tests {
     fn actions_map_to_supervisor_calls() {
         let dir = temp_dir("actions");
         let (mut sup, engines) = fake_supervisor();
-        apply(&mut sup, "enable", None).unwrap();
+        apply(&mut sup, "enable", None, Selection::default()).unwrap();
         assert_eq!(sup.status().phase, "unavailable", "no verified model");
-        assert!(apply(&mut sup, "explode", None).is_err());
+        assert!(apply(&mut sup, "explode", None, Selection::default()).is_err());
 
         let model = dir.join("model.onnx");
-        apply(&mut sup, "enable", Some(model)).unwrap();
+        apply(&mut sup, "enable", Some(model), Selection::default()).unwrap();
         let player = PlayerProcess {
             source_id: "folia".into(),
             pid: 7,
@@ -556,8 +683,8 @@ pub(crate) mod tests {
         let engine = engines.lock().unwrap()[0].clone();
         assert_eq!(engine.sent().len(), 4);
         engine.clear_sent();
-        apply(&mut sup, "disable", None).unwrap();
-        apply(&mut sup, "release", None).unwrap();
+        apply(&mut sup, "disable", None, Selection::default()).unwrap();
+        apply(&mut sup, "release", None, Selection::default()).unwrap();
         assert_eq!(
             engine.sent(),
             vec![Command::SetMode { devocal: false }, Command::Release]
@@ -568,10 +695,72 @@ pub(crate) mod tests {
     fn state_without_a_started_supervisor_reports_off_and_rejects_commands() {
         let state = DevocalState::new(Arc::new(AttenuationGate::new()));
         assert_eq!(state.status(), DevocalStatus::off());
-        assert!(state.command("enable").is_err());
+        assert!(state.command("enable", None, None).is_err());
         state.model_installed(); // no supervisor: nothing to clear
         assert_eq!(state.status(), DevocalStatus::off());
         state.shutdown(); // no thread: returns at once
+    }
+
+    #[test]
+    fn enable_rejects_an_unknown_model_or_device_before_changing_the_selection() {
+        let state = DevocalState::new(Arc::new(AttenuationGate::new()));
+        let good = Selection {
+            model_id: "bytesep-mobilenet-1s".into(),
+            device: "gpu".into(),
+        };
+        *lock(&state.shared.selection) = good.clone();
+        for (model, device) in [
+            (Some("no-such-model"), None),
+            (Some("../evil"), None),
+            (None, Some("tpu")),
+            (Some("htdemucs-ft-vocals-1s"), Some("")),
+        ] {
+            let err = state
+                .command("enable", model.map(String::from), device.map(String::from))
+                .unwrap_err();
+            assert!(
+                err.starts_with("unknown_model:") || err.starts_with("unknown_device:"),
+                "{err}"
+            );
+            assert_eq!(*lock(&state.shared.selection), good, "{model:?} {device:?}");
+        }
+        // Valid values pass validation (here they only fail on the missing supervisor) and are kept.
+        let err = state.command(
+            "enable",
+            Some("htdemucs-ft-vocals-1s".into()),
+            Some("cpu".into()),
+        );
+        assert_eq!(err.unwrap_err(), "devocal is not started yet");
+        assert_eq!(
+            lock(&state.shared.selection).model_id,
+            "htdemucs-ft-vocals-1s"
+        );
+        // Other actions do not look at the fields.
+        assert!(state
+            .command("disable", Some("no-such-model".into()), None)
+            .is_err());
+        assert_eq!(
+            lock(&state.shared.selection).model_id,
+            "htdemucs-ft-vocals-1s"
+        );
+    }
+
+    #[test]
+    fn auto_enable_only_when_stemgenrt_is_selected() {
+        let state = DevocalState::new(Arc::new(AttenuationGate::new()));
+        // The default selection is StemgenRT: it goes ahead (and only fails: no supervisor).
+        assert_eq!(
+            state.auto_enable().unwrap_err(),
+            "devocal is not started yet"
+        );
+        let other = Selection {
+            model_id: "bytesep-mobilenet-1s".into(),
+            device: "gpu".into(),
+        };
+        *lock(&state.shared.selection) = other.clone();
+        // Another model is selected: skipped, and the selection is left alone.
+        assert_eq!(state.auto_enable(), Ok(None));
+        assert_eq!(*lock(&state.shared.selection), other);
     }
 
     #[test]
@@ -624,7 +813,8 @@ pub(crate) mod tests {
             serde_json::json!({
                 "phase": "off", "held": false, "latencyMs": null, "loadRatio": null,
                 "fallbackReason": null, "sessionOverridden": false, "inputSilent": false,
-                "waitingForPlayer": false, "error": null
+                "waitingForPlayer": false, "error": null,
+                "modelId": null, "device": null, "deviceNote": null
             })
         );
     }

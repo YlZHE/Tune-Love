@@ -159,6 +159,19 @@ node scripts/verify-key-detection.mjs
 
 `audio_probe` 只读当前来源并报告 PCM 帧数、RMS、峰值和进程身份，不输出原始音频。`audio_isolation` 创建两个自己的低音量播放进程，依次测试静音、目标单独发声、其他进程单独发声、同时发声和恢复静音；它不会操作你的播放器，并在结束时关闭自己的测试进程。测试音幅度为 0.01。隔离结论要求目标信号非零、非目标信号不混入，还要单独确认非目标进程实际输出了非零音频。
 
+高质量去人声模型文件（发布在 Release，不入库）可从原始权重重新生成。导出需要单独的 Python 环境（torch、onnx、torchlibrosa、bytesep；HTDemucs 另需 Demucs 与 StemSplit demucs-onnx），校验需要 onnxruntime：
+
+```powershell
+# bytesep：Zenodo 5804160 的 .pth，Zenodo 5513378 的滤波器放在 <dir>\bytesep_data\filters
+python scripts/models/export_bytesep.py --ckpt bytesep_mobilenet_vocals.pth --filters-home <dir> --out-dir <out>
+python scripts/models/convert.py bytesep --src <out>\bytesep_mobilenet_vocals_1s.onnx --out <release>
+# HTDemucs：demucs-onnx 自动下载 htdemucs_ft 官方权重
+python scripts/models/export_short.py <out> 1
+python scripts/models/convert.py htdemucs --src <out>\htdemucs_ft_vocals_1s.onnx --out <release>
+```
+
+`convert.py` 会把输出和 `--src` 的大小与 SHA-256 写入 `<release>\sha256.txt`。
+
 构建可独立启动的 exe：
 
 ```powershell
@@ -213,6 +226,8 @@ npm run tauri -- build --debug --no-bundle --config src-tauri/tauri.verify.conf.
 | [FFTW](https://www.fftw.org/) | libkeyfinder 的固定 3.3.10 静态依赖，GPL-2.0-or-later；来源、哈希和构建边界见 `docs/keyfinder-dependencies.md` |
 | [colord](https://github.com/omgovich/colord) | 颜色格式与深色界面对比度处理，MIT |
 | [Phosphor](https://phosphoricons.com/) | 图标与应用图标 |
+| [bytesep MobileNet-Subbandtime](https://github.com/bytedance/music_source_separation) | 可选的高质量去人声模型。权重与 PQMF 滤波器为 Kong 等人发布，[Zenodo 5804160](https://doi.org/10.5281/zenodo.5804160) 与 [Zenodo 5513378](https://doi.org/10.5281/zenodo.5513378)，CC BY 4.0，代码 Apache-2.0；**已由本项目转换为 ONNX 并改写计算图，权重数值未改**（`scripts/models/export_bytesep.py` → `convert.py`），许可见 `licenses/bytesep.txt` |
+| [HTDemucs](https://github.com/facebookresearch/demucs) | 可选的高质量去人声模型（htdemucs_ft 人声）。Demucs 代码 MIT；用 [StemSplit demucs-onnx](https://github.com/StemSplit/demucs-onnx) 导出（对应 [StemSplitio 的 ONNX 模型](https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx)）；训练数据含来源不明的 800 首歌，仅限非商业使用；**已由本项目导出为 1 秒窗并改写计算图，权重数值未改**（`scripts/models/export_short.py` → `convert.py`），许可见 `licenses/htdemucs.txt` |
 | [nowplaying](https://github.com/pyanexu/nowplaying) | 媒体发现、会话选择、播放状态、时间线校正 |
 | [windows-rs](https://github.com/microsoft/windows-rs) | 封面读取适配、Windows Shell 来源名称／图标及可执行文件来源匹配 |
 | [png](https://github.com/image-rs/image-png) | 将 Windows Shell 返回的来源图标编码为 PNG；复用项目已有依赖版本 |

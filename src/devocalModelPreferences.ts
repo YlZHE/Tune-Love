@@ -26,26 +26,32 @@ export function qualityLatencyMs(model: ModelInfo, device: DevocalDevice): numbe
   return ((device === "cpu" ? cpu ?? gpu : gpu ?? cpu))?.latencyMs ?? 0;
 }
 
+// Re-parsed only when the stored string changes, so the snapshot stays stable for
+// useSyncExternalStore while a write from the other window is still seen without a subscriber.
+let currentRaw: string | null | undefined;
+let current = DEFAULT_DEVOCAL_MODEL;
 function load(): DevocalModelPreference {
-  try { return parseDevocalModelPreference(localStorage.getItem(DEVOCAL_MODEL_STORAGE_KEY)); }
-  catch { return DEFAULT_DEVOCAL_MODEL; }
+  let raw: string | null;
+  try { raw = localStorage.getItem(DEVOCAL_MODEL_STORAGE_KEY); } catch { return current; }
+  if (raw !== currentRaw) { currentRaw = raw; current = parseDevocalModelPreference(raw); }
+  return current;
 }
-let current = load();
 const listeners = new Set<() => void>();
 
-export function readDevocalModelPreference(): DevocalModelPreference { return current; }
+export function readDevocalModelPreference(): DevocalModelPreference { return load(); }
 export function subscribeDevocalModelPreference(listener: () => void) {
   listeners.add(listener);
   const receive = (event: StorageEvent) => {
     if (event.key !== DEVOCAL_MODEL_STORAGE_KEY && event.key !== null) return;
-    current = load(); listener();
+    load(); listener();
   };
   window.addEventListener("storage", receive);
   return () => { listeners.delete(listener); window.removeEventListener("storage", receive); };
 }
 export function setDevocalModelPreference(next: DevocalModelPreference) {
-  localStorage.setItem(DEVOCAL_MODEL_STORAGE_KEY, JSON.stringify(next));
-  current = next;
+  const raw = JSON.stringify(next);
+  localStorage.setItem(DEVOCAL_MODEL_STORAGE_KEY, raw);
+  currentRaw = raw; current = next;
   listeners.forEach(listener => listener());
 }
 export function useDevocalModelPreference() {

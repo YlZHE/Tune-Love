@@ -53,4 +53,17 @@ describe("the shared store", () => {
     expect(heard).toHaveBeenCalledTimes(1);
     expect(store.readDevocalModelPreference()).toEqual({ modelId: "htdemucs-ft-vocals-1s", device: "gpu" });
   });
+
+  // Real machine: the main window never subscribes, and the settings window's write reached it
+  // only through localStorage, so its enable kept sending the selection read at page load.
+  it("reads another window's write without a subscriber or storage event", async () => {
+    const data = new Map<string, string>();
+    vi.stubGlobal("localStorage", { getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => { data.set(k, v); } });
+    vi.resetModules();
+    const store = await import("./devocalModelPreferences");
+    expect(store.readDevocalModelPreference()).toEqual(DEFAULT_DEVOCAL_MODEL);
+    data.set(DEVOCAL_MODEL_STORAGE_KEY, JSON.stringify({ modelId: "bytesep-mobilenet-1s", device: "gpu" }));
+    expect(store.readDevocalModelPreference()).toEqual({ modelId: "bytesep-mobilenet-1s", device: "gpu" });
+    expect(store.readDevocalModelPreference()).toBe(store.readDevocalModelPreference());
+  });
 });

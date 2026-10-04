@@ -6,6 +6,7 @@
       "id": "stemgenrt-hop128",
       "name": "StemgenRT（低延迟）",
       "tier": "realtime",
+      "kind": "streaming",
       "files": [
         {
           "file": "model.onnx",
@@ -16,10 +17,64 @@
         }
       ],
       "sampleRate": 44100,
-      "latencyMs": 5.8,
-      "runtime": "cpu",
+      "vocalsIndex": 0,
+      "devices": {
+        "cpu": { "windowMs": 0, "hopMs": 0, "lookaheadMs": 0, "threads": 1, "latencyMs": 5.8 },
+        "gpu": null
+      },
       "license": { "code": "MIT", "weights": "pending", "trainingData": ["MUSDB18-HQ（仅教育用途）", "MoisesDB（CC BY-NC-SA 4.0）"] },
       "source": "https://github.com/sweetspotsoundsystem/stemgen-rt"
+    },
+    {
+      "id": "bytesep-mobilenet-1s",
+      "name": "bytesep MobileNet（高质量）",
+      "tier": "quality",
+      "kind": "windowed",
+      "files": [
+        {
+          "file": "bytesep-mobilenet-1s.onnx",
+          "bytes": 9600617,
+          "sha256": "d70b6ba65e9627b6bc0f3e02efb6d678030d44af74b9de1ed0c7bc60a80d4885",
+          "origin": "https://github.com/YlZHE/Tune-Love/releases/download/models-v1/bytesep-mobilenet-1s.onnx",
+          "mirrorable": true
+        }
+      ],
+      "sampleRate": 44100,
+      "vocalsIndex": 0,
+      "devices": {
+        "cpu": { "windowMs": 1000, "hopMs": 200, "lookaheadMs": 100, "threads": 2, "latencyMs": 360 },
+        "gpu": { "windowMs": 1000, "hopMs": 100, "lookaheadMs": 100, "threads": 1, "latencyMs": 230 }
+      },
+      "license": { "code": "Apache-2.0", "weights": "CC BY 4.0", "trainingData": ["MUSDB18（仅教育用途）"], "converted": true },
+      "source": "https://zenodo.org/records/5804160"
+    },
+    {
+      "id": "htdemucs-ft-vocals-1s",
+      "name": "HTDemucs（高质量）",
+      "tier": "quality",
+      "kind": "windowed",
+      "files": [
+        {
+          "file": "htdemucs-ft-vocals-1s.onnx",
+          "bytes": 304759764,
+          "sha256": "fb173f3fdffd43d298c5ab26a9945a6c17845b9b81cce99df5ebcc8022dd5ab4",
+          "origin": "https://github.com/YlZHE/Tune-Love/releases/download/models-v1/htdemucs-ft-vocals-1s.onnx",
+          "mirrorable": true
+        }
+      ],
+      "sampleRate": 44100,
+      "vocalsIndex": 3,
+      "devices": {
+        "cpu": null,
+        "gpu": { "windowMs": 1000, "hopMs": 100, "lookaheadMs": 100, "threads": 1, "latencyMs": 230 }
+      },
+      "license": {
+        "code": "MIT",
+        "weights": "Demucs 官方 htdemucs_ft 检查点",
+        "trainingData": ["MUSDB18-HQ（仅教育用途）", "约 800 首未公开来源的歌曲（训练数据来源不明，仅限非商业使用）"],
+        "converted": true
+      },
+      "source": "https://github.com/facebookresearch/demucs"
     }
   ]
 }

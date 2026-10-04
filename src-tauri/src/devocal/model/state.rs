@@ -571,7 +571,8 @@ mod tests {
     fn model_json(id: &str, files: Vec<serde_json::Value>) -> serde_json::Value {
         serde_json::json!({
             "id": id, "name": id, "tier": "realtime", "files": files,
-            "sampleRate": 44100, "latencyMs": 5.8, "runtime": "cpu",
+            "sampleRate": 44100, "kind": "streaming", "vocalsIndex": 0,
+            "devices": { "cpu": { "windowMs": 0, "hopMs": 0, "lookaheadMs": 0, "threads": 1, "latencyMs": 5.8 }, "gpu": null },
             "license": { "code": "MIT", "weights": "pending", "trainingData": [] },
             "source": "https://example.com"
         })

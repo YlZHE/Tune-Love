@@ -70,16 +70,21 @@ def _finish(model, em):
     return model
 
 
-def _convtranspose_ok(node, w, min_kernel):
-    """Weight constant, group 1, no dilation, no pads / output_padding / output_shape,
-    1-D or (K, 1) 2-D, kernel >= min_kernel."""
+def _convtranspose_ok(node, consts, min_kernel):
+    """Constant weight (and bias, if any), group 1, no dilation, auto_pad NOTSET, no pads /
+    output_padding / output_shape, stride > 1, 1-D or (K, 1) 2-D, kernel >= min_kernel."""
+    w = consts.get(node.input[1]) if len(node.input) > 1 else None
     if w is None or w.ndim not in (3, 4):
+        return False
+    if len(node.input) > 2 and node.input[2] and node.input[2] not in consts:
         return False
     two_d = w.ndim == 4
     k = list(_attr(node, "kernel_shape") or w.shape[2:])
     strides = list(_attr(node, "strides") or [1] * (w.ndim - 2))
     return (
-        _attr(node, "group", 1) == 1
+        strides[0] > 1
+        and _attr(node, "auto_pad", b"NOTSET") in (b"NOTSET", "NOTSET")
+        and _attr(node, "group", 1) == 1
         and all(d == 1 for d in (_attr(node, "dilations") or [1]))
         and not any(_attr(node, "pads") or [])
         and not _attr(node, "output_padding")
@@ -89,7 +94,7 @@ def _convtranspose_ok(node, w, min_kernel):
     )
 
 
-def _overlap_add(em, x, w, bias, stride, two_d):
+def _overlap_add(em, x, w, bias, stride):
     """x: (B, Cin, T); w: (Cin, Cout, K) -> (B, Cout, (T-1)*stride + K), same as ConvTranspose."""
     cin, cout, k = w.shape
     parts_n = -(-k // stride)  # ceil(K / S)
@@ -115,16 +120,16 @@ def rewrite_convtranspose(model, min_kernel=MIN_KERNEL):
     consts = _constants(model.graph)
     em = _Emitter("ola")
     for n in model.graph.node:
-        w = consts.get(n.input[1]) if n.op_type == "ConvTranspose" and len(n.input) > 1 else None
-        if n.op_type != "ConvTranspose" or not _convtranspose_ok(n, w, min_kernel):
+        if n.op_type != "ConvTranspose" or not _convtranspose_ok(n, consts, min_kernel):
             em.nodes.append(n)
             continue
+        w = consts[n.input[1]]
         two_d = w.ndim == 4
         x = n.input[0]
         if two_d:
             x = em.node("Squeeze", [x, em.ints([3])], "sq")
         bias = consts[n.input[2]] if len(n.input) > 2 and n.input[2] else None
-        y = _overlap_add(em, x, w[..., 0] if two_d else w, bias, list(_attr(n, "strides"))[0], two_d)
+        y = _overlap_add(em, x, w[..., 0] if two_d else w, bias, list(_attr(n, "strides"))[0])
         if two_d:
             em.nodes.append(helper.make_node("Unsqueeze", [y, em.ints([3])], [n.output[0]]))
         else:
@@ -133,7 +138,7 @@ def rewrite_convtranspose(model, min_kernel=MIN_KERNEL):
 
 
 def split_to_slice(model):
-    """Replace every Split without a `split` input (equal parts) by equal-width Slices. The width
+    """Replace every Split without a `split` input or legacy `split` attribute (equal parts) by equal-width Slices. The width
     comes from shape inference; a Split whose axis size is unknown or not divisible stays."""
     inferred = shape_inference.infer_shapes(model).graph
     dims = {}
@@ -141,7 +146,7 @@ def split_to_slice(model):
         dims[v.name] = [d.dim_value if d.HasField("dim_value") else None for d in v.type.tensor_type.shape.dim]
     em = _Emitter("sl")
     for n in model.graph.node:
-        if n.op_type == "Split" and len(n.input) == 1:
+        if n.op_type == "Split" and len(n.input) == 1 and not any(a.name == "split" for a in n.attribute):
             axis = _attr(n, "axis", 0)
             shape = dims.get(n.input[0])
             size = shape[axis] if shape and -len(shape) <= axis < len(shape) else None
@@ -176,3 +181,18 @@ def drop_unused_initializers(model):
     del model.graph.node[:]
     model.graph.node.extend(live)
     return model
+
+
+def count_ops(model, op_type):
+    return sum(n.op_type == op_type for n in model.graph.node)
+
+
+def count_large_convtranspose(model, min_kernel=MIN_KERNEL):
+    """ConvTranspose nodes whose first kernel dimension is >= min_kernel (what the rewrite targets)."""
+    consts = _constants(model.graph)
+    total = 0
+    for n in model.graph.node:
+        if n.op_type == "ConvTranspose":
+            k = _attr(n, "kernel_shape") or (consts[n.input[1]].shape[2:] if n.input[1] in consts else [0])
+            total += k[0] >= min_kernel
+    return total

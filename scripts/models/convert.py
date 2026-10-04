@@ -3,10 +3,17 @@
     convert.py bytesep   --src bytesep_mobilenet_vocals_1s.onnx --out <dir>
     convert.py htdemucs  --src htdemucs_ft_vocals_1s.onnx       --out <dir>
 
-bytesep's source is the 1 s export made by artifacts/separation-bench/src/export_bytesep.py (from the
-official .pth and PQMF filters). HTDemucs's source is the StemSplitio htdemucs_ft_vocals ONNX cut to 1 s.
-Steps: rewrite ConvTranspose (+ Split for HTDemucs), drop dead weights, save, check the saved file
-against the source on CPU (SDR >= 100 dB), then record bytes and SHA-256 in <dir>/sha256.txt.
+Provenance of the --src files (made by scripts in artifacts/separation-bench/src, not stored in git):
+  bytesep:  Zenodo 5804160 checkpoint .pth (MD5 197abd4c514fcc92bd22fb1fe77d5f3a) + Zenodo 5513378
+            PQMF .mat files -> export_bytesep.py (torch.onnx.export, opset 17, 1 s window) -> 1 s ONNX
+            -> convert.py.
+  htdemucs: official Demucs htdemucs_ft checkpoint, vocals sub-model -> export_short.py (demucs-onnx by
+            StemSplit, 1 s window) -> 1 s ONNX -> convert.py. It is re-exported from the checkpoint, not
+            cut from StemSplitio's full-length Hugging Face ONNX (only a research reference).
+
+Steps: rewrite ConvTranspose (+ Split for HTDemucs), check the rewrite counts, drop dead weights, save,
+check the saved file against the source on CPU (SDR >= 100 dB), then record bytes and SHA-256 of the
+output and of --src in <dir>/sha256.txt.
 """
 import argparse
 import hashlib
@@ -22,10 +29,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rewrite_graph as rg  # noqa: E402
 
 MIN_SDR_DB = 100.0
-# out file, apply Split->Slice, index of the vocals stem in the (squeezed) output
+# out file, apply Split->Slice, index of the vocals stem in the (squeezed) output,
+# expected number of rewritten (ConvTranspose, Split) nodes
 MODELS = {
-    "bytesep": ("bytesep-mobilenet-1s.onnx", False, 0),
-    "htdemucs": ("htdemucs-ft-vocals-1s.onnx", True, 3),
+    "bytesep": ("bytesep-mobilenet-1s.onnx", False, 0, (4, 0)),
+    "htdemucs": ("htdemucs-ft-vocals-1s.onnx", True, 3, (2, 48)),
 }
 
 
@@ -56,22 +64,38 @@ def sha256_of(path):
     return h.hexdigest()
 
 
-def record(out_dir, name, size, digest):
-    """sha256.txt lines: '<sha256>  <bytes>  <file>'; one line per file, replaced on rerun."""
+def record(out_dir, name, size, digest, src):
+    """sha256.txt: per file a '# <file> converted from <src> (sha256, bytes)' comment line followed by
+    '<sha256>  <bytes>  <file>'; both are replaced on rerun."""
     f = out_dir / "sha256.txt"
-    lines = [l for l in (f.read_text().splitlines() if f.exists() else []) if l.split()[-1:] != [name]]
-    lines.append(f"{digest}  {size}  {name}")
-    f.write_text("\n".join(sorted(lines, key=lambda l: l.split()[-1])) + "\n")
+    old = f.read_text().splitlines() if f.exists() else []
+    keep = [l for l in old if l.split()[-1:] != [name] and not l.startswith(f"# {name} ")]
+    note = f"# {name} converted from {src.name} (sha256 {sha256_of(src)}, {src.stat().st_size} bytes)"
+    entries = keep + [note, f"{digest}  {size}  {name}"]
+    pairs = sorted((entries[i], entries[i + 1]) for i in range(0, len(entries), 2))
+    f.write_text("\n".join(l for p in pairs for l in p) + "\n")
 
 
 def convert(kind, src, out_dir):
-    name, split, vocals_index = MODELS[kind]
+    name, split, vocals_index, expected = MODELS[kind]
     out_dir.mkdir(parents=True, exist_ok=True)
     dst = out_dir / name
-    m = rg.rewrite_convtranspose(onnx.load(str(src)))
+    if dst.resolve() == src.resolve():
+        raise SystemExit(f"--out would overwrite --src ({src})")
+    m = onnx.load(str(src))
+    before = (rg.count_ops(m, "ConvTranspose"), rg.count_ops(m, "Split"))
+    m = rg.rewrite_convtranspose(m)
     if split:
         m = rg.split_to_slice(m)
     m = rg.drop_unused_initializers(m)
+    after = (rg.count_ops(m, "ConvTranspose"), rg.count_ops(m, "Split"))
+    rewritten = (before[0] - after[0], before[1] - after[1])
+    print(f"{name}: rewrote ConvTranspose {rewritten[0]}, Split {rewritten[1]}; "
+          f"left ConvTranspose {after[0]}, Split {after[1]}", flush=True)
+    if rewritten != expected:
+        raise SystemExit(f"{name}: rewrote (ConvTranspose, Split) = {rewritten}, expected {expected}; not written")
+    if rg.count_large_convtranspose(m) or (split and after[1]):
+        raise SystemExit(f"{name}: a large ConvTranspose or a Split remains; not written")
     onnx.checker.check_model(m)
     onnx.save(m, str(dst))
     sdr = parity_sdr(src, dst)
@@ -79,14 +103,16 @@ def convert(kind, src, out_dir):
         dst.unlink()
         raise SystemExit(f"{name}: CPU parity {sdr:.1f} dB < {MIN_SDR_DB} dB, not written")
     size, digest = dst.stat().st_size, sha256_of(dst)
-    record(out_dir, name, size, digest)
+    record(out_dir, name, size, digest, src)
     m = onnx.load(str(dst))
     dims = lambda v: [d.dim_value for d in v.type.tensor_type.shape.dim]
     outs = cpu_session(dst).get_outputs()
     return {"file": name, "bytes": size, "sha256": digest,
             "paritySdrDb": round(min(sdr, 999.0), 1),  # 999 = bit-identical
             "input": {"name": m.graph.input[0].name, "shape": dims(m.graph.input[0])},
-            "outputShape": outs[0].shape, "vocalsIndex": vocals_index}
+            "outputShape": outs[0].shape, "vocalsIndex": vocals_index,
+            "rewrittenConvTranspose": rewritten[0], "rewrittenSplit": rewritten[1],
+            "srcSha256": sha256_of(src)}
 
 
 def main():

@@ -214,7 +214,7 @@ npm run tauri -- build --debug --no-bundle --config src-tauri/tauri.verify.conf.
 | [colord](https://github.com/omgovich/colord) | 颜色格式与深色界面对比度处理，MIT |
 | [Phosphor](https://phosphoricons.com/) | 图标与应用图标 |
 | [bytesep MobileNet-Subbandtime](https://github.com/bytedance/music_source_separation) | 可选的高质量去人声模型。权重与 PQMF 滤波器为 Kong 等人发布，[Zenodo 5804160](https://doi.org/10.5281/zenodo.5804160) 与 [Zenodo 5513378](https://doi.org/10.5281/zenodo.5513378)，CC BY 4.0，代码 Apache-2.0；**已由本项目转换为 ONNX 并改写计算图，权重数值未改**（`scripts/models/convert.py`），许可见 `licenses/bytesep.txt` |
-| [HTDemucs](https://github.com/facebookresearch/demucs) | 可选的高质量去人声模型（htdemucs_ft 人声，StemSplitio 的 ONNX 导出）。Demucs 代码 MIT；训练数据含来源不明的 800 首歌，仅限非商业使用；**已由本项目裁成 1 秒窗并改写计算图，权重数值未改**，许可见 `licenses/htdemucs.txt` |
+| [HTDemucs](https://github.com/facebookresearch/demucs) | 可选的高质量去人声模型（htdemucs_ft 人声）。Demucs 代码 MIT；用 [StemSplit demucs-onnx](https://github.com/StemSplit/demucs-onnx) 导出（对应 [StemSplitio 的 ONNX 模型](https://huggingface.co/StemSplitio/htdemucs-ft-vocals-onnx)）；训练数据含来源不明的 800 首歌，仅限非商业使用；**已由本项目导出为 1 秒窗并改写计算图，权重数值未改**，许可见 `licenses/htdemucs.txt` |
 | [nowplaying](https://github.com/pyanexu/nowplaying) | 媒体发现、会话选择、播放状态、时间线校正 |
 | [windows-rs](https://github.com/microsoft/windows-rs) | 封面读取适配、Windows Shell 来源名称／图标及可执行文件来源匹配 |
 | [png](https://github.com/image-rs/image-png) | 将 Windows Shell 返回的来源图标编码为 PNG；复用项目已有依赖版本 |

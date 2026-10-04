@@ -15,9 +15,9 @@ import rewrite_graph as rg  # noqa: E402
 ort.set_default_logger_severity(3)
 
 
-def make_model(nodes, inputs, outputs, inits=()):
+def make_model(nodes, inputs, outputs, inits=(), opset=17):
     g = helper.make_graph(nodes, "t", inputs, outputs, list(inits))
-    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", opset)])
     m.ir_version = 8
     onnx.checker.check_model(m)
     return m
@@ -85,6 +85,55 @@ class RewriteGraphTest(unittest.TestCase):
         self.assertNotIn("Split", [n.op_type for n in m2.graph.node])
         for a, b in zip(before, run(m2, x)):
             np.testing.assert_array_equal(a, b)
+
+    def test_convtranspose_2d_kernel_k_by_1_matches(self):
+        rng = np.random.RandomState(5)
+        w = rng.randn(4, 2, 256, 1).astype(np.float32)
+        b = rng.randn(2).astype(np.float32)
+        node = helper.make_node("ConvTranspose", ["x", "w", "b"], ["y"], strides=[64, 1], kernel_shape=[256, 1])
+        m = make_model([node], [vi("x", [1, 4, 7, 1])], [vi("y", [1, 2, None, 1])],
+                       [numpy_helper.from_array(w, "w"), numpy_helper.from_array(b, "b")])
+        x = rng.randn(1, 4, 7, 1).astype(np.float32)
+        before = run(m, x)[0]
+        m2 = rg.rewrite_convtranspose(m)
+        self.assertNotIn("ConvTranspose", [n.op_type for n in m2.graph.node])
+        after = run(m2, x)[0]
+        self.assertEqual(before.shape, after.shape)
+        self.assertLessEqual(float(np.abs(before - after).max()), 1e-5)
+
+    def _kept(self, node, inits, x_shape):
+        m = make_model([node], [vi("x", x_shape)] + ([vi("b", [1])] if "b" in node.input else []),
+                       [vi("y", [None, None, None])], inits)
+        return [n.op_type for n in rg.rewrite_convtranspose(m).graph.node]
+
+    def test_convtranspose_not_rewritten_outside_conditions(self):
+        w = numpy_helper.from_array(np.ones((2, 1, 256), np.float32), "w")
+        kept = ["ConvTranspose"]
+        # stride 1: no overlap-add to speed up
+        self.assertEqual(self._kept(helper.make_node("ConvTranspose", ["x", "w"], ["y"], strides=[1], kernel_shape=[256]),
+                                    [w], [1, 2, 5]), kept)
+        # auto_pad other than NOTSET
+        self.assertEqual(self._kept(helper.make_node("ConvTranspose", ["x", "w"], ["y"], strides=[64], kernel_shape=[256],
+                                                     auto_pad="SAME_UPPER"), [w], [1, 2, 5]), kept)
+        # bias that is a graph input, not a constant
+        self.assertEqual(self._kept(helper.make_node("ConvTranspose", ["x", "w", "b"], ["y"], strides=[64], kernel_shape=[256]),
+                                    [w], [1, 2, 5]), kept)
+
+    def test_convtranspose_strides_default_is_not_rewritten(self):
+        w = numpy_helper.from_array(np.ones((2, 1, 256), np.float32), "w")
+        self.assertEqual(self._kept(helper.make_node("ConvTranspose", ["x", "w"], ["y"], kernel_shape=[256]),
+                                    [w], [1, 2, 5]), ["ConvTranspose"])
+
+    def test_split_with_legacy_split_attribute_is_kept(self):
+        node = helper.make_node("Split", ["x"], ["a", "b"], axis=1, split=[2, 4])  # opset 11 attribute form
+        m = make_model([node], [vi("x", [1, 6, 5])], [vi("a", [1, 2, 5]), vi("b", [1, 4, 5])], opset=11)
+        x = np.random.RandomState(6).randn(1, 6, 5).astype(np.float32)
+        before = run(m, x)
+        m2 = rg.split_to_slice(m)
+        self.assertEqual([n.op_type for n in m2.graph.node], ["Split"])
+        for a, b in zip(before, run(m2, x)):
+            np.testing.assert_array_equal(a, b)
+
 
     def test_drop_unused_initializers(self):
         keep = numpy_helper.from_array(np.ones((3,), np.float32), "keep")

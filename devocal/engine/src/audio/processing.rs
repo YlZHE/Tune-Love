@@ -9,7 +9,7 @@
 //! Positions: `in_pos` counts frames taken from ring A (processed or discarded), `out_pos`
 //! frames pushed to ring B. Input frame `x` of a block leaves the processor `latency` frames
 //! later, at output frame `x + (out_pos - in_pos) + latency`; `latency` is the audible path's
-//! (`Processor::output_latency_frames`: passthrough or model, by stage).
+//! (`Processor::output_latency_frames`: the model's, or the dry path's at P or held at M).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;

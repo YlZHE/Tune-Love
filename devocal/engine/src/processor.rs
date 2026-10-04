@@ -1,29 +1,40 @@
 //! Block processor on the engine's processing thread: one hop of interleaved stereo `f32`
-//! per call. The passthrough goes through a `DelayLine` of the model's
-//! `passthrough_latency_frames()`: equal to the model latency for StemgenRT, so switching
-//! never shifts the audio; window models keep it at one block, and switching then repeats
-//! or skips about the difference (the fades mix the two paths as they are).
+//! per call. The dry (passthrough) path reads one ring of the input at the model's
+//! `passthrough_latency_frames()` `P` or at its `latency_frames()` `M`. For StemgenRT
+//! `P == M`, so switching never shifts the audio. Window models keep `P` at one block; then
+//! (spec 4.2) switching neither repeats nor skips:
 //!
-//! Stages (`fade` = 20 ms equal-power crossfade between passthrough and accompaniment):
+//! - On: after the warm-up the dry path fades out, `M - D` frames of silence follow (`D`:
+//!   the dry path's current delay), and the accompaniment fades in from the input frame
+//!   after the last dry one. With `M == D` it is a plain crossfade; with `M < D` (ruling 14)
+//!   too, skipping `D - M`.
+//! - Off (and fallback): crossfade to the dry path at `M`, which then stays held at `M`
+//!   (model idle) until the `M - P` frames a drop to `P` would skip, and the frame before
+//!   them, are silent (below -80 dBFS), or until a discontinuity.
+//!
+//! Stages (`fade` = 20 ms equal-power crossfade between dry path and accompaniment):
 //!
 //! ```text
-//!   Passthrough --on--> WarmingUp --200 ms--> FadingIn --fade--> Devocal
-//!        ^   <--off (gain is 0)--'              |  ^               |
-//!        |                                  off |  | on        off |
-//!        |                                      v  |               |
-//!        '------------- fade done ---------- FadingOut <-----------'
-//!                                               |  (force_fallback: done -> Fallback)
-//!   Fallback --on (reset model)--> WarmingUp    v
+//!   Passthrough --on--> WarmingUp --200 ms--> FadingIn ------[gap]--fade--> Devocal
+//!   (dry at P, or  <--off (gain is 0)--'        |  ^    (gap if M > D: dry   |
+//!    held at M)                             off |  | on  fades out, M - D    | off
+//!        ^                                      v  |    frames of silence)   |
+//!        '------------- fade done ---------- FadingOut <---------------------'
+//!                                               |  (crossfade to dry at M;
+//!   Fallback --on (reset model)--> WarmingUp    v   force_fallback: -> Fallback)
 //!   Fallback <------------------------- fade done
+//!
+//!   Passthrough / Fallback / WarmingUp: dry held at M --silence or discontinuity--> P
 //! ```
 //!
-//! Reversing direction during a fade continues from the current gain. Any model error (or
-//! non-finite model output, or a malformed block while the model runs) outputs that block as
-//! passthrough and enters `Fallback` at once; the model is `reset()` before it runs again.
+//! Reversing direction during a fade continues from the current gain; "off" during the gap
+//! lets the silence run out and fades the dry path in at `M`. Any model error (or non-finite
+//! model output, or a malformed block while the model runs) outputs that block as dry and
+//! enters `Fallback` at once; the model is `reset()` before it runs again.
 
 use devocal_core::protocol::FallbackReason;
 
-use crate::dsp::{frames_for_ms, Crossfade, DelayLine};
+use crate::dsp::{equal_power, frames_for_ms, Crossfade};
 use crate::separator::Separator;
 
 /// Hop and passthrough latency without a model, matching StemgenRT so that loading the
@@ -35,6 +46,8 @@ pub const NO_MODEL_LATENCY_FRAMES: usize = 128;
 pub const WARM_UP_MS: f32 = 200.0;
 /// Equal-power crossfade between passthrough and accompaniment.
 pub const FADE_MS: f32 = 20.0;
+/// Peak below -80 dBFS on every channel: silent enough to drop a held delay in.
+const SILENCE: f32 = 1e-4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -54,25 +67,150 @@ pub struct BlockReport {
     pub stage: Stage,
 }
 
+/// The dry path: a ring of the input read at `delay` (`p`, or `m` while held), with its own
+/// equal-power gain ramp and the enable gap. Allocates only in `new`.
+struct DryPath {
+    ring: Vec<f32>,
+    /// Ring slot (frame) of the next input frame.
+    pos: usize,
+    p: usize,
+    m: usize,
+    delay: usize,
+    /// Gain position `0..=fade`; gain `sin(pi/2 * gain / fade)`, moving towards `up`.
+    gain: usize,
+    fade: usize,
+    up: bool,
+    /// Enable gap: the gain falls to 0, then this many silent frames, then `delay = m`.
+    gap: Option<usize>,
+    /// Consecutive silent frames read at tap `p`, up to the previous frame.
+    quiet: usize,
+}
+
+impl DryPath {
+    fn new(p: usize, m: usize, fade: usize) -> Self {
+        Self {
+            ring: vec![0.0; (p.max(m) + 1) * 2],
+            pos: 0,
+            p,
+            m,
+            delay: p,
+            gain: fade,
+            fade,
+            up: true,
+            gap: None,
+            quiet: 0,
+        }
+    }
+
+    /// Clears the ring; full gain at `delay`.
+    fn reset(&mut self, delay: usize) {
+        self.ring.fill(0.0);
+        self.pos = 0;
+        self.delay = delay;
+        self.gain = self.fade;
+        self.up = true;
+        self.gap = None;
+        self.quiet = 0;
+    }
+
+    /// The accompaniment is about to fade in: if it is later than the dry path, pause for
+    /// the difference instead of repeating it. During a gap the dry path stays muted after it.
+    fn before_fade_in(&mut self) {
+        if self.gap.is_none() && self.m > self.delay {
+            self.gap = Some(self.m - self.delay);
+        }
+        if self.gap.is_some() {
+            self.up = false;
+        }
+    }
+
+    /// The accompaniment is audible: the dry path waits at its delay, at full gain.
+    fn hold_model(&mut self) {
+        self.delay = self.m;
+        self.gain = self.fade;
+        self.up = true;
+        self.gap = None;
+    }
+
+    fn read(&self, delay: usize) -> [f32; 2] {
+        let cap = self.ring.len() / 2;
+        let i = (self.pos + cap - delay) % cap * 2;
+        [self.ring[i], self.ring[i + 1]]
+    }
+
+    /// Replaces `buf` (whole frames) with the dry path; returns how many leading frames were
+    /// in the gap. `may_drop`: the dry path alone is audible, so a held delay may drop.
+    fn process(&mut self, buf: &mut [f32], may_drop: bool) -> usize {
+        let cap = self.ring.len() / 2;
+        let mut gap_frames = 0;
+        for f in buf.as_chunks_mut::<2>().0 {
+            self.ring[self.pos * 2..self.pos * 2 + 2].copy_from_slice(f);
+            if self.gap == Some(0) && self.gain == 0 {
+                self.gap = None;
+                self.delay = self.m;
+            }
+            // The skipped frames and the one played before them are silent, so the output
+            // goes from silence into the next input frame, as the input itself does.
+            if may_drop
+                && self.gap.is_none()
+                && self.delay > self.p
+                && self.quiet > self.delay - self.p
+            {
+                self.delay = self.p;
+            }
+            let at_p = self.read(self.p);
+            self.quiet = if at_p.iter().all(|s| s.abs() < SILENCE) {
+                self.quiet.saturating_add(1)
+            } else {
+                0
+            };
+            let g = self.gain_now();
+            match self.gap {
+                Some(left) => {
+                    gap_frames += 1;
+                    if self.gain > 0 {
+                        self.gain -= 1;
+                    } else {
+                        self.gap = Some(left - 1);
+                    }
+                }
+                None if self.up => self.gain = (self.gain + 1).min(self.fade),
+                None => self.gain = self.gain.saturating_sub(1),
+            }
+            let x = self.read(self.delay);
+            f[0] = x[0] * g;
+            f[1] = x[1] * g;
+            self.pos = (self.pos + 1) % cap;
+        }
+        gap_frames
+    }
+
+    fn gain_now(&self) -> f32 {
+        if self.gain >= self.fade {
+            1.0
+        } else {
+            equal_power(self.gain as f32 / self.fade as f32).1
+        }
+    }
+}
+
 pub struct Processor {
     separator: Option<Box<dyn Separator>>,
     hop: usize,
     /// The model's latency in frames (the accompaniment's delay).
     latency_frames: usize,
-    /// Passthrough delay in frames; the model's own `passthrough_latency_frames()`.
-    passthrough_frames: usize,
-    delay: DelayLine,
+    dry: DryPath,
     stage: Stage,
     /// Set while falling back (fading out towards, or in, `Fallback`).
     fallback: Option<FallbackReason>,
     warm_frames: usize,
     warm_left: usize,
-    /// Fade position in the current direction: `FadingIn` mixes passthrough -> accompaniment,
-    /// `FadingOut` mixes accompaniment -> passthrough.
+    /// Fade position in the current direction: `FadingIn` mixes dry -> accompaniment,
+    /// `FadingOut` mixes accompaniment -> dry. Held at its start during the enable gap.
     fade: Crossfade,
     /// Sanitised copy of the input block (model input).
     input: Vec<f32>,
-    /// Delayed passthrough block.
+    /// Dry path block.
     pass: Vec<f32>,
     /// Accompaniment block from the model.
     acc: Vec<f32>,
@@ -86,8 +224,11 @@ impl Processor {
             separator: None,
             hop: NO_MODEL_HOP,
             latency_frames: NO_MODEL_LATENCY_FRAMES,
-            passthrough_frames: NO_MODEL_LATENCY_FRAMES,
-            delay: DelayLine::new(NO_MODEL_LATENCY_FRAMES),
+            dry: DryPath::new(
+                NO_MODEL_LATENCY_FRAMES,
+                NO_MODEL_LATENCY_FRAMES,
+                fade_frames,
+            ),
             stage: Stage::Passthrough,
             fallback: None,
             warm_frames: 0,
@@ -110,8 +251,8 @@ impl Processor {
         p
     }
 
-    /// Installs a new model: back to `Passthrough` (fallback cleared) with the passthrough
-    /// delay set to the model's latency. Allocates; call off the audio path or between blocks.
+    /// Installs a new model: back to `Passthrough` (fallback cleared) with the dry path at
+    /// the model's passthrough latency. Allocates; call off the audio path or between blocks.
     /// Returns the previous model so the caller can drop it off the audio thread (tearing
     /// down an inference session can take milliseconds).
     pub fn set_separator(&mut self, s: Box<dyn Separator>) -> Option<Box<dyn Separator>> {
@@ -140,8 +281,7 @@ impl Processor {
     fn configure(&mut self, hop: usize, latency_frames: usize, passthrough_frames: usize) {
         self.hop = hop.max(1);
         self.latency_frames = latency_frames;
-        self.passthrough_frames = passthrough_frames;
-        self.delay = DelayLine::new(passthrough_frames);
+        self.dry = DryPath::new(passthrough_frames, latency_frames, self.fade.frames());
         self.stage = Stage::Passthrough;
         self.fallback = None;
         // At least the model's latency: until then a window model's output is still its
@@ -176,6 +316,7 @@ impl Processor {
                     // The model ran through the fade-out without error; its state is valid.
                     self.fallback = None;
                     self.reverse_fade();
+                    self.dry.before_fade_in();
                     self.stage = Stage::FadingIn;
                 }
                 Stage::WarmingUp | Stage::FadingIn | Stage::Devocal => {}
@@ -186,6 +327,7 @@ impl Processor {
                 Stage::WarmingUp => self.stage = Stage::Passthrough,
                 Stage::FadingIn => {
                     self.reverse_fade();
+                    self.dry.up = true;
                     self.stage = Stage::FadingOut;
                 }
                 Stage::Devocal => {
@@ -213,6 +355,7 @@ impl Processor {
             Stage::WarmingUp | Stage::Fallback => self.stage = Stage::Fallback,
             Stage::FadingIn => {
                 self.reverse_fade();
+                self.dry.up = true;
                 self.stage = Stage::FadingOut;
             }
             Stage::Devocal => {
@@ -238,14 +381,20 @@ impl Processor {
         self.separator.as_ref().and_then(|s| s.window_stats())
     }
 
-    /// Input discontinuity (seek, glitch): clears the model state and the passthrough delay.
-    /// The stage is kept, except that a warm-up or fade-in in progress (re)starts the warm-up,
-    /// so the fresh model state still gets the full warm-up before it becomes audible.
+    /// Input discontinuity (seek, glitch): clears the model state and the dry path, which
+    /// drops a held delay to `P` (it stays at `M` while the accompaniment is audible, so a
+    /// later fade-out stays aligned). The stage is kept, except that a warm-up or fade-in in
+    /// progress (re)starts the warm-up, so the fresh model state still gets the full warm-up
+    /// before it becomes audible.
     pub fn on_discontinuity(&mut self) {
         if let Some(sep) = self.separator.as_mut() {
             sep.reset();
         }
-        self.delay.reset();
+        let delay = match self.stage {
+            Stage::Devocal | Stage::FadingOut => self.latency_frames,
+            _ => self.dry.p,
+        };
+        self.dry.reset(delay);
         // A fade-in in progress goes back to warm-up too: the reset window model is silent
         // again and the fade would complete into silence.
         if matches!(self.stage, Stage::WarmingUp | Stage::FadingIn) {
@@ -265,18 +414,18 @@ impl Processor {
         self.latency_frames
     }
 
-    /// Passthrough delay relative to the input in frames.
+    /// The dry path's delay relative to the input in frames when it is not held.
     pub fn passthrough_latency_frames(&self) -> usize {
-        self.passthrough_frames
+        self.dry.p
     }
 
-    /// Delay of what is audible now: the model's in `Devocal`/`FadingOut`, otherwise the
-    /// passthrough's (`Passthrough`, `WarmingUp`, `FadingIn`, `Fallback`). During the fades
-    /// the two paths differ in delay and are mixed as they are (a short repeat/skip).
+    /// Delay of what is audible now: the model's in `Devocal`/`FadingOut` and during the
+    /// enable gap, otherwise the dry path's (`P`, or `M` while held).
     pub fn output_latency_frames(&self) -> usize {
         match self.stage {
             Stage::Devocal | Stage::FadingOut => self.latency_frames,
-            _ => self.passthrough_frames,
+            _ if self.dry.gap.is_some() => self.latency_frames,
+            _ => self.dry.delay,
         }
     }
 
@@ -287,7 +436,7 @@ impl Processor {
     }
 
     /// Processes one block of `hop() * 2` samples. Never allocates, panics or outputs
-    /// non-finite samples. A block of another length is passed through the delay (the
+    /// non-finite samples. A block of another length is passed through the dry path (the
     /// remainder of `output` is zeroed); if the model was running this is a model error.
     pub fn process_block(&mut self, input: &[f32], output: &mut [f32]) -> BlockReport {
         let samples = self.hop * 2;
@@ -298,7 +447,8 @@ impl Processor {
             *d = finite_or_zero(s);
         }
         self.pass.copy_from_slice(&self.input);
-        self.delay.process(&mut self.pass);
+        let dry_alone = self.dry_alone();
+        let gap = self.dry.process(&mut self.pass, dry_alone) * 2;
 
         let mut ran_model = false;
         if self.model_running() {
@@ -324,11 +474,18 @@ impl Processor {
                 self.warm_left = self.warm_left.saturating_sub(self.hop);
                 if self.warm_left == 0 {
                     self.fade.start();
+                    self.dry.before_fade_in();
                     self.stage = Stage::FadingIn;
                 }
             }
             Stage::FadingIn => {
-                if self.fade.mix(&self.pass, &self.acc, output) {
+                // The fade waits for the gap (the dry path fading out, then silence).
+                output[..gap].copy_from_slice(&self.pass[..gap]);
+                if self
+                    .fade
+                    .mix(&self.pass[gap..], &self.acc[gap..], &mut output[gap..])
+                {
+                    self.dry.hold_model();
                     self.stage = Stage::Devocal;
                 }
             }
@@ -347,11 +504,12 @@ impl Processor {
     }
 
     fn process_malformed(&mut self, input: &[f32], output: &mut [f32]) -> BlockReport {
-        let n = input.len().min(output.len());
+        let n = input.len().min(output.len()) / 2 * 2;
         for (o, &s) in output[..n].iter_mut().zip(input) {
             *o = finite_or_zero(s);
         }
-        self.delay.process(&mut output[..n]);
+        let dry_alone = self.dry_alone();
+        self.dry.process(&mut output[..n], dry_alone);
         output[n..].fill(0.0);
         if self.model_running() {
             // The model cannot take this block; its stream would be out of step.
@@ -367,11 +525,20 @@ impl Processor {
         )
     }
 
-    /// Model failure: the current block was passthrough, so go straight to `Fallback`
+    /// Only the dry path is audible, so a held delay may drop to `P` (in silence).
+    fn dry_alone(&self) -> bool {
+        matches!(
+            self.stage,
+            Stage::Passthrough | Stage::Fallback | Stage::WarmingUp
+        )
+    }
+
+    /// Model failure: the current block was the dry path, so go straight to `Fallback`
     /// without a fade (the accompaniment is unusable). The model is reset before it runs
     /// again (`request_devocal(true)` from `Fallback`).
     fn fail_now(&mut self) {
         self.fallback = Some(FallbackReason::ModelError);
+        self.dry.up = true;
         self.stage = Stage::Fallback;
     }
 
@@ -403,7 +570,7 @@ mod tests {
     use crate::dsp::{equal_power, frames_for_ms, DelayLine};
     use crate::separator::{check_block, DelayOnly};
     use crate::stemgen::alloc_count;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     const HOP: usize = 128;
@@ -654,9 +821,11 @@ mod tests {
             assert_eq!(rig.block().stage, Stage::WarmingUp);
         }
         assert_eq!(rig.block().stage, Stage::FadingIn);
-        // The first fade-in block already carries model output, not its initial silence.
-        rig.block();
-        assert!(rig.out.iter().any(|&s| s != 0.0));
+        // The fade-in never fades into the model's initial silence: once the accompaniment
+        // is audible it stays.
+        let left = rig.run_until(Stage::Devocal);
+        let first = left.iter().position(|&s| s != 0.0).unwrap();
+        assert!(left[first..].iter().all(|&s| s != 0.0));
     }
 
     #[test]
@@ -672,8 +841,9 @@ mod tests {
             assert_eq!(rig.block().stage, Stage::WarmingUp);
         }
         assert_eq!(rig.block().stage, Stage::FadingIn);
-        rig.block();
-        assert!(rig.out.iter().any(|&s| s != 0.0));
+        let left = rig.run_until(Stage::Devocal);
+        let first = left.iter().position(|&s| s != 0.0).unwrap();
+        assert!(left[first..].iter().all(|&s| s != 0.0));
     }
 
     #[test]
@@ -708,12 +878,11 @@ mod tests {
         rig.block();
         assert!(rig.out.iter().all(|&s| s == ACC));
         assert_eq!(rig.p.output_latency_frames(), 10_000);
-        // Back to passthrough: the 128-frame delay again.
+        // Back to passthrough, held at the model's delay (the ramp input is never silent).
         rig.p.request_devocal(false);
         rig.run_until(Stage::Passthrough);
         rig.block();
-        assert_eq!(rig.out, rig.pass);
-        assert_eq!(rig.p.output_latency_frames(), HOP);
+        assert_eq!(rig.p.output_latency_frames(), 10_000);
     }
 
     #[test]
@@ -725,19 +894,23 @@ mod tests {
         rig.p.request_devocal(true);
         assert_eq!(rig.p.stage(), Stage::WarmingUp);
         assert_eq!(rig.p.output_latency_frames(), HOP);
+        // The enable gap already plays at the model's delay.
         rig.run_until(Stage::FadingIn);
-        assert_eq!(rig.p.output_latency_frames(), HOP);
+        assert_eq!(rig.p.output_latency_frames(), model);
         rig.run_until(Stage::Devocal);
         assert_eq!(rig.p.output_latency_frames(), model);
         rig.p.request_devocal(false);
         assert_eq!(rig.p.stage(), Stage::FadingOut);
         assert_eq!(rig.p.output_latency_frames(), model);
+        // Passthrough holds the model's delay until silence or a discontinuity.
         rig.run_until(Stage::Passthrough);
-        assert_eq!(rig.p.output_latency_frames(), HOP);
+        assert_eq!(rig.p.output_latency_frames(), model);
         rig.p.request_devocal(true);
         rig.run_until(Stage::Devocal);
         rig.p.force_fallback(FallbackReason::Overload);
         rig.run_until(Stage::Fallback);
+        assert_eq!(rig.p.output_latency_frames(), model);
+        rig.p.on_discontinuity();
         assert_eq!(rig.p.output_latency_frames(), HOP);
     }
 
@@ -1227,6 +1400,390 @@ mod tests {
         }
         p.on_discontinuity();
         p.process_block(&input, &mut out);
+        assert_eq!(alloc_count::this_thread() - before, 0);
+    }
+
+    /// Window-model latency for the content checks (passthrough stays at one hop).
+    const M: usize = 10_000;
+
+    /// Window-model stand-in for content checks: the accompaniment is the input delayed by
+    /// `m`, so it is aligned with the dry path held at `m`. `process` errs while `fail` is set.
+    struct IndexSep {
+        m: usize,
+        p: usize,
+        delay: DelayLine,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl Separator for IndexSep {
+        fn sample_rate(&self) -> u32 {
+            44_100
+        }
+        fn hop(&self) -> usize {
+            HOP
+        }
+        fn latency_frames(&self) -> usize {
+            self.m
+        }
+        fn passthrough_latency_frames(&self) -> usize {
+            self.p
+        }
+        fn process(&mut self, input: &[f32], out: &mut [f32]) -> Result<(), String> {
+            check_block(HOP, input, out)?;
+            if self.fail.load(Ordering::Relaxed) {
+                return Err("inference failed".into());
+            }
+            out.copy_from_slice(input);
+            self.delay.process(out);
+            Ok(())
+        }
+        fn reset(&mut self) {
+            self.delay.reset();
+        }
+    }
+
+    fn index_sep(m: usize, p: usize) -> (Box<dyn Separator>, Arc<AtomicBool>) {
+        let fail = Arc::new(AtomicBool::new(false));
+        let sep = IndexSep {
+            m,
+            p,
+            delay: DelayLine::new(m),
+            fail: fail.clone(),
+        };
+        (Box::new(sep), fail)
+    }
+
+    /// Feeds input frame `n` as `(n + 1, 1)`, or silence inside `quiet`, so an output frame
+    /// `(l, r)` carries input frame `l / r - 1` at any fade gain (as long as the frames mixed
+    /// into it are the same input frame).
+    struct Probe {
+        p: Processor,
+        quiet: Vec<std::ops::Range<usize>>,
+        out: Vec<[f32; 2]>,
+    }
+
+    impl Probe {
+        fn new(p: Processor) -> Self {
+            Self {
+                p,
+                quiet: Vec::new(),
+                out: Vec::new(),
+            }
+        }
+
+        /// Next input frame = number of output frames so far.
+        fn frame(&self) -> usize {
+            self.out.len()
+        }
+
+        fn is_quiet(&self, n: usize) -> bool {
+            self.quiet.iter().any(|q| q.contains(&n))
+        }
+
+        fn block(&mut self) -> BlockReport {
+            let start = self.frame();
+            let input: Vec<f32> = (start..start + HOP)
+                .flat_map(|n| {
+                    if self.is_quiet(n) {
+                        [0.0, 0.0]
+                    } else {
+                        [(n + 1) as f32, 1.0]
+                    }
+                })
+                .collect();
+            let mut out = vec![9.0; HOP * 2];
+            let r = self.p.process_block(&input, &mut out);
+            self.out.extend(out.as_chunks::<2>().0.iter().copied());
+            r
+        }
+
+        fn run(&mut self, blocks: usize) -> BlockReport {
+            (0..blocks).map(|_| self.block()).last().unwrap()
+        }
+
+        fn run_until(&mut self, stage: Stage) {
+            for _ in 0..1000 {
+                if self.block().stage == stage {
+                    return;
+                }
+            }
+            panic!("never reached {stage:?}");
+        }
+
+        /// Input frame carried by output frame `o`; `None` if it is silent.
+        fn content(&self, o: usize) -> Option<usize> {
+            let [l, r] = self.out[o];
+            (r != 0.0).then(|| (l / r).round() as usize - 1)
+        }
+
+        /// Audible output frames from `from` on, as `(output frame, input frame)`.
+        fn audible(&self, from: usize) -> Vec<(usize, usize)> {
+            (from..self.frame())
+                .filter_map(|o| self.content(o).map(|n| (o, n)))
+                .collect()
+        }
+
+        /// From output frame `from` on, input frames play in order, none twice, and none
+        /// is skipped unless it is quiet.
+        fn assert_continuous(&self, from: usize) {
+            for w in self.audible(from).windows(2) {
+                let ((o0, n0), (o1, n1)) = (w[0], w[1]);
+                assert!(n1 > n0, "output frame {o1} plays input {n1} after {n0}");
+                for n in n0 + 1..n1 {
+                    assert!(
+                        self.is_quiet(n),
+                        "loud input frame {n} skipped between output frames {o0} and {o1}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Devocal on, then off: passthrough with the dry path held at the model's delay.
+    fn held_probe() -> Probe {
+        let (sep, _) = index_sep(M, HOP);
+        let mut pr = Probe::new(Processor::new(Some(sep)));
+        pr.p.request_devocal(true);
+        pr.run_until(Stage::Devocal);
+        pr.p.request_devocal(false);
+        pr.run_until(Stage::Passthrough);
+        pr
+    }
+
+    #[test]
+    fn enable_with_larger_model_latency_pauses_instead_of_repeating() {
+        let (sep, _) = index_sep(M, HOP);
+        let mut pr = Probe::new(Processor::new(Some(sep)));
+        pr.run(20);
+        pr.p.request_devocal(true);
+        let on_at = pr.frame();
+        pr.run_until(Stage::FadingIn);
+        assert_eq!(pr.p.output_latency_frames(), M, "the gap publishes M");
+        pr.run_until(Stage::Devocal);
+        pr.run(10);
+        assert_eq!(pr.p.output_latency_frames(), M);
+
+        let a = pr.audible(on_at);
+        for &(o, n) in &a {
+            assert!(
+                o - n == HOP || o - n == M,
+                "output frame {o} plays input {n}: neither the dry path nor the model"
+            );
+        }
+        for w in a.windows(2) {
+            assert!(w[1].1 > w[0].1, "output frame {} repeats input", w[1].0);
+        }
+        let (last_dry_o, last_dry) = *a.iter().rfind(|&&(o, n)| o - n == HOP).unwrap();
+        let (first_model_o, first_model) = *a.iter().find(|&&(o, n)| o - n == M).unwrap();
+        // The dry path fades out over FADE (its first frame still at full gain)...
+        let fading = a
+            .iter()
+            .filter(|&&(o, n)| o - n == HOP && pr.out[o][1] < 1.0)
+            .count();
+        assert_eq!(fading, FADE_FRAMES - 1);
+        // ...then M - P frames of silence. The next frame starts the model fade-in (at
+        // equal-power gain 0, so it is silent too) with the input frame right after the last
+        // dry one.
+        assert_eq!(first_model_o - last_dry_o - 1, M - HOP + 1);
+        assert_eq!(first_model_o - 1 - M, last_dry + 1);
+        assert_eq!(first_model, last_dry + 2);
+        // The fade-in completes into the model alone.
+        assert!(a.iter().all(|&(o, n)| o < first_model_o || o - n == M));
+        assert_eq!(pr.out[first_model_o + FADE_FRAMES][1], 1.0);
+    }
+
+    /// "Off" during the gap: the silence runs out and the dry path fades in at M, from the
+    /// input frame after the last one played.
+    #[test]
+    fn disable_during_the_gap_resumes_the_dry_path_at_the_model_delay() {
+        let (sep, _) = index_sep(M, HOP);
+        let mut pr = Probe::new(Processor::new(Some(sep)));
+        pr.run(20);
+        pr.p.request_devocal(true);
+        let on_at = pr.frame();
+        pr.run_until(Stage::FadingIn);
+        pr.run(3);
+        pr.p.request_devocal(false);
+        assert_eq!(pr.p.stage(), Stage::FadingOut);
+        let r = pr.run(100);
+        assert_eq!(
+            r,
+            BlockReport {
+                ran_model: false,
+                stage: Stage::Passthrough
+            }
+        );
+        assert_eq!(pr.p.output_latency_frames(), M);
+        let a = pr.audible(on_at);
+        assert!(a.iter().all(|&(o, n)| o - n == HOP || o - n == M));
+        let (last_dry_o, last_dry) = *a.iter().rfind(|&&(o, n)| o - n == HOP).unwrap();
+        let (first_o, first) = *a.iter().find(|&&(o, n)| o - n == M).unwrap();
+        assert_eq!(first_o - last_dry_o - 1, M - HOP + 1);
+        assert_eq!(first, last_dry + 2);
+        assert!(a.iter().all(|&(o, n)| o < first_o || o - n == M));
+    }
+
+    #[test]
+    fn disable_holds_the_model_delay_without_skipping() {
+        let (sep, _) = index_sep(M, HOP);
+        let mut pr = Probe::new(Processor::new(Some(sep)));
+        pr.p.request_devocal(true);
+        pr.run_until(Stage::Devocal);
+        pr.run(5);
+        let off_at = pr.frame();
+        pr.p.request_devocal(false);
+        assert_eq!(pr.p.output_latency_frames(), M);
+        pr.run_until(Stage::Passthrough);
+        let r = pr.run(20);
+        assert_eq!(
+            r,
+            BlockReport {
+                ran_model: false,
+                stage: Stage::Passthrough
+            }
+        );
+        assert_eq!(pr.p.output_latency_frames(), M);
+        let a = pr.audible(off_at);
+        assert_eq!(a.len(), pr.frame() - off_at, "no silent frame");
+        assert!(a.iter().all(|&(o, n)| o - n == M), "no input frame skipped");
+    }
+
+    #[test]
+    fn delay_drops_to_passthrough_after_silence() {
+        let mut pr = held_probe();
+        let start = pr.frame();
+        // The frames a drop skips plus the output frame before them must be silent.
+        let k = M - HOP + 1;
+        let blocks = (M + k + 2000) / HOP;
+        // One loud frame inside the window restarts the count: no drop.
+        let a0 = pr.frame() + 1000;
+        pr.quiet.push(a0..a0 + k / 2);
+        pr.quiet.push(a0 + k / 2 + 1..a0 + k);
+        pr.run(blocks);
+        assert_eq!(pr.p.output_latency_frames(), M);
+        assert!(pr.audible(start).iter().all(|&(o, n)| o - n == M));
+
+        // A clean window: the delay drops to P inside it.
+        let b = pr.frame() + 1000;
+        pr.quiet.push(b..b + k);
+        pr.run(blocks);
+        assert_eq!(pr.p.output_latency_frames(), HOP);
+        let a = pr.audible(b);
+        let first = *a.iter().find(|&&(o, n)| o - n == HOP).unwrap();
+        // Silence, then the first loud frame after the window at once.
+        assert_eq!(first, (b + M + 1, b + k));
+        assert_eq!(pr.content(b + M), None);
+        assert!(a
+            .iter()
+            .all(|&(o, n)| o - n == if o < b + M { M } else { HOP }));
+        pr.assert_continuous(start);
+    }
+
+    #[test]
+    fn discontinuity_drops_the_held_delay() {
+        let mut pr = held_probe();
+        assert_eq!(pr.p.output_latency_frames(), M);
+        pr.p.on_discontinuity();
+        assert_eq!(pr.p.output_latency_frames(), HOP);
+        let at = pr.frame();
+        pr.run(10);
+        let a = pr.audible(at);
+        assert_eq!(a[0].0, at + HOP, "the cleared passthrough delay first");
+        assert!(a.iter().all(|&(o, n)| o - n == HOP));
+    }
+
+    #[test]
+    fn reenable_while_delay_is_held_is_an_aligned_crossfade() {
+        let mut pr = held_probe();
+        let on_at = pr.frame();
+        pr.p.request_devocal(true);
+        pr.run_until(Stage::Devocal);
+        pr.run(5);
+        assert_eq!(pr.p.output_latency_frames(), M);
+        let a = pr.audible(on_at);
+        assert_eq!(a.len(), pr.frame() - on_at, "no gap");
+        assert!(a.iter().all(|&(o, n)| o - n == M), "no repeat, no skip");
+    }
+
+    #[test]
+    fn fallback_lands_on_the_model_aligned_dry_signal() {
+        for error in [false, true] {
+            let (sep, fail) = index_sep(M, HOP);
+            let mut pr = Probe::new(Processor::new(Some(sep)));
+            pr.p.request_devocal(true);
+            pr.run_until(Stage::Devocal);
+            pr.run(5);
+            let at = pr.frame();
+            if error {
+                fail.store(true, Ordering::Relaxed);
+                assert_eq!(pr.block().stage, Stage::Fallback);
+            } else {
+                pr.p.force_fallback(FallbackReason::Overload);
+                pr.run_until(Stage::Fallback);
+            }
+            let r = pr.run(20);
+            assert_eq!(
+                r,
+                BlockReport {
+                    ran_model: false,
+                    stage: Stage::Fallback
+                }
+            );
+            assert_eq!(pr.p.output_latency_frames(), M, "error: {error}");
+            let a = pr.audible(at);
+            assert_eq!(a.len(), pr.frame() - at, "error: {error}");
+            assert!(a.iter().all(|&(o, n)| o - n == M), "error: {error}");
+        }
+    }
+
+    /// Ruling 14: a model with less latency than the dry path crossfades as before (and
+    /// skips the difference).
+    #[test]
+    fn smaller_model_latency_keeps_the_crossfade() {
+        let (sep, _) = index_sep(HOP, 300);
+        let mut pr = Probe::new(Processor::new(Some(sep)));
+        pr.run(10);
+        pr.p.request_devocal(true);
+        let on_at = pr.frame();
+        pr.run_until(Stage::FadingIn);
+        assert_eq!(pr.p.output_latency_frames(), 300);
+        let fade_at = pr.frame();
+        pr.run_until(Stage::Devocal);
+        let devocal_at = pr.frame();
+        pr.run(5);
+        assert_eq!(pr.p.output_latency_frames(), HOP);
+        assert!((on_at..pr.frame()).all(|o| pr.out[o][1] != 0.0), "no gap");
+        assert!(pr
+            .audible(on_at)
+            .iter()
+            .all(|&(o, n)| o >= fade_at || o - n == 300));
+        assert!(pr.audible(devocal_at).iter().all(|&(o, n)| o - n == HOP));
+    }
+
+    #[test]
+    fn gap_hold_and_drop_do_not_allocate() {
+        let (sep, _) = index_sep(M, HOP);
+        let mut p = Processor::new(Some(sep));
+        let loud = vec![0.1f32; HOP * 2];
+        let quiet = vec![0.0f32; HOP * 2];
+        let mut out = vec![0.0f32; HOP * 2];
+        let before = alloc_count::this_thread();
+        p.request_devocal(true);
+        for _ in 0..200 {
+            p.process_block(&loud, &mut out);
+        }
+        assert_eq!(p.stage(), Stage::Devocal);
+        p.request_devocal(false);
+        for _ in 0..20 {
+            p.process_block(&loud, &mut out);
+        }
+        assert_eq!(p.output_latency_frames(), M);
+        for _ in 0..90 {
+            p.process_block(&quiet, &mut out);
+        }
+        assert_eq!(p.output_latency_frames(), HOP);
+        p.on_discontinuity();
+        p.process_block(&loud, &mut out);
         assert_eq!(alloc_count::this_thread() - before, 0);
     }
 

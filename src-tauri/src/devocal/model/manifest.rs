@@ -155,6 +155,12 @@ fn validate_devices(model: &ModelSpec) -> Result<(), String> {
     if devices.iter().all(|(_, d)| d.is_none()) {
         return Err(format!("model {id} has no usable device"));
     }
+    // The engine gets one window and one lookahead per model (only the hop differs by device).
+    if let (ModelKind::Windowed, Some(cpu), Some(gpu)) = (model.kind, &model.devices.cpu, &model.devices.gpu) {
+        if (cpu.window_ms, cpu.lookahead_ms) != (gpu.window_ms, gpu.lookahead_ms) {
+            return Err(format!("model {id}: cpu and gpu must use the same window and lookahead"));
+        }
+    }
     for (name, d) in devices {
         let Some(d) = d else { continue };
         if d.threads == 0 {
@@ -420,6 +426,13 @@ mod tests {
             ("zero hop", Box::new(|v| v["models"][1]["devices"]["gpu"]["hopMs"] = 0.into())),
             ("zero window", Box::new(|v| v["models"][1]["devices"]["gpu"]["windowMs"] = 0.into())),
             ("streaming with a window", Box::new(|v| v["models"][0]["devices"]["cpu"]["windowMs"] = 1000.into())),
+            // The WindowedSpec has one window and one lookahead for both devices.
+            ("devices disagree on the window", Box::new(|v| v["models"][1]["devices"]["cpu"]["windowMs"] = 2000.into())),
+            ("devices disagree on the lookahead", Box::new(|v| {
+                let cpu = &mut v["models"][1]["devices"]["cpu"];
+                cpu["lookaheadMs"] = 50.into();
+                cpu["latencyMs"] = 310.0.into(); // still on the latency rule
+            })),
             ("vocals index 4", Box::new(|v| v["models"][2]["vocalsIndex"] = 4.into())),
             ("streaming vocals index 1", Box::new(|v| v["models"][0]["vocalsIndex"] = 1.into())),
             ("bad kind", Box::new(|v| v["models"][0]["kind"] = "batch".into())),

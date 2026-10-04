@@ -936,7 +936,7 @@ impl AudioHandle {
             capture_packet_frames: AtomicU32::new(0),
             in_ring_frames: AtomicU32::new(0),
             proc_in_flight_frames: AtomicU32::new(0),
-            proc_latency_frames: AtomicU32::new(processor.latency_frames() as u32),
+            proc_latency_frames: AtomicU32::new(processor.output_latency_frames() as u32),
             proc_hop: AtomicU32::new(processor.hop() as u32),
             output_failed: AtomicBool::new(false),
             preroll_request: AtomicBool::new(false),

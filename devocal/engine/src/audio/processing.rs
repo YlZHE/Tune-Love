@@ -8,7 +8,8 @@
 //!
 //! Positions: `in_pos` counts frames taken from ring A (processed or discarded), `out_pos`
 //! frames pushed to ring B. Input frame `x` of a block leaves the processor `latency` frames
-//! later, at output frame `x + (out_pos - in_pos) + latency`.
+//! later, at output frame `x + (out_pos - in_pos) + latency`; `latency` is the audible path's
+//! (`Processor::output_latency_frames`: passthrough or model, by stage).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -145,7 +146,6 @@ fn block_us(hop: usize) -> f64 {
 
 struct State {
     hop: usize,
-    latency: usize,
     in_block: Vec<f32>,
     out_block: Vec<f32>,
     in_pos: u64,
@@ -171,7 +171,6 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
     let hop = ctx.processor.hop();
     let mut st = State {
         hop,
-        latency: ctx.processor.latency_frames(),
         in_block: vec![0.0; hop * 2],
         out_block: vec![0.0; hop * 2],
         in_pos: 0,
@@ -234,8 +233,8 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
                         break;
                     }
                     let _ = ctx.in_markers.pop();
-                    let out =
-                        at as i128 + st.out_pos as i128 - st.in_pos as i128 + st.latency as i128;
+                    let out = at as i128 + st.out_pos as i128 - st.in_pos as i128
+                        + ctx.processor.output_latency_frames() as i128;
                     let out = out.max(st.out_pos as i128) as u64;
                     let _ = ctx.out_markers.push(out);
                 }
@@ -332,7 +331,7 @@ pub(crate) fn run(mut ctx: ProcessingCtx) -> Option<Box<dyn Separator>> {
 /// the frames before it, and the output fades in after the cleared delay.
 fn begin_gap(ctx: &mut ProcessingCtx, st: &mut State) {
     let _ = ctx.out_markers.push(st.out_pos);
-    st.fade_in.start(st.latency);
+    st.fade_in.start(ctx.processor.output_latency_frames());
 }
 
 /// Forces `Fallback(Overload)` (load or underrun), records it for the engine log and
@@ -441,7 +440,6 @@ fn try_swap(ctx: &mut ProcessingCtx, st: &mut State) -> bool {
         retire(old);
     }
     st.hop = ctx.processor.hop();
-    st.latency = ctx.processor.latency_frames();
     // Re-chunk at the new hop: nothing partial is held (blocks are read whole from ring A).
     st.in_block = vec![0.0; st.hop * 2];
     st.out_block = vec![0.0; st.hop * 2];
@@ -465,6 +463,11 @@ fn publish_state(ctx: &ProcessingCtx) {
         reason_code(ctx.processor.fallback_reason()),
         Ordering::Release,
     );
+    // The audible path's delay changes with the stage (passthrough vs model).
+    ctx.shared.proc_latency_frames.store(
+        ctx.processor.output_latency_frames() as u32,
+        Ordering::Relaxed,
+    );
 }
 
 /// Drops a replaced model on a short-lived thread: tearing down an inference session can
@@ -478,9 +481,6 @@ fn retire(old: Box<dyn Separator>) {
 }
 
 fn publish_config(ctx: &ProcessingCtx, st: &State) {
-    ctx.shared
-        .proc_latency_frames
-        .store(st.latency as u32, Ordering::Relaxed);
     ctx.shared.proc_hop.store(st.hop as u32, Ordering::Relaxed);
 }
 
@@ -661,7 +661,6 @@ mod tests {
         let hop = processor.hop();
         let st = State {
             hop,
-            latency: processor.latency_frames(),
             in_block: vec![0.0; hop * 2],
             out_block: vec![0.0; hop * 2],
             in_pos: 0,

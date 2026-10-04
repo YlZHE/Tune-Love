@@ -1,7 +1,8 @@
 //! Block processor on the engine's processing thread: one hop of interleaved stereo `f32`
-//! per call. The passthrough always goes through a `DelayLine` matching the model latency,
-//! so passthrough and accompaniment stay time-aligned and switching between them never
-//! shifts the audio.
+//! per call. The passthrough goes through a `DelayLine` of the model's
+//! `passthrough_latency_frames()`: equal to the model latency for StemgenRT, so switching
+//! never shifts the audio; window models keep it at one block, and switching then repeats
+//! or skips about the difference (the fades mix the two paths as they are).
 //!
 //! Stages (`fade` = 20 ms equal-power crossfade between passthrough and accompaniment):
 //!
@@ -55,8 +56,10 @@ pub struct BlockReport {
 pub struct Processor {
     separator: Option<Box<dyn Separator>>,
     hop: usize,
-    /// Passthrough delay in frames (the model's latency).
+    /// The model's latency in frames (the accompaniment's delay).
     latency_frames: usize,
+    /// Passthrough delay in frames; the model's own `passthrough_latency_frames()`.
+    passthrough_frames: usize,
     delay: DelayLine,
     stage: Stage,
     /// Set while falling back (fading out towards, or in, `Fallback`).
@@ -82,6 +85,7 @@ impl Processor {
             separator: None,
             hop: NO_MODEL_HOP,
             latency_frames: NO_MODEL_LATENCY_FRAMES,
+            passthrough_frames: NO_MODEL_LATENCY_FRAMES,
             delay: DelayLine::new(NO_MODEL_LATENCY_FRAMES),
             stage: Stage::Passthrough,
             fallback: None,
@@ -96,7 +100,11 @@ impl Processor {
             Some(s) => {
                 p.set_separator(s);
             }
-            None => p.configure(NO_MODEL_HOP, NO_MODEL_LATENCY_FRAMES),
+            None => p.configure(
+                NO_MODEL_HOP,
+                NO_MODEL_LATENCY_FRAMES,
+                NO_MODEL_LATENCY_FRAMES,
+            ),
         }
         p
     }
@@ -108,8 +116,9 @@ impl Processor {
     pub fn set_separator(&mut self, s: Box<dyn Separator>) -> Option<Box<dyn Separator>> {
         let hop = s.hop();
         let latency = s.latency_frames();
+        let passthrough = s.passthrough_latency_frames();
         let old = self.separator.replace(s);
-        self.configure(hop, latency);
+        self.configure(hop, latency, passthrough);
         old
     }
 
@@ -118,15 +127,20 @@ impl Processor {
     pub fn take_separator(&mut self) -> Option<Box<dyn Separator>> {
         let s = self.separator.take();
         if s.is_some() {
-            self.configure(NO_MODEL_HOP, NO_MODEL_LATENCY_FRAMES);
+            self.configure(
+                NO_MODEL_HOP,
+                NO_MODEL_LATENCY_FRAMES,
+                NO_MODEL_LATENCY_FRAMES,
+            );
         }
         s
     }
 
-    fn configure(&mut self, hop: usize, latency_frames: usize) {
+    fn configure(&mut self, hop: usize, latency_frames: usize, passthrough_frames: usize) {
         self.hop = hop.max(1);
         self.latency_frames = latency_frames;
-        self.delay = DelayLine::new(latency_frames);
+        self.passthrough_frames = passthrough_frames;
+        self.delay = DelayLine::new(passthrough_frames);
         self.stage = Stage::Passthrough;
         self.fallback = None;
         self.warm_frames = frames_for_ms(WARM_UP_MS).div_ceil(self.hop) * self.hop;
@@ -226,9 +240,25 @@ impl Processor {
         self.hop
     }
 
-    /// Output delay relative to the input in frames (passthrough and accompaniment alike).
+    /// The model's delay relative to the input in frames (the accompaniment's; see
+    /// `passthrough_latency_frames` and `output_latency_frames`).
     pub fn latency_frames(&self) -> usize {
         self.latency_frames
+    }
+
+    /// Passthrough delay relative to the input in frames.
+    pub fn passthrough_latency_frames(&self) -> usize {
+        self.passthrough_frames
+    }
+
+    /// Delay of what is audible now: the model's in `Devocal`/`FadingOut`, otherwise the
+    /// passthrough's (`Passthrough`, `WarmingUp`, `FadingIn`, `Fallback`). During the fades
+    /// the two paths differ in delay and are mixed as they are (a short repeat/skip).
+    pub fn output_latency_frames(&self) -> usize {
+        match self.stage {
+            Stage::Devocal | Stage::FadingOut => self.latency_frames,
+            _ => self.passthrough_frames,
+        }
     }
 
     /// Current stage (changes immediately on `request_devocal`/`force_fallback`, and on
@@ -526,6 +556,95 @@ mod tests {
             }
             panic!("never reached {stage:?}");
         }
+    }
+
+    /// Window-model stand-in: latency 10000, passthrough 128; accompaniment is constant.
+    struct SplitSep;
+
+    impl Separator for SplitSep {
+        fn sample_rate(&self) -> u32 {
+            44_100
+        }
+        fn hop(&self) -> usize {
+            HOP
+        }
+        fn latency_frames(&self) -> usize {
+            10_000
+        }
+        fn passthrough_latency_frames(&self) -> usize {
+            HOP
+        }
+        fn process(&mut self, input: &[f32], out: &mut [f32]) -> Result<(), String> {
+            check_block(HOP, input, out)?;
+            out.fill(ACC);
+            Ok(())
+        }
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn passthrough_uses_its_own_latency() {
+        let mut rig = Rig::new(Processor::new(Some(Box::new(SplitSep))), ramp);
+        assert_eq!(rig.p.latency_frames(), 10_000);
+        assert_eq!(rig.p.passthrough_latency_frames(), HOP);
+        rig.block();
+        // One hop of silence, then the input delayed by 128 frames.
+        assert!(rig.out.iter().all(|&s| s == 0.0));
+        let first_input = rig.input.clone();
+        rig.block();
+        assert_eq!(rig.out, first_input);
+        for _ in 0..10 {
+            rig.block();
+            assert_eq!(rig.out, rig.pass);
+        }
+        // Warm-up is passthrough as well.
+        rig.p.request_devocal(true);
+        for _ in 0..WARM_BLOCKS - 1 {
+            let r = rig.block();
+            assert_eq!(r.stage, Stage::WarmingUp);
+            assert_eq!(rig.out, rig.pass);
+        }
+    }
+
+    #[test]
+    fn devocal_after_fade_uses_model_latency() {
+        let mut rig = Rig::new(Processor::new(Some(Box::new(SplitSep))), ramp);
+        rig.p.request_devocal(true);
+        rig.run_until(Stage::Devocal);
+        rig.block();
+        assert!(rig.out.iter().all(|&s| s == ACC));
+        assert_eq!(rig.p.output_latency_frames(), 10_000);
+        // Back to passthrough: the 128-frame delay again.
+        rig.p.request_devocal(false);
+        rig.run_until(Stage::Passthrough);
+        rig.block();
+        assert_eq!(rig.out, rig.pass);
+        assert_eq!(rig.p.output_latency_frames(), HOP);
+    }
+
+    #[test]
+    fn published_latency_follows_stage() {
+        let mut rig = Rig::new(Processor::new(Some(Box::new(SplitSep))), ramp);
+        let model = 10_000;
+        assert_eq!(rig.p.stage(), Stage::Passthrough);
+        assert_eq!(rig.p.output_latency_frames(), HOP);
+        rig.p.request_devocal(true);
+        assert_eq!(rig.p.stage(), Stage::WarmingUp);
+        assert_eq!(rig.p.output_latency_frames(), HOP);
+        rig.run_until(Stage::FadingIn);
+        assert_eq!(rig.p.output_latency_frames(), HOP);
+        rig.run_until(Stage::Devocal);
+        assert_eq!(rig.p.output_latency_frames(), model);
+        rig.p.request_devocal(false);
+        assert_eq!(rig.p.stage(), Stage::FadingOut);
+        assert_eq!(rig.p.output_latency_frames(), model);
+        rig.run_until(Stage::Passthrough);
+        assert_eq!(rig.p.output_latency_frames(), HOP);
+        rig.p.request_devocal(true);
+        rig.run_until(Stage::Devocal);
+        rig.p.force_fallback(FallbackReason::Overload);
+        rig.run_until(Stage::Fallback);
+        assert_eq!(rig.p.output_latency_frames(), HOP);
     }
 
     #[test]

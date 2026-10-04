@@ -10,7 +10,7 @@ const POLL_MS = 500;
 // Polls the backend status and sends toggle/release commands. At most one
 // command is in flight; clicks made meanwhile are ignored. Commands reject so
 // callers can tell the user; the polled status stays the source of truth.
-export function useDevocal(): { status: DevocalStatus; enabled: boolean; toggle(): Promise<void>; release(): Promise<void> } {
+export function useDevocal(): { status: DevocalStatus; enabled: boolean; toggle(): Promise<void>; release(): Promise<void>; apply(): Promise<void> } {
   const [status, setStatus] = useState<DevocalStatus>(OFF_STATUS);
   const [enabling, setEnabling] = useState(false);
   const inFlight = useRef(false);
@@ -54,6 +54,9 @@ export function useDevocal(): { status: DevocalStatus; enabled: boolean; toggle(
   }, []);
 
   const toggle = useCallback(() => send(active.current ? "disable" : "enable"), [send]);
+  // The saved model/device changed: while de-vocal is on, enable again so the backend swaps to the
+  // new selection (it resends the model only when it really differs). Off: nothing to do.
+  const apply = useCallback(async () => { if (active.current) await send("enable"); }, [send]);
   const release = useCallback(() => send("release"), [send]);
-  return { status, enabled: phaseActive || enabling, toggle, release };
+  return { status, enabled: phaseActive || enabling, toggle, release, apply };
 }

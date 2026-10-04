@@ -24,15 +24,15 @@ const CHOICE_LABELS: Record<string, string> = {
 // request is used up once the row reaches installed, or dropped when the user cancels a download.
 // A non-zero `focusSeq` change focuses the row's first usable button. Picking a quality model
 // asks first; the choice is saved only after 切换.
-export function ModelSection({ autoEnablePending, onAutoEnableConsumed, focusSeq }: {
-  autoEnablePending: boolean; onAutoEnableConsumed(): void; focusSeq: number;
+export function ModelSection({ autoEnablePending, onAutoEnableConsumed, focusSeq, onSelectionChanged }: {
+  autoEnablePending: boolean; onAutoEnableConsumed(): void; focusSeq: number; onSelectionChanged(): void;
 }) {
   const { statuses, send } = useModelDownload();
   const selection = useDevocalModelPreference();
   const [pending, setPending] = useState<ModelInfo | null>(null);
   const [saveError, setSaveError] = useState("");
   const save = (modelId: string) => {
-    try { setDevocalModelPreference({ ...selection, modelId }); setSaveError(""); }
+    try { setDevocalModelPreference({ ...selection, modelId }); setSaveError(""); onSelectionChanged(); }
     catch { setSaveError("未能保存模型选择，请重试"); }
   };
   const choose = (id: string) => {

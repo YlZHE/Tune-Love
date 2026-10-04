@@ -3,7 +3,7 @@
 .model-row h3, .model-row-choice { margin: 0; font-size: 14px; font-weight: 600; }
 .model-device { margin-top: 16px; display: grid; gap: 8px; }
 .model-device h3 { margin: 0; font-size: 14px; font-weight: 600; }
-.model-device-options { display: flex; gap: 16px; font-size: 13px; }
+.model-device-options { display: flex; flex-direction: row; flex-wrap: wrap; gap: 8px 20px; font-size: 13px; }
 .model-row p { margin: 0; }
 .model-row .color-error { margin: 0; }
 .model-row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }

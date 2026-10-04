@@ -175,3 +175,32 @@ test("status line: nothing while the engine is not running; HTDemucs on CPU repo
   await setDevocal(page, { phase: "passthrough", held: true, error: "gpu_required: no usable GPU" });
   await expect(page.locator(".devocal-device-status")).toHaveText("所选模型需要 GPU，当前不可用");
 });
+
+const requests = (page: Page) => page.evaluate(() => (window as any).devocalRequests as Record<string, unknown>[]);
+const ON = { phase: "devocal", held: true, modelId: STEM, device: "cpu" };
+
+test("a device change while devocal is on re-sends enable with the new device", async ({ page }) => {
+  await prepare(page, SETTINGS, { devocal: ON });
+  await radio(page, "GPU").click();
+  await expect.poll(() => requests(page)).toEqual([{ action: "enable", modelId: STEM, device: "gpu" }]);
+});
+
+test("a quality model change while devocal is on counts only after the dialog is confirmed", async ({ page }) => {
+  await prepare(page, SETTINGS, { devocal: ON });
+  await radio(page, "bytesep（高质量）").click();
+  await dialog(page).getByRole("button", { name: "取消", exact: true }).click();
+  await expect(dialog(page)).toHaveCount(0);
+  expect(await requests(page)).toEqual([]);
+  await radio(page, "bytesep（高质量）").click();
+  await dialog(page).getByRole("button", { name: "切换", exact: true }).click();
+  await expect.poll(() => requests(page)).toEqual([{ action: "enable", modelId: BYTE, device: "auto" }]);
+});
+
+test("a model or device change while devocal is off sends nothing", async ({ page }) => {
+  await prepare(page, SETTINGS, { selection: { modelId: BYTE, device: "auto" } });
+  await radio(page, "StemgenRT（默认，低延迟）").click();
+  await radio(page, "GPU").click();
+  await expect(radio(page, "GPU")).toBeChecked();
+  await page.waitForTimeout(500);
+  expect(await requests(page)).toEqual([]);
+});

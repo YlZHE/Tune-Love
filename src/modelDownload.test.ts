@@ -48,6 +48,10 @@ describe("manifest", () => {
     expect(modelTotalBytes(h)).toBe(304759764);
     expect(b.license.converted && h.license.converted).toBe(true);
     expect(h.license.trainingData.join()).toContain("仅限非商业使用");
+    expect(h.license.weights).toBe("MIT（Demucs 官方发布；训练数据来源不明，仅限非商业使用）");
+    expect(b.license.credit).toContain("Kong 等人");
+    expect(b.license.credit).toContain("zenodo.org/records/5513378");
+    expect(h.license.credit).toContain("StemSplit demucs-onnx");
   });
 });
 
@@ -71,6 +75,12 @@ describe("parseManifest", () => {
       (v: any) => { v.models[1].devices.gpu.latencyMs = 100; },
       (v: any) => { v.models[0].kind = "batch"; },
       (v: any) => { delete v.models[0].kind; },
+      (v: any) => { v.models[2].vocalsIndex = 4; },
+      (v: any) => { v.models[2].vocalsIndex = -1; },
+      (v: any) => { v.models[2].vocalsIndex = 1.5; },
+      (v: any) => { v.models[2].vocalsIndex = "3"; },
+      (v: any) => { delete v.models[2].vocalsIndex; },
+      (v: any) => { v.models[0].vocalsIndex = 1; },
     ]) {
       const v = raw();
       edit(v);

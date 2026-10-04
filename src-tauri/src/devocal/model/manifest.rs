@@ -91,6 +91,9 @@ pub struct LicenseInfo {
     /// The weights were converted and modified by this project (shown in the consent box).
     #[serde(default)]
     pub converted: bool,
+    /// Extra credits shown with the conversion note (authors, tools); empty if none.
+    #[serde(default)]
+    pub credit: String,
 }
 
 impl Manifest {
@@ -144,6 +147,10 @@ impl Manifest {
 
 fn validate_devices(model: &ModelSpec) -> Result<(), String> {
     let id = &model.id;
+    // The vocals stem is one of the four stems (drums, bass, other, vocals); streaming models ignore it.
+    if model.vocals_index >= 4 || (model.kind == ModelKind::Streaming && model.vocals_index != 0) {
+        return Err(format!("model {id}: invalid vocals index {}", model.vocals_index));
+    }
     let devices = [("cpu", &model.devices.cpu), ("gpu", &model.devices.gpu)];
     if devices.iter().all(|(_, d)| d.is_none()) {
         return Err(format!("model {id} has no usable device"));
@@ -354,6 +361,9 @@ mod tests {
         assert_eq!(h.source, "https://github.com/facebookresearch/demucs");
         assert_eq!(h.license.code, "MIT");
         assert!(h.license.converted);
+        assert_eq!(h.license.weights, "MIT（Demucs 官方发布；训练数据来源不明，仅限非商业使用）");
+        assert!(h.license.credit.contains("StemSplit demucs-onnx"));
+        assert!(b.license.credit.contains("Kong 等人") && b.license.credit.contains("zenodo.org/records/5513378"));
         assert!(h.license.training_data.iter().any(|t| t.contains("来源不明") && t.contains("仅限非商业使用")));
         assert!(h.devices.cpu.is_none(), "HTDemucs runs on GPU only");
         assert_eq!(
@@ -410,6 +420,8 @@ mod tests {
             ("zero hop", Box::new(|v| v["models"][1]["devices"]["gpu"]["hopMs"] = 0.into())),
             ("zero window", Box::new(|v| v["models"][1]["devices"]["gpu"]["windowMs"] = 0.into())),
             ("streaming with a window", Box::new(|v| v["models"][0]["devices"]["cpu"]["windowMs"] = 1000.into())),
+            ("vocals index 4", Box::new(|v| v["models"][2]["vocalsIndex"] = 4.into())),
+            ("streaming vocals index 1", Box::new(|v| v["models"][0]["vocalsIndex"] = 1.into())),
             ("bad kind", Box::new(|v| v["models"][0]["kind"] = "batch".into())),
             ("old runtime-only entry", Box::new(|v| {
                 let m = v["models"][0].as_object_mut().unwrap();

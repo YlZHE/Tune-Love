@@ -20,7 +20,7 @@ export interface ModelInfo {
   // A null side: the model does not run on that device.
   devices: { cpu: DeviceParams | null; gpu: DeviceParams | null };
   // converted: the weights were converted and modified by this project.
-  license: { code: string; weights: string; trainingData: string[]; converted?: boolean };
+  license: { code: string; weights: string; trainingData: string[]; converted?: boolean; credit?: string };
   source: string;
 }
 export interface Manifest { version: number; mirrors: string[]; models: ModelInfo[] }
@@ -49,6 +49,9 @@ export function parseManifest(value: unknown): Manifest | null {
     if (!isRecord(m) || (m.kind !== "streaming" && m.kind !== "windowed") || !isRecord(m.devices)) return null;
     const cpu = parseDevice(m.devices.cpu, m.kind);
     const gpu = parseDevice(m.devices.gpu, m.kind);
+    // One of the four stems; streaming models ignore it (0). Same rule as validate_devices.
+    const maxIndex = m.kind === "streaming" ? 0 : 3;
+    if (!isCount(m.vocalsIndex) || m.vocalsIndex > maxIndex) return null;
     if (cpu === undefined || gpu === undefined || (!cpu && !gpu)) return null;
     models.push({ ...(m as unknown as ModelInfo), devices: { cpu, gpu } });
   }

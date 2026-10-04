@@ -45,7 +45,8 @@
         "cpu": { "windowMs": 1000, "hopMs": 200, "lookaheadMs": 100, "threads": 2, "latencyMs": 360 },
         "gpu": { "windowMs": 1000, "hopMs": 100, "lookaheadMs": 100, "threads": 1, "latencyMs": 230 }
       },
-      "license": { "code": "Apache-2.0", "weights": "CC BY 4.0", "trainingData": ["MUSDB18（仅教育用途）"], "converted": true },
+      "license": { "code": "Apache-2.0", "weights": "CC BY 4.0", "trainingData": ["MUSDB18（仅教育用途）"], "converted": true,
+        "credit": "原作者 Kong 等人（ByteDance）；PQMF 滤波器见 https://zenodo.org/records/5513378。" },
       "source": "https://zenodo.org/records/5804160"
     },
     {
@@ -70,9 +71,10 @@
       },
       "license": {
         "code": "MIT",
-        "weights": "Demucs 官方 htdemucs_ft 检查点",
+        "weights": "MIT（Demucs 官方发布；训练数据来源不明，仅限非商业使用）",
         "trainingData": ["MUSDB18-HQ（仅教育用途）", "约 800 首未公开来源的歌曲（训练数据来源不明，仅限非商业使用）"],
-        "converted": true
+        "converted": true,
+        "credit": "转换工具：StemSplit demucs-onnx（MIT）。"
       },
       "source": "https://github.com/facebookresearch/demucs"
     }

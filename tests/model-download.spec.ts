@@ -242,6 +242,8 @@ test("consent dialog for the quality models states the modification and the HTDe
   await expect(dialog).toContainText("Apache-2.0");
   await expect(dialog).toContainText("CC BY 4.0");
   await expect(dialog).toContainText("已由本项目转换修改");
+  await expect(dialog).toContainText("Kong 等人");
+  await expect(dialog).toContainText("https://zenodo.org/records/5513378");
   await expect(dialog).toContainText("d70b6ba65e9627b6bc0f3e02efb6d678030d44af74b9de1ed0c7bc60a80d4885");
   await expect(dialog).not.toContainText("仅限非商业使用");
   await dialog.getByRole("button", { name: "取消", exact: true }).click();
@@ -249,8 +251,9 @@ test("consent dialog for the quality models states the modification and the HTDe
 
   await page.getByRole("group", { name: "HTDemucs（高质量）" }).getByRole("button", { name: /^下载模型/ }).click();
   await expect(dialog).toContainText("https://github.com/facebookresearch/demucs");
-  await expect(dialog).toContainText("MIT");
+  await expect(dialog).toContainText("模型权重采用 MIT（Demucs 官方发布；训练数据来源不明，仅限非商业使用）。");
   await expect(dialog).toContainText("已由本项目转换修改");
+  await expect(dialog).toContainText("StemSplit demucs-onnx");
   await expect(dialog).toContainText("训练数据来源不明，仅限非商业使用");
   await expect(dialog).toContainText("fb173f3fdffd43d298c5ab26a9945a6c17845b9b81cce99df5ebcc8022dd5ab4");
   expect(await requests(page)).toEqual([]);
